@@ -9,7 +9,15 @@ set -euo pipefail
 cd "$(dirname "$0")"
 export PATH="$PATH:/usr/local/go/bin"
 
-VERSION="${VERSION:-0.3.0}"
+# Version: $VERSION (CI passes the release tag), else the latest vX.Y.Z git tag.
+if [[ -z "${VERSION:-}" ]]; then
+  VERSION="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo v0.0.0)"
+  VERSION="${VERSION#v}"
+fi
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "ERROR: VERSION must be X.Y.Z, got '$VERSION'" >&2
+  exit 1
+fi
 WINRES="github.com/tc-hib/go-winres@v0.3.3"
 MAX_BYTES=$((5 * 1024 * 1024))
 
@@ -36,7 +44,7 @@ echo "==> resources (.syso)"
 go run "$WINRES" make --in assets/winres.json --arch amd64 --out rsrc \
   --file-version "$VERSION.0" --product-version "$VERSION.0"
 
-echo "==> build"
+echo "==> build $VERSION"
 mkdir -p build
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
   -ldflags "-s -w -H windowsgui -X jiraffe/internal/app.Version=$VERSION" \

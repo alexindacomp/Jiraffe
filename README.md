@@ -19,17 +19,25 @@ Put it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\Jiraffe\jiraffe.exe`
 and personal access token. Requires the Microsoft Edge WebView2 Runtime
 (preinstalled on Windows 10/11).
 
-To publish a new version: bump `VERSION` in `build.sh` (and `assets/winres.json`,
-`internal/app.Version`), run `./build.sh`, copy `build/jiraffe.exe` to `dist/`,
-commit, then create a GitHub release `vX.Y.Z` with `build/jiraffe.exe` attached —
-the download link always points to the latest release's `jiraffe.exe`.
+Binaries are built by GitHub Actions ([.github/workflows/build.yml](.github/workflows/build.yml)),
+not committed to the repo. Every push to `master` and every pull request runs
+`go vet`, `go test` and the build, and keeps `jiraffe.exe` as a workflow artifact.
+To publish a version, push a tag — the version is taken from it (no files to bump):
+
+```sh
+git tag -a v0.4.0 -m "Jiraffe v0.4.0" -m "- what changed"   # tag message = release notes
+git push origin v0.4.0
+```
+
+The workflow builds `jiraffe.exe` with version 0.4.0 and publishes the GitHub
+release `v0.4.0` as the latest one, so the download link above serves it.
 
 ## Build (WSL / Linux)
 
 ```sh
 ./build.sh            # → build/jiraffe.exe, prints the size (budget 5 MB)
 ./build.sh --check    # go vet (linux + windows) and go test first
-VERSION=1.2.0 ./build.sh
+VERSION=1.2.0 ./build.sh   # default version: the latest vX.Y.Z git tag
 ```
 
 `build.sh` generates the icon (`tools/icongen` → `assets/icon.ico`), embeds icon,

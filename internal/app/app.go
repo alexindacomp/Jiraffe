@@ -24,8 +24,9 @@ import (
 	"jiraffe/internal/worklog"
 )
 
-// Version is set at build time with -ldflags "-X jiraffe/internal/app.Version=…".
-var Version = "0.3.0"
+// Version is set at build time from the git tag by build.sh
+// (-ldflags "-X jiraffe/internal/app.Version=…").
+var Version = "dev"
 
 // Platform provides the OS services the app needs.
 type Platform interface {
