@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Jiraffe</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<!-- Icon sprite (inline, no network). Stroke icons use currentColor. -->
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-logo" viewBox="0 0 32 32">
+      <rect width="32" height="32" rx="8" fill="#F59E0B"/>
+      <path fill="#D97706" d="M5 22.5c1.6-.6 3.4.1 3.6 1.7.2 1.5-1.4 2.6-3 2.3-1.7-.3-2.1-3.3-.6-4zM24.3 21c1.8-.3 3.3 1 2.9 2.6-.4 1.5-2.4 2-3.7 1.1-1.2-.9-.9-3.4.8-3.7zM6.3 6.2c1.5-.4 2.9.7 2.6 2-.3 1.4-2.2 1.9-3.3 1-1-.8-.7-2.7.7-3z"/>
+      <g fill="none" stroke="#3B2104" stroke-width="3.2" stroke-linecap="round"><path d="M19.5 11v8.5a4.5 4.5 0 0 1-9 0"/></g>
+      <g fill="#3B2104"><circle cx="17.2" cy="6.6" r="1.7"/><circle cx="21.8" cy="6.6" r="1.7"/></g>
+    </symbol>
+    <symbol id="i-board" viewBox="0 0 24 24"><rect x="3" y="3" width="5" height="15" rx="1.5"/><rect x="9.5" y="3" width="5" height="10" rx="1.5"/><rect x="16" y="3" width="5" height="18" rx="1.5"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5M3 21v-5h5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c6.5 0 10 7 10 7a17 17 0 0 1-2.16 3.19M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="m2 2 20 20"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m7 4 13 8-13 8z"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-chevron-up" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"/></symbol>
+    <symbol id="i-chevrons-up" viewBox="0 0 24 24"><path d="m17 11-5-5-5 5M17 18l-5-5-5 5"/></symbol>
+    <symbol id="i-chevrons-down" viewBox="0 0 24 24"><path d="m7 6 5 5 5-5M7 13l5 5 5-5"/></symbol>
+    <symbol id="i-equal" viewBox="0 0 24 24"><path d="M5 9h14M5 15h14"/></symbol>
+    <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M6 8h12v4a6 6 0 0 1-12 0zM12 18v4"/></symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></symbol>
+  </defs>
+</svg>
+
+<div class="app" id="app">
+  <nav class="rail" data-i18n-attr="aria-label:nav.label">
+    <div class="brand" aria-hidden="true">
+      <svg class="brand-logo"><use href="#i-logo"/></svg>
+    </div>
+    <ul class="nav" role="list">
+      <li><button type="button" class="nav-item" data-view="board"><svg class="icon" aria-hidden="true"><use href="#i-board"/></svg><span data-i18n="nav.board"></span></button></li>
+      <li><button type="button" class="nav-item" data-view="worklog"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg><span data-i18n="nav.worklog"></span></button></li>
+      <li><button type="button" class="nav-item" data-view="notifications" id="nav-notifications"><span class="nav-icon-wrap"><svg class="icon" aria-hidden="true"><use href="#i-bell"/></svg><span class="nav-badge" id="nav-badge" hidden></span></span><span data-i18n="nav.notifications"></span></button></li>
+      <li><button type="button" class="nav-item" data-view="settings"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg><span data-i18n="nav.settings"></span></button></li>
+    </ul>
+    <div class="rail-foot">
+      <span class="rail-version" id="app-version"></span>
+    </div>
+  </nav>
+
+  <div class="main">
+    <header class="topbar">
+      <h1 class="view-title" id="view-title"></h1>
+      <div class="board-tools" id="board-tools" hidden>
+        <div class="search">
+          <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+          <input type="search" id="search" autocomplete="off" spellcheck="false" data-i18n-attr="placeholder:board.searchPlaceholder;aria-label:board.searchLabel">
+          <kbd aria-hidden="true">/</kbd>
+        </div>
+        <div class="chips" id="project-chips" role="group" data-i18n-attr="aria-label:board.projectsLabel" hidden></div>
+      </div>
+      <div class="topbar-end">
+        <button type="button" class="icon-btn" id="refresh-btn" data-i18n-attr="aria-label:common.refreshShortcut;title:common.refreshShortcut">
+          <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>
+        </button>
+        <button type="button" class="avatar-btn" id="avatar-btn">
+          <span class="avatar" id="avatar" aria-hidden="true"></span>
+          <span class="avatar-dot" id="avatar-dot" aria-hidden="true"></span>
+        </button>
+      </div>
+    </header>
+
+    <main class="views" id="views">
+      <!-- App-level loading / fatal error -->
+      <section class="view view-status" id="view-status" hidden></section>
+
+      <!-- Board -->
+      <section class="view view-board" id="view-board" hidden>
+        <div class="board" id="board"></div>
+      </section>
+
+      <!-- Worklog -->
+      <section class="view view-scroll" id="view-worklog" hidden>
+        <div class="page">
+          <div class="card-surface today" id="wl-today"></div>
+
+          <section class="card-surface" aria-labelledby="wl-preview-title">
+            <header class="section-head">
+              <div>
+                <h2 class="section-title" id="wl-preview-title"></h2>
+                <p class="section-sub" id="wl-preview-sub"></p>
+              </div>
+              <div class="section-actions">
+                <button type="button" class="btn" id="wl-preview-btn"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span data-i18n="worklog.preview"></span></button>
+                <button type="button" class="btn btn-primary" id="wl-run-btn"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="worklog.logNow"></span></button>
+              </div>
+            </header>
+            <div id="wl-preview"></div>
+          </section>
+
+          <section class="card-surface" aria-labelledby="wl-history-title">
+            <header class="section-head">
+              <h2 class="section-title" id="wl-history-title" data-i18n="worklog.history"></h2>
+            </header>
+            <div id="wl-history"></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- Notifications -->
+      <section class="view view-scroll" id="view-notifications" hidden>
+        <div class="page page-narrow">
+          <div class="list-head">
+            <p class="list-head-text" id="notif-summary" aria-live="polite"></p>
+            <button type="button" class="btn" id="notif-mark-all"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span data-i18n="notif.markAll"></span></button>
+          </div>
+          <div id="notif-list"></div>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section class="view view-settings" id="view-settings" hidden>
+        <form class="settings" id="settings-form" novalidate autocomplete="off">
+          <div class="settings-scroll">
+            <div class="page page-narrow">
+              <div class="form-alert" id="settings-alert" role="alert" hidden></div>
+              <div id="settings-loading" class="settings-loading" hidden></div>
+
+              <div class="settings-body" id="settings-body">
+                <!-- Connection -->
+                <section class="settings-section" aria-labelledby="sec-conn">
+                  <h2 class="settings-title" id="sec-conn"><svg class="icon" aria-hidden="true"><use href="#i-plug"/></svg><span data-i18n="settings.connection"></span></h2>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-jiraUrl" data-i18n="settings.jiraUrl"></label><p class="hint" id="h-jiraUrl" data-i18n="settings.jiraUrlHint"></p></div>
+                    <div class="setting-control setting-control-wide">
+                      <input class="input" type="url" id="s-jiraUrl" name="jiraUrl" placeholder="https://sd.local" spellcheck="false" aria-describedby="h-jiraUrl e-jiraUrl">
+                      <p class="field-error" id="e-jiraUrl" data-error-for="jiraUrl" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-token" data-i18n="settings.token"></label><p class="hint" id="h-token" data-i18n="settings.tokenHint"></p></div>
+                    <div class="setting-control setting-control-wide">
+                      <div class="input-group">
+                        <input class="input" type="password" id="s-token" name="token" spellcheck="false" autocomplete="new-password" aria-describedby="h-token e-token">
+                        <button type="button" class="icon-btn input-addon" data-action="toggle-secret" data-target="s-token" aria-pressed="false" data-i18n-attr="aria-label:settings.showToken;title:settings.showToken"><svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg></button>
+                      </div>
+                      <p class="field-error" id="e-token" data-error-for="token" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting setting-actions">
+                    <div class="test-result" id="s-test-result" role="status" aria-live="polite"></div>
+                    <button type="button" class="btn" id="s-test-btn" data-i18n="settings.test"></button>
+                  </div>
+                </section>
+
+                <!-- Worklog -->
+                <section class="settings-section" aria-labelledby="sec-wl">
+                  <h2 class="settings-title" id="sec-wl"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg><span data-i18n="settings.worklog"></span></h2>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-worklogEnabled" data-i18n="settings.worklogEnabled"></label><p class="hint" data-i18n="settings.worklogEnabledHint"></p></div>
+                    <div class="setting-control"><input type="checkbox" role="switch" class="switch" id="s-worklogEnabled" name="worklogEnabled"></div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-worklogTime" data-i18n="settings.worklogTime"></label><p class="hint" data-i18n="settings.worklogTimeHint"></p></div>
+                    <div class="setting-control">
+                      <input class="input input-time" type="text" inputmode="numeric" maxlength="5" autocomplete="off" spellcheck="false" pattern="[0-2]\d:[0-5]\d" data-mask="time" id="s-worklogTime" name="worklogTime" data-i18n-attr="placeholder:settings.timePlaceholder" aria-describedby="e-worklogTime">
+                      <p class="field-error" id="e-worklogTime" data-error-for="worklogTime" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><span class="label" id="l-workday" data-i18n="settings.workday"></span></div>
+                    <div class="setting-control">
+                      <div class="range" role="group" aria-labelledby="l-workday">
+                        <input class="input input-time" type="text" inputmode="numeric" maxlength="5" autocomplete="off" spellcheck="false" pattern="[0-2]\d:[0-5]\d" data-mask="time" id="s-workdayStart" name="workdayStart" data-i18n-attr="aria-label:settings.from;placeholder:settings.timePlaceholder" aria-describedby="e-workdayStart">
+                        <span class="range-sep" aria-hidden="true">–</span>
+                        <input class="input input-time" type="text" inputmode="numeric" maxlength="5" autocomplete="off" spellcheck="false" pattern="[0-2]\d:[0-5]\d" data-mask="time" id="s-workdayEnd" name="workdayEnd" data-i18n-attr="aria-label:settings.to;placeholder:settings.timePlaceholder" aria-describedby="e-workdayEnd">
+                      </div>
+                      <p class="field-error" id="e-workdayStart" data-error-for="workdayStart" hidden></p>
+                      <p class="field-error" id="e-workdayEnd" data-error-for="workdayEnd" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><span class="label" id="l-lunch" data-i18n="settings.lunch"></span><p class="hint" data-i18n="settings.lunchHint"></p></div>
+                    <div class="setting-control">
+                      <div class="range" role="group" aria-labelledby="l-lunch">
+                        <input class="input input-time" type="text" inputmode="numeric" maxlength="5" autocomplete="off" spellcheck="false" pattern="[0-2]\d:[0-5]\d" data-mask="time" id="s-lunchStart" name="lunchStart" data-i18n-attr="aria-label:settings.from;placeholder:settings.timePlaceholder" aria-describedby="e-lunchStart">
+                        <span class="range-sep" aria-hidden="true">–</span>
+                        <input class="input input-time" type="text" inputmode="numeric" maxlength="5" autocomplete="off" spellcheck="false" pattern="[0-2]\d:[0-5]\d" data-mask="time" id="s-lunchEnd" name="lunchEnd" data-i18n-attr="aria-label:settings.to;placeholder:settings.timePlaceholder" aria-describedby="e-lunchEnd">
+                      </div>
+                      <p class="field-error" id="e-lunchStart" data-error-for="lunchStart" hidden></p>
+                      <p class="field-error" id="e-lunchEnd" data-error-for="lunchEnd" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-dailyCapHours" data-i18n="settings.dailyCap"></label><p class="hint" data-i18n="settings.dailyCapHint"></p></div>
+                    <div class="setting-control">
+                      <div class="input-unit"><input class="input input-num" type="number" id="s-dailyCapHours" name="dailyCapHours" min="0.5" max="24" step="0.5" inputmode="decimal" aria-describedby="e-dailyCapHours"><span data-i18n="settings.unitHours"></span></div>
+                      <p class="field-error" id="e-dailyCapHours" data-error-for="dailyCapHours" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-hoursPerDay" data-i18n="settings.hoursPerDay"></label><p class="hint" data-i18n="settings.hoursPerDayHint"></p></div>
+                    <div class="setting-control">
+                      <div class="input-unit"><input class="input input-num" type="number" id="s-hoursPerDay" name="hoursPerDay" min="1" max="24" step="1" inputmode="numeric" aria-describedby="e-hoursPerDay"><span data-i18n="settings.unitHours"></span></div>
+                      <p class="field-error" id="e-hoursPerDay" data-error-for="hoursPerDay" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting setting-stack">
+                    <div class="setting-text"><label for="s-status-input" data-i18n="settings.statuses"></label><p class="hint" data-i18n="settings.statusesHint"></p></div>
+                    <div class="setting-control setting-control-wide">
+                      <ul class="tags" id="s-statuses" role="list"></ul>
+                      <div class="add-row">
+                        <input class="input" type="text" id="s-status-input" data-i18n-attr="placeholder:settings.statusPlaceholder" aria-describedby="e-inProgressStatuses">
+                        <button type="button" class="btn" data-action="add-status"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="common.add"></span></button>
+                      </div>
+                      <p class="field-error" id="e-inProgressStatuses" data-error-for="inProgressStatuses" hidden></p>
+                    </div>
+                  </div>
+                </section>
+
+                <!-- Calendar -->
+                <section class="settings-section" aria-labelledby="sec-cal">
+                  <h2 class="settings-title" id="sec-cal"><svg class="icon" aria-hidden="true"><use href="#i-calendar"/></svg><span data-i18n="settings.calendar"></span></h2>
+                  <div class="setting">
+                    <div class="setting-text"><span class="label" id="l-workDays" data-i18n="settings.workDays"></span></div>
+                    <div class="setting-control">
+                      <div class="daypicker" id="s-workDays" role="group" aria-labelledby="l-workDays" aria-describedby="e-workDays"></div>
+                      <p class="field-error" id="e-workDays" data-error-for="workDays" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting setting-stack">
+                    <div class="setting-text"><span class="label" id="l-vacations" data-i18n="settings.vacations"></span><p class="hint" data-i18n="settings.vacationsHint"></p></div>
+                    <div class="setting-control setting-control-wide">
+                      <div class="vac-list" id="s-vacations" role="list" aria-labelledby="l-vacations"></div>
+                      <button type="button" class="btn btn-ghost" data-action="add-vacation"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="settings.addVacation"></span></button>
+                      <p class="field-error" id="e-vacations" data-error-for="vacations" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting setting-stack">
+                    <div class="setting-text"><label for="s-holiday-input" data-i18n="settings.holidays"></label><p class="hint" data-i18n="settings.holidaysHint"></p></div>
+                    <div class="setting-control setting-control-wide">
+                      <ul class="tags" id="s-holidays" role="list"></ul>
+                      <div class="add-row">
+                        <input class="input input-date" type="text" inputmode="numeric" maxlength="10" autocomplete="off" spellcheck="false" data-mask="date" id="s-holiday-input" data-i18n-attr="placeholder:settings.datePlaceholder" aria-describedby="e-holidays">
+                        <button type="button" class="btn" data-action="add-holiday"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="common.add"></span></button>
+                      </div>
+                      <p class="field-error" id="e-holidays" data-error-for="holidays" hidden></p>
+                    </div>
+                  </div>
+                </section>
+
+                <!-- Notifications -->
+                <section class="settings-section" aria-labelledby="sec-notif">
+                  <h2 class="settings-title" id="sec-notif"><svg class="icon" aria-hidden="true"><use href="#i-bell"/></svg><span data-i18n="settings.notifications"></span></h2>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-notifyComments" data-i18n="settings.notifyComments"></label><p class="hint" data-i18n="settings.notifyCommentsHint"></p></div>
+                    <div class="setting-control"><input type="checkbox" role="switch" class="switch" id="s-notifyComments" name="notifyComments"></div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-commentPollMinutes" data-i18n="settings.pollInterval"></label><p class="hint" data-i18n="settings.pollIntervalHint"></p></div>
+                    <div class="setting-control">
+                      <div class="input-unit"><input class="input input-num" type="number" id="s-commentPollMinutes" name="commentPollMinutes" min="1" max="60" step="1" inputmode="numeric" aria-describedby="e-commentPollMinutes"><span data-i18n="settings.unitMinutes"></span></div>
+                      <p class="field-error" id="e-commentPollMinutes" data-error-for="commentPollMinutes" hidden></p>
+                    </div>
+                  </div>
+                </section>
+
+                <!-- Application -->
+                <section class="settings-section" aria-labelledby="sec-app">
+                  <h2 class="settings-title" id="sec-app"><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg><span data-i18n="settings.application"></span></h2>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-language" data-i18n="settings.language"></label><p class="hint" data-i18n="settings.languageHint"></p></div>
+                    <div class="setting-control">
+                      <select class="input select" id="s-language" name="language" aria-describedby="e-language">
+                        <option value="ru">Русский</option>
+                        <option value="uk">Українська</option>
+                        <option value="en">English</option>
+                      </select>
+                      <p class="field-error" id="e-language" data-error-for="language" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-autostart" data-i18n="settings.autostart"></label><p class="hint" data-i18n="settings.autostartHint"></p></div>
+                    <div class="setting-control"><input type="checkbox" role="switch" class="switch" id="s-autostart" name="autostart" aria-describedby="w-autostart"><p class="field-warning" id="w-autostart" role="status" data-i18n="settings.autostartMismatch" hidden></p></div>
+                  </div>
+                  <details class="advanced">
+                    <summary><svg class="icon chev" aria-hidden="true"><use href="#i-chevron-down"/></svg><span data-i18n="settings.advanced"></span></summary>
+                    <div class="setting setting-stack">
+                      <div class="setting-text"><label for="s-boardJql" data-i18n="settings.boardJql"></label><p class="hint" id="h-boardJql" data-i18n="settings.boardJqlHint"></p></div>
+                      <div class="setting-control setting-control-wide">
+                        <textarea class="input textarea mono" id="s-boardJql" name="boardJql" rows="3" spellcheck="false" aria-describedby="h-boardJql e-boardJql"></textarea>
+                        <p class="field-error" id="e-boardJql" data-error-for="boardJql" hidden></p>
+                      </div>
+                    </div>
+                  </details>
+                </section>
+              </div>
+            </div>
+          </div>
+
+          <footer class="savebar" id="savebar">
+            <div class="page page-narrow savebar-inner">
+              <span class="savebar-text" id="savebar-text" aria-live="polite"></span>
+              <button type="button" class="btn btn-ghost" id="s-discard" data-i18n="settings.discard"></button>
+              <button type="submit" class="btn btn-primary" id="s-save" data-i18n="common.save"></button>
+            </div>
+          </footer>
+        </form>
+      </section>
+
+      <!-- Onboarding (first start, not configured) -->
+      <section class="view view-scroll view-onboarding" id="view-onboarding" hidden>
+        <form class="onboarding card-surface" id="onboarding-form" novalidate autocomplete="off" aria-labelledby="ob-title">
+          <svg class="onboarding-logo" aria-hidden="true"><use href="#i-logo"/></svg>
+          <h2 class="onboarding-title" id="ob-title" data-i18n="onboarding.title"></h2>
+          <p class="onboarding-text" data-i18n="onboarding.text"></p>
+          <div class="form-alert" id="ob-alert" role="alert" hidden></div>
+          <div class="field">
+            <label for="o-jiraUrl" data-i18n="settings.jiraUrl"></label>
+            <input class="input" type="url" id="o-jiraUrl" name="jiraUrl" placeholder="https://sd.local" spellcheck="false" aria-describedby="oe-jiraUrl">
+            <p class="field-error" id="oe-jiraUrl" data-error-for="jiraUrl" hidden></p>
+          </div>
+          <div class="field">
+            <label for="o-token" data-i18n="settings.token"></label>
+            <div class="input-group">
+              <input class="input" type="password" id="o-token" name="token" spellcheck="false" autocomplete="new-password" aria-describedby="oh-token oe-token">
+              <button type="button" class="icon-btn input-addon" data-action="toggle-secret" data-target="o-token" aria-pressed="false" data-i18n-attr="aria-label:settings.showToken;title:settings.showToken"><svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg></button>
+            </div>
+            <p class="hint" id="oh-token" data-i18n="onboarding.tokenHint"></p>
+            <p class="field-error" id="oe-token" data-error-for="token" hidden></p>
+          </div>
+          <div class="field field-inline">
+            <label for="o-language" data-i18n="settings.language"></label>
+            <select class="input select" id="o-language" name="language">
+              <option value="ru">Русский</option>
+              <option value="uk">Українська</option>
+              <option value="en">English</option>
+            </select>
+          </div>
+          <div class="test-result" id="o-test-result" role="status" aria-live="polite"></div>
+          <div class="onboarding-actions">
+            <button type="button" class="btn" id="o-test-btn" data-i18n="settings.test"></button>
+            <button type="submit" class="btn btn-primary" id="o-save-btn" data-i18n="onboarding.start"></button>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- Overlays: non-modal <dialog>s managed by app.js (app is made inert while open), so toasts stay on top. -->
+<div class="scrim" id="scrim" hidden></div>
+
+<dialog class="drawer" id="drawer" aria-labelledby="drawer-title"></dialog>
+
+<dialog class="modal" id="dlg-confirm" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+  <div class="modal-panel">
+    <h2 class="modal-title" id="confirm-title"></h2>
+    <p class="modal-body" id="confirm-body"></p>
+    <div class="modal-actions">
+      <button type="button" class="btn" data-action="cancel" data-i18n="common.cancel"></button>
+      <button type="button" class="btn btn-primary" data-action="ok" id="confirm-ok"></button>
+    </div>
+  </div>
+</dialog>
+
+<dialog class="modal" id="dlg-picker" aria-labelledby="picker-title" aria-describedby="picker-text">
+  <div class="modal-panel">
+    <h2 class="modal-title" id="picker-title" data-i18n="picker.title"></h2>
+    <p class="modal-body" id="picker-text"></p>
+    <ul class="picker-list" id="picker-list" role="list"></ul>
+    <div class="modal-actions">
+      <button type="button" class="btn" data-action="cancel" data-i18n="common.cancel"></button>
+    </div>
+  </div>
+</dialog>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-relevant="additions"></div>
+
+<script src="i18n.js"></script>
+<script src="mock.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
