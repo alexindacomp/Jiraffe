@@ -53,6 +53,9 @@ type Data struct {
 	LastCommentPoll string `json:"lastCommentPoll,omitempty"`
 	// NotificationsPaused suppresses tray balloons.
 	NotificationsPaused bool `json:"notificationsPaused,omitempty"`
+	// UIPrefs is the UI's preferences object, stored as raw JSON (opaque to
+	// Go; independent of the Jira connection).
+	UIPrefs json.RawMessage `json:"uiPrefs,omitempty"`
 }
 
 // Store keeps Data in memory and writes it to disk on every update.
@@ -102,6 +105,9 @@ func (d Data) clone() Data {
 	}
 	c.Notifications = append([]Notification{}, d.Notifications...)
 	c.SeenComments = append([]string{}, d.SeenComments...)
+	if d.UIPrefs != nil {
+		c.UIPrefs = append(json.RawMessage{}, d.UIPrefs...)
+	}
 	return c
 }
 

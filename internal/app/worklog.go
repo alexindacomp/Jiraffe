@@ -56,11 +56,12 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time)
 	now := effectiveNow(realNow, due)
 	s := a.cfg.Get()
 	run := worklog.Run{
-		At:      realNow.Format(time.RFC3339),
-		Date:    now.Format(worklog.DateLayout),
-		Trigger: trigger,
-		Items:   []worklog.Item{},
-		Total:   worklog.FormatDuration(0, s.HoursPerDay),
+		At:         realNow.Format(time.RFC3339),
+		Date:       now.Format(worklog.DateLayout),
+		Trigger:    trigger,
+		Items:      []worklog.Item{},
+		CapSeconds: s.CapSeconds(),
+		Total:      worklog.FormatDuration(0, s.HoursPerDay),
 	}
 	lang := s.Language
 	c, identity, err := a.client()
@@ -223,7 +224,8 @@ func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s confi
 	}
 	// Plan subtracts the candidates' logged time from the cap; subtracting the
 	// other issues' time here makes the budget cap − everything logged today.
-	capSeconds := int64(math.Round(s.DailyCapHours*3600)) - other
+	// The cap is the effective one: dailyCapHours × loadFactor.
+	capSeconds := s.CapSeconds() - other
 	if capSeconds < 0 {
 		capSeconds = 0
 	}

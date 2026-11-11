@@ -37,8 +37,10 @@ type Run struct {
 	TotalSeconds int64  `json:"totalSeconds"`
 	// OtherLoggedSeconds is my time logged today on issues that are not items
 	// of this run; it reduces the daily cap.
-	OtherLoggedSeconds int64  `json:"otherLoggedSeconds"`
-	Total              string `json:"total"`
-	SkippedReason      string `json:"skippedReason,omitempty"`
-	Error              string `json:"error,omitempty"`
+	OtherLoggedSeconds int64 `json:"otherLoggedSeconds"`
+	// CapSeconds is the effective daily cap (dailyCapHours × loadFactor).
+	CapSeconds    int64  `json:"capSeconds"`
+	Total         string `json:"total"`
+	SkippedReason string `json:"skippedReason,omitempty"`
+	Error         string `json:"error,omitempty"`
 }

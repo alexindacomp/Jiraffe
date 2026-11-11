@@ -22,22 +22,46 @@ type NameDTO struct {
 	Name string `json:"name"`
 }
 
-// AssigneeDTO is {displayName}.
-type AssigneeDTO struct {
-	DisplayName string `json:"displayName"`
+// IssueTypeDTO is the IssueType contract type.
+type IssueTypeDTO struct {
+	Name      string `json:"name"`
+	Kind      string `json:"kind"` // epic | story | task | subtask
+	IconColor string `json:"iconColor,omitempty"`
+}
+
+// EpicChipDTO is Issue.epic: the Epic Link target.
+type EpicChipDTO struct {
+	Key   string `json:"key"`
+	Name  string `json:"name"`
+	Color string `json:"color"` // Jira colour key, e.g. "ghx-label-4"
 }
 
 // IssueDTO is the Issue contract type.
 type IssueDTO struct {
+	ID          string       `json:"id"`
+	Key         string       `json:"key"`
+	Summary     string       `json:"summary"`
+	URL         string       `json:"url"`
+	Project     string       `json:"project"`
+	Status      StatusDTO    `json:"status"`
+	Type        IssueTypeDTO `json:"type"`
+	Priority    NameDTO      `json:"priority"`
+	Updated     string       `json:"updated"`
+	Assignee    *UserDTO     `json:"assignee"`
+	Mine        bool         `json:"mine"`
+	Epic        *EpicChipDTO `json:"epic,omitempty"`
+	StoryPoints *float64     `json:"storyPoints,omitempty"`
+}
+
+// IssueRef is the IssueRef contract type (a related issue).
+type IssueRef struct {
 	Key      string       `json:"key"`
 	Summary  string       `json:"summary"`
 	URL      string       `json:"url"`
-	Project  string       `json:"project"`
 	Status   StatusDTO    `json:"status"`
-	Type     NameDTO      `json:"type"`
-	Priority NameDTO      `json:"priority"`
-	Updated  string       `json:"updated"`
-	Assignee *AssigneeDTO `json:"assignee"`
+	Type     IssueTypeDTO `json:"type"`
+	Assignee *UserDTO     `json:"assignee,omitempty"`
+	Mine     bool         `json:"mine"`
 }
 
 // TransitionDTO is the Transition contract type.
@@ -57,11 +81,59 @@ type Column struct {
 type Board struct {
 	Columns   []Column `json:"columns"`
 	FetchedAt string   `json:"fetchedAt"`
+	Scope     string   `json:"scope"`
+	Truncated bool     `json:"truncated"`
+	// Hidden (scope "mine" only) counts my issues left out because their
+	// project is not tracked.
+	Hidden *HiddenDTO `json:"hidden,omitempty"`
 }
 
-const boardTTL = 60 * time.Second
+// HiddenDTO is Board.hidden.
+type HiddenDTO struct {
+	Count    int      `json:"count"`
+	Projects []string `json:"projects"` // sorted project keys
+}
+
+// hiddenByTracking describes the issues filterTracked dropped.
+func hiddenByTracking(all []jira.Issue, tracked []string) *HiddenDTO {
+	h := &HiddenDTO{Projects: []string{}}
+	set := trackedSet(tracked)
+	if set == nil {
+		return h
+	}
+	seen := map[string]bool{}
+	for _, is := range all {
+		if p := projectOf(is); !set[p] {
+			h.Count++
+			if !seen[p] && p != "" {
+				seen[p] = true
+				h.Projects = append(h.Projects, p)
+			}
+		}
+	}
+	sort.Strings(h.Projects)
+	return h
+}
+
+// Board scopes.
+const (
+	ScopeMine = "mine"
+	ScopeAll  = "all"
+)
+
+const (
+	boardTTL      = 60 * time.Second
+	mineBoardMax  = 300
+	allBoardMax   = 500
+	allBoardOrder = " AND statusCategory != Done ORDER BY updated DESC"
+)
 
 var boardFields = []string{"summary", "status", "issuetype", "priority", "updated", "assignee", "project"}
+
+// AllBoardJQL is the "all" board query for the tracked projects.
+func AllBoardJQL(tracked []string) string {
+	return "project in (" + quoteKeys(tracked) + ")" + allBoardOrder
+}
 
 func category(key string) string {
 	switch key {
@@ -96,32 +168,6 @@ func rfc3339(jiraTime string) string {
 		return jiraTime
 	}
 	return t.Local().Format(time.RFC3339)
-}
-
-func issueDTO(c *jira.Client, is jira.Issue) IssueDTO {
-	f := is.Fields
-	d := IssueDTO{
-		Key:     is.Key,
-		Summary: f.Summary,
-		URL:     c.BrowseURL(is.Key),
-		Status:  statusDTO(f.Status),
-		Updated: rfc3339(f.Updated),
-	}
-	if f.Project != nil {
-		d.Project = f.Project.Key
-	} else if i := strings.LastIndexByte(is.Key, '-'); i > 0 {
-		d.Project = is.Key[:i]
-	}
-	if f.IssueType != nil {
-		d.Type.Name = f.IssueType.Name
-	}
-	if f.Priority != nil {
-		d.Priority.Name = f.Priority.Name
-	}
-	if f.Assignee != nil {
-		d.Assignee = &AssigneeDTO{DisplayName: f.Assignee.DisplayName}
-	}
-	return d
 }
 
 // BuildColumns groups issues by status: columns ordered by category
@@ -160,39 +206,78 @@ func BuildColumns(issues []IssueDTO) []Column {
 	return out
 }
 
-func (a *App) getBoard(ctx context.Context, force bool) (*Board, error) {
+// parseScope maps "" to def and rejects anything but mine/all.
+func (a *App) parseScope(scope, def string) (string, error) {
+	switch scope {
+	case "":
+		return def, nil
+	case ScopeMine, ScopeAll:
+		return scope, nil
+	}
+	return "", a.newErr(CodeBadParams, "err_bad_scope")
+}
+
+func (a *App) getBoard(ctx context.Context, force bool, scope string) (*Board, error) {
+	scope, err := a.parseScope(scope, ScopeMine)
+	if err != nil {
+		return nil, err
+	}
 	c, id, err := a.client()
 	if err != nil {
 		return nil, err
 	}
-	now := a.clock.Now()
-	a.mu.Lock()
-	if !force && a.board != nil && a.boardFor == id && now.Sub(a.boardAt) < boardTTL {
-		b := a.board
-		a.mu.Unlock()
-		return b, nil
+	key := cacheBoard + ":" + scope
+	cached, gen, ok := a.cacheGet(key, id, boardTTL)
+	if ok && !force {
+		return cached.(*Board), nil
 	}
-	gen := a.boardGen
-	a.mu.Unlock()
+	now := a.clock.Now()
 
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	issues, err := c.Search(ctx, a.cfg.Get().BoardJQL, jira.SearchOptions{Fields: boardFields, Limit: 300})
+	tracked, err := a.trackedProjects(ctx, c, id, nil)
 	if err != nil {
 		return nil, err
 	}
+	b := &Board{Columns: []Column{}, FetchedAt: now.Format(time.RFC3339), Scope: scope}
+	jql, limit := a.cfg.Get().BoardJQL, mineBoardMax
+	if scope == ScopeAll {
+		inJira, err := a.queryProjects(ctx, c, id, tracked)
+		if err != nil {
+			return nil, err
+		}
+		if len(inJira) == 0 {
+			a.cachePut(key, id, gen, now, b)
+			return b, nil
+		}
+		jql, limit = AllBoardJQL(inJira), allBoardMax
+	}
+	v, err := a.newView(ctx, c, id)
+	if err != nil {
+		return nil, err
+	}
+	res, err := c.SearchAll(ctx, jql, jira.SearchOptions{Fields: v.fields(boardFields, false), Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	issues := filterTracked(res.Issues, tracked)
+	if scope == ScopeMine {
+		b.Hidden = hiddenByTracking(res.Issues, tracked)
+	}
+	var epicKeys []string
+	for i := range issues {
+		epicKeys = append(epicKeys, v.epicLink(&issues[i]))
+	}
+	a.loadEpics(ctx, v, epicKeys)
 	dtos := make([]IssueDTO, 0, len(issues))
 	for _, is := range issues {
-		dtos = append(dtos, issueDTO(c, is))
+		dtos = append(dtos, v.issue(is))
 	}
-	b := &Board{Columns: BuildColumns(dtos), FetchedAt: now.Format(time.RFC3339)}
-	a.mu.Lock()
+	b.Columns = BuildColumns(dtos)
+	b.Truncated = res.Truncated()
 	// A transition (or settings change) during the fetch makes the result
 	// possibly stale: return it, but do not cache it.
-	if a.boardGen == gen {
-		a.board, a.boardAt, a.boardFor = b, now, id
-	}
-	a.mu.Unlock()
+	a.cachePut(key, id, gen, now, b)
 	return b, nil
 }
 
@@ -223,7 +308,7 @@ func (a *App) getTransitions(ctx context.Context, key string) ([]TransitionDTO, 
 // fails, a minimal issue with the transition's target status is returned and
 // a "board" event asks the UI to refetch.
 func (a *App) transition(ctx context.Context, key, transitionID string) (*IssueDTO, error) {
-	c, _, err := a.client()
+	c, identity, err := a.client()
 	if err != nil {
 		return nil, err
 	}
@@ -256,17 +341,22 @@ func (a *App) transition(ctx context.Context, key, transitionID string) (*IssueD
 
 	gctx, gcancel := context.WithTimeout(ctx, 30*time.Second)
 	defer gcancel()
-	is, err := c.GetIssue(gctx, key, boardFields)
+	v, err := a.cachedView(gctx, c, identity)
+	var is *jira.Issue
+	if err == nil {
+		is, err = c.GetIssue(gctx, key, v.fields(boardFields, false))
+	}
 	if err != nil {
 		log.Printf("transition %s → %q done, but re-reading the issue failed: %v", key, chosen.To.Name, err)
 		to := chosen.To
-		d := IssueDTO{Key: key, URL: c.BrowseURL(key), Status: statusDTO(&to)}
+		d := IssueDTO{Key: key, URL: c.BrowseURL(key), Status: statusDTO(&to), Type: IssueTypeDTO{Kind: KindTask}}
 		if i := strings.LastIndexByte(key, '-'); i > 0 {
 			d.Project = key[:i]
 		}
 		a.emit("board", struct{}{})
 		return &d, nil
 	}
-	d := issueDTO(c, *is)
+	a.loadEpics(gctx, v, []string{v.epicLink(is)})
+	d := v.issue(*is)
 	return &d, nil
 }

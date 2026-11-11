@@ -242,3 +242,176 @@ project filter chips, refresh button, connection/user avatar.
 7. Autostart toggle works (HKCU Run), window close hides to tray, single instance.
 8. UI works in ru/uk/en, light/dark, without network resources.
 9. `jiraffe.exe --worklog-preview out.json` works headless.
+
+---
+
+# v0.2 — all issues, projects, issue details, sprints, epics & stories, load factor, redesign
+
+Everything above stays valid unless changed here. Facts from the real Jira (sd.local, Server/DC):
+
+- Issue type names are localized in responses ("Epic", "История", "Задача", sub-task types),
+  but JQL accepts canonical names: `issuetype = Epic`, `issuetype = Story` work.
+  Classify issues by **issuetype id**: learn the Epic/Story type ids from the results of the
+  `issuetype = Epic` / `issuetype = Story` queries (and from `/rest/api/2/issuetype` where the
+  name matches `Epic`/`Story` case-insensitively); `issuetype.subtask == true` ⇒ sub-task; else task.
+- Custom field ids differ between Jira instances — **discover them** via `GET /rest/api/2/field`
+  (cache per connection) by `schema.custom`:
+  `com.pyxis.greenhopper.jira:gh-epic-link` (Epic Link, here customfield_10103, value = epic key),
+  `…:gh-epic-label` (Epic Name, 10105), `…:gh-epic-color` (Epic Color, 10106, values like `ghx-label-4`),
+  `…:gh-sprint` (Sprint, 10107 — array of strings `com.atlassian.greenhopper.service.sprint.Sprint@…[id=6338,…,name=…,state=CLOSED,…]`
+  or objects; parse both), Story Points = a number field whose `clauseNames` contain `Story Points`
+  (here customfield_10130). Missing field ⇒ feature degrades gracefully (no crash, empty value).
+- Story → task relation in this Jira is via **issue links** (any link type, e.g. "relates to",
+  "blocks") and sub-tasks; tasks and stories belong to an epic via Epic Link.
+- Agile REST: `GET /rest/agile/1.0/board?projectKeyOrId=KEY&maxResults=50`,
+  `GET /rest/agile/1.0/board/{id}/sprint?state=active,future` and `state=closed` (paginated, `isLast`;
+  ordered oldest first). Sprint issues via JQL `sprint = {id}`.
+
+## Settings additions
+
+| key | default | notes |
+|---|---|---|
+| `loadFactor` | `1.0` | 0.0–1.0 (step 0.05). Effective daily cap = `dailyCapHours × loadFactor` |
+| `trackedProjects` | `null` | list of project keys. `null` = not initialised: on first need, initialise to the distinct projects of my not-done issues and persist |
+
+`boardJql` stays (advanced) and defines the "mine" board query.
+
+**Tracked projects** filter the board (both scopes), sprints (board list), epics & stories and
+comment alerts (post-filter by project key). The **worklog ignores this filter** — time is logged
+for everything I actually worked on, otherwise the daily cap would be wrong.
+
+## Worklog change — load factor
+
+Step 6 cap becomes `capSeconds = round(dailyCapHours × loadFactor × 3600)`. Everything else is the
+same. `WorklogRun` gets `capSeconds`. Tests (day 09–18, lunch 13–14, cap 8h):
+| scenario | expected |
+|---|---|
+| loadFactor 0.6, A all day | A 4h 48m |
+| loadFactor 0.5, A and B all day | 2h + 2h |
+| loadFactor 0.5, A all day, already logged 3h today elsewhere | A 1h |
+| loadFactor 0 | nothing logged, items show todo 0 |
+| loadFactor 1.0 | identical to v0.1 results |
+Validation: number, 0 ≤ x ≤ 1, field error otherwise.
+
+## Types (additions)
+
+```
+Kind       "epic" | "story" | "task" | "subtask"
+IssueType  { name, kind, iconColor? }
+User       { name, displayName }
+Issue      + { id, type: IssueType, assignee?: User, mine: bool, epic?: { key, name, color }, storyPoints?: number }
+IssueRef   { key, summary, url, status: Status, type: IssueType, assignee?: User, mine: bool }
+Progress   { done, inProgress, todo, total }          // counted by status category
+Project    { key, name, category?, lead?: string, tracked: bool, myOpen: number, available: bool }   // available=false: tracked key Jira no longer lists (shown only to untrack)
+Sprint     { id, name, state: "active"|"future"|"closed", startDate?, endDate?, completeDate?, goal?, boardId }
+AgileBoard { id, name, type: "scrum"|"kanban", projectKey }
+Comment    { id, author: User, created, updated, body }          // body = raw Jira wiki markup
+ChangeItem { field, from, to }                                    // display strings (fromString/toString, fallback from/to)
+Change     { id, author: User, created, items: [ChangeItem] }
+Link       { relation, issue: IssueRef }   // relation as seen from this issue: outward ⇒ type.outward, inward ⇒ type.inward
+IssueDetail {
+  issue: Issue, description (raw wiki markup, "" if none), reporter?: User, creator?: User,
+  created, updated, dueDate?, resolution?, labels: [], components: [], fixVersions: [],
+  priority?, timeTracking: { originalSeconds?, remainingSeconds?, spentSeconds?,
+                             original?, remaining?, spent? },   // formatted with hoursPerDay
+  storyPoints?, sprints: [Sprint],
+  epic?: IssueRef + { name, color },  // Epic Link target
+  parent?: IssueRef,                  // for sub-tasks
+  stories: [IssueRef],                // stories linked to this issue (for a task)
+  children: [IssueRef],               // epic ⇒ issues with this Epic Link; story ⇒ sub-tasks + linked non-epic/non-story issues; task ⇒ sub-tasks
+  links: [Link], comments: [Comment] (oldest first, max 200), changelog: [Change] (newest first),
+  watchers?: number
+}
+StoryNode  { story: IssueRef, epic?: IssueRef + { name, color } (getStories only), tasks: [IssueRef], progress: Progress, storyPoints? }
+EpicNode   { epic: IssueRef + { name, color }, stories: [StoryNode], tasks: [IssueRef], progress: Progress }
+```
+Epic tree rules: an epic contains its stories (Epic Link) and its tasks (Epic Link, not a story,
+not linked to one of the epic's stories). A story contains its sub-tasks and linked issues that are
+neither epics nor stories (dedupe by key; a task linked to several stories appears under each).
+Progress of an epic counts every distinct descendant issue. Stories without Epic Link are
+"orphan stories". Sort: not-done first, then by status category (indeterminate, new, done), then key desc.
+`scope: "mine"` keeps an epic/story if it, or any descendant, is assigned to me.
+Limits: max 300 epics/stories and 1000 children per call ⇒ `truncated: true`.
+
+## Methods (additions / changes)
+
+| method | params | result |
+|---|---|---|
+| `getBoard` | `{ force?, scope?: "mine"\|"all" }` (default "mine") | `{ columns, fetchedAt, scope, truncated, hidden?: { count, projects: [key] } }` (`hidden` = my issues filtered out because their project is not tracked; always present for scope mine — `{count:0, projects:[]}` when none — absent for all). "mine" = `boardJql`; "all" = `project in (tracked) AND statusCategory != Done ORDER BY updated DESC`, max 500 issues. Both post-filtered by tracked projects. Cache per scope |
+| `getIssue` | `{ key }` | `IssueDetail` (`expand=changelog`, all comments) |
+| `getProjects` | `{ force? }` | `[Project]` all projects I can browse (`/rest/api/2/project`), tracked first, then by name. `myOpen` = count of my not-done issues per project (one JQL) |
+| `setProjectTracked` | `{ key, tracked }` | `[Project]`; persists `trackedProjects`; invalidates board/epics/sprint caches and emits `board` |
+| `getAgileBoards` | `{ force? }` | `[AgileBoard]` of tracked projects (deduped by id) |
+| `getSprints` | `{ boardId }` | `[Sprint]`: active, then future, then the last 5 closed (newest first) |
+| `getSprint` | `{ sprintId, scope? }` | `{ sprint, columns (as board, including done), progress: Progress, storyPoints: { done, total }, truncated }` |
+| `getEpics` | `{ includeDone?, scope?, force? }` | `{ epics: [EpicNode], orphanStories: [StoryNode], fetchedAt, truncated }` — epics of tracked projects, not-done unless `includeDone` |
+| `getStories` | `{ includeDone?, scope?, force? }` | `{ stories: [StoryNode], fetchedAt, truncated }` |
+| `getUiPrefs` | – | object (`{}` if none) — UI preferences stored in state.json (`uiPrefs`) |
+| `setUiPrefs` | `{ prefs: object }` | `null`; whole object replaced, ≤ 32 KB compact JSON |
+
+Errors as before (`{code,message}` localized). Agile API unavailable (404) ⇒ `getAgileBoards` returns `[]`, UI says sprints are unavailable.
+
+## UI v0.2
+
+Nav rail: **Board, Sprints, Epics & stories, Worklog, Notifications, Projects, Settings**.
+
+- **Board**: a toggle in the top bar **"Only mine"** (checkbox/switch, remembered in localStorage;
+  default on) switching `scope`. In "all" mode cards show the assignee avatar (initials, colour
+  hashed from name); my cards are subtly highlighted. Truncated ⇒ hint. Cards also show epic chip
+  (epic colour) and story points.
+- **Status change via dropdown**: the status pill on a card and the status control in the drawer
+  open a dropdown listing the available transitions (fetched on open, loading state, target status
+  colour dot, keyboard: arrows/Enter/Esc). Drag & drop stays.
+- **Issue drawer** (wider, ~520px, resizable not required): header (type icon, key, summary,
+  status dropdown, open in Jira), tabs **Details / Comments (n) / History**.
+  Details: description (render a safe subset of Jira wiki markup: `h1.`–`h6.`, `*bold*`, `_italic_`,
+  `{{mono}}`, `{code}`/`{noformat}` blocks, `* `/`# ` lists, `[text|url]` links via `openUrl`,
+  `[~user]` mentions; everything else as text — **never innerHTML of Jira content**),
+  people (assignee, reporter), estimates (original / remaining / spent with a bar, story points),
+  sprint(s), epic, stories, children, linked issues grouped by relation, labels/components/versions,
+  dates. Every related issue is clickable and opens in the drawer (back button / history stack).
+  Comments: author, relative time, rendered body. History: changelog entries, `field: from → to`.
+- **Sprints**: board picker (from `getAgileBoards`, remembered), sprint picker (active selected by
+  default; state badges), sprint header (name, goal, dates, days left, progress bar by category,
+  story points done/total), issues as kanban columns (same cards, dropdown, drawer) with the
+  "Only mine" toggle. Kanban boards / no sprints ⇒ friendly empty state.
+- **Epics & stories**: segmented control **Epics | Stories**, search, "Only mine", "Show done".
+  Epics: list of expandable epic rows (epic colour stripe, name, key, status, progress bar with
+  counts); expanded ⇒ stories (each expandable to its tasks) and then direct tasks; a separate
+  section **"Stories without epic"** at the end. Stories: list of expandable story rows (epic chip
+  if any) with their tasks. Best practices: progressive disclosure, remembered expansion state,
+  keyboard (arrows / Enter / Space to expand), counts in collapsed rows, skeleton loading,
+  empty states, sticky section headers.
+- **Projects**: searchable list/grid of all accessible projects with a toggle "Tracked", my open
+  issue count, category; tracked first; bulk "Track only projects with my issues".
+- **Settings → Worklog**: `loadFactor` slider 0–1 (step 0.05) + numeric value, live hint
+  "max per day: 4h 48m". Worklog page shows the effective cap.
+- **Visual redesign — "task board" style, yellow × graphite**: graphite surfaces
+  (#1E1F22 / #2A2C30 / #35383D dark; light theme: warm paper #F7F5EF / white cards, graphite text
+  #2A2C30) with a signature yellow accent (#FFC400, hover #FFD54A, pressed #E6AC00, text on
+  yellow = graphite). More colour: status categories (new = slate blue-grey, indeterminate =
+  yellow/amber, done = green), priority colours (highest red → lowest blue), issue-type colours
+  (epic purple, story green, task blue, bug red, subtask teal), epic colours from Jira `ghx-label-N`
+  (map 1–14 to a palette), assignee avatar colours. Column headers with coloured top bar and
+  counts, cards with left colour stripe by type, subtle shadows, rounded 10px.
+  Motion: card enter (fade/translate, staggered), drag lift (scale+shadow), column drop
+  highlight, drawer slide-in, dropdown scale-in, expand/collapse height animation, progress bar
+  fill, skeleton shimmer, toast slide. 150–250 ms, ease-out; **all disabled under
+  `prefers-reduced-motion`**. Contrast WCAG AA in both themes; focus rings visible (yellow).
+- `ui/mock.js`: extend with ~4 projects, other people's issues, epics (with colours), stories
+  (in and outside epics, linked tasks, sub-tasks), 2 agile boards (scrum + kanban), sprints
+  (active/future/closed), comments with wiki markup, changelogs — enough to review every screen.
+
+## Acceptance criteria v0.2
+
+1. Board "Only mine" toggle switches between my issues and all not-done issues of tracked projects.
+2. Projects page lists accessible projects; toggling tracking persists and affects board, sprints, epics, alerts; worklog unaffected.
+3. Drawer shows description, comments, changelog, estimates/story points, people, links, epic, stories, children; related issues navigable.
+4. Status change via dropdown on card and in drawer.
+5. `loadFactor` setting validated, persisted, applied to the cap; scenario tests pass.
+6. Sprints view: boards → sprints → sprint issues with progress.
+7. Epics & stories view with the hierarchy rules above, orphan stories separately.
+8. Yellow-graphite redesign with animations, reduced-motion respected, ru/uk/en, light/dark, no network resources.
+9. `go vet`, `go test` pass; `build/jiraffe.exe` ≤ 5 MB.
+
+Note (v0.2): `saveSettings` invalidates the board caches and emits `board` when `jiraUrl`, the token or `boardJql` changed.

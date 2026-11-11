@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -47,7 +48,16 @@ type Settings struct {
 	NotifyComments     bool       `json:"notifyComments"`
 	CommentPollMinutes int        `json:"commentPollMinutes"`
 	BoardJQL           string     `json:"boardJql"`
+	// LoadFactor scales the daily cap: effective cap = DailyCapHours × LoadFactor.
+	LoadFactor float64 `json:"loadFactor"`
+	// TrackedProjects are the project keys the board, sprints, epics and
+	// comment alerts are limited to. nil (JSON null) = not initialised yet.
+	// Store.Save never changes it; use Store.UpdateTrackedProjects.
+	TrackedProjects []string `json:"trackedProjects"`
 }
+
+// MaxTrackedProjects bounds the tracked project list (JQL length).
+const MaxTrackedProjects = 200
 
 // Defaults returns the default settings.
 func Defaults() Settings {
@@ -69,7 +79,13 @@ func Defaults() Settings {
 		NotifyComments:     true,
 		CommentPollMinutes: 5,
 		BoardJQL:           DefaultBoardJQL,
+		LoadFactor:         1,
 	}
+}
+
+// CapSeconds is the effective daily worklog cap in seconds.
+func (s Settings) CapSeconds() int64 {
+	return int64(math.Round(s.DailyCapHours * s.LoadFactor * 3600))
 }
 
 // Clone returns a deep copy.
@@ -79,6 +95,9 @@ func (s Settings) Clone() Settings {
 	c.Vacations = append([]Vacation{}, s.Vacations...)
 	c.Holidays = append([]string{}, s.Holidays...)
 	c.InProgressStatuses = append([]string{}, s.InProgressStatuses...)
+	if s.TrackedProjects != nil { // keep nil (not initialised) distinct from empty
+		c.TrackedProjects = append([]string{}, s.TrackedProjects...)
+	}
 	return c
 }
 
@@ -187,6 +206,23 @@ func (s *Settings) Normalize() {
 		}
 	}
 	s.InProgressStatuses = st
+	s.TrackedProjects = NormalizeProjectKeys(s.TrackedProjects)
+}
+
+// NormalizeProjectKeys trims, upper-cases, sorts and dedups project keys.
+// nil stays nil (not initialised).
+func NormalizeProjectKeys(keys []string) []string {
+	if keys == nil {
+		return nil
+	}
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if k = strings.ToUpper(strings.TrimSpace(k)); k != "" {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return dedupStrings(out)
 }
 
 // Validate returns per-field errors; messages are in s.Language (fallback en).
@@ -283,7 +319,35 @@ func (s Settings) Validate() []FieldError {
 	if len(s.BoardJQL) > 2000 {
 		add("boardJql", "jqlLong")
 	}
+	if !(s.LoadFactor >= 0 && s.LoadFactor <= 1) {
+		add("loadFactor", "range", 0, 1)
+	}
+	if len(s.TrackedProjects) > MaxTrackedProjects {
+		add("trackedProjects", "projectsMany", MaxTrackedProjects)
+	}
+	for _, k := range s.TrackedProjects {
+		if !validProjectKey(k) {
+			add("trackedProjects", "projectKey", k)
+			break
+		}
+	}
 	return errs
+}
+
+// validProjectKey mirrors jira.ValidProjectKey (config does not import jira):
+// a letter, then letters, digits or underscores, at most 64 bytes.
+func validProjectKey(key string) bool {
+	if key == "" || len(key) > 64 {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		letter := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+		if i == 0 && !letter || !(letter || c >= '0' && c <= '9' || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 func dedupInts(a []int) []int {
@@ -407,6 +471,10 @@ func repair(s Settings, errs []FieldError) Settings {
 			s.CommentPollMinutes = d.CommentPollMinutes
 		case "boardJql":
 			s.BoardJQL = d.BoardJQL
+		case "loadFactor":
+			s.LoadFactor = d.LoadFactor
+		case "trackedProjects":
+			s.TrackedProjects = d.TrackedProjects
 		}
 	}
 	return s
@@ -438,14 +506,21 @@ func (st *Store) Configured() bool {
 
 // Save validates and persists s. token == nil keeps the stored token.
 // On validation failure it returns ErrValidation and the field errors.
+// s.TrackedProjects is ignored: the stored list is kept (a settings form
+// holding a stale copy must not undo project tracking changes), except that
+// it is reset to nil (not initialised) when the Jira origin changes.
 func (st *Store) Save(s Settings, token *string) (Settings, []FieldError, error) {
 	s = s.Clone()
 	s.Normalize()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	s.TrackedProjects = nil
+	if st.s.TrackedProjects != nil && (s.JiraURL == st.s.JiraURL || SameOrigin(s.JiraURL, st.s.JiraURL)) {
+		s.TrackedProjects = append([]string{}, st.s.TrackedProjects...)
+	}
 	if errs := s.Validate(); len(errs) > 0 {
 		return Settings{}, errs, ErrValidation
 	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	newToken := st.token
 	if token != nil {
 		newToken = strings.TrimSpace(*token)
@@ -455,6 +530,54 @@ func (st *Store) Save(s Settings, token *string) (Settings, []FieldError, error)
 	}
 	st.s, st.token = s, newToken
 	return s.Clone(), nil, nil
+}
+
+// ValidationError carries the field errors of a rejected update; it
+// matches ErrValidation with errors.Is.
+type ValidationError struct{ Fields []FieldError }
+
+func (e *ValidationError) Error() string {
+	if len(e.Fields) == 0 {
+		return ErrValidation.Error()
+	}
+	return ErrValidation.Error() + ": " + e.Fields[0].Field + ": " + e.Fields[0].Message
+}
+
+// Is makes errors.Is(err, ErrValidation) true.
+func (e *ValidationError) Is(target error) bool { return target == ErrValidation }
+
+// ErrConnectionChanged is returned by UpdateTrackedProjects when the Jira URL
+// is no longer the one the update was computed for.
+var ErrConnectionChanged = errors.New("the Jira connection changed")
+
+// UpdateTrackedProjects replaces the tracked project keys with fn(current)
+// atomically; current is nil when not initialised. If fn returns nil nothing
+// changes. jiraURL must be the URL the caller's data came from (else
+// ErrConnectionChanged). It returns the stored settings.
+func (st *Store) UpdateTrackedProjects(jiraURL string, fn func(cur []string) []string) (Settings, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.s.JiraURL != jiraURL {
+		return st.s.Clone(), ErrConnectionChanged
+	}
+	var cur []string
+	if st.s.TrackedProjects != nil {
+		cur = append([]string{}, st.s.TrackedProjects...)
+	}
+	keys := fn(cur)
+	if keys == nil {
+		return st.s.Clone(), nil
+	}
+	s := st.s.Clone()
+	s.TrackedProjects = NormalizeProjectKeys(keys)
+	if errs := s.Validate(); len(errs) > 0 {
+		return st.s.Clone(), &ValidationError{Fields: errs}
+	}
+	if err := st.write(s, st.token); err != nil {
+		return st.s.Clone(), err
+	}
+	st.s = s
+	return s.Clone(), nil
 }
 
 func (st *Store) write(s Settings, token string) error {

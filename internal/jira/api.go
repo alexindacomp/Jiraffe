@@ -1,7 +1,9 @@
 package jira
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/url"
 	"strconv"
 	"strings"
@@ -45,10 +47,51 @@ type Named struct {
 	Name string `json:"name"`
 }
 
-// Project of an issue.
+// Project of an issue (also an entry of GET /rest/api/2/project, where the
+// category and, with expand=lead, the lead are filled).
 type Project struct {
-	Key  string `json:"key"`
-	Name string `json:"name"`
+	ID              string `json:"id"`
+	Key             string `json:"key"`
+	Name            string `json:"name"`
+	ProjectCategory *Named `json:"projectCategory"`
+	Lead            *User  `json:"lead"`
+}
+
+// IssueType of an issue. Names are localized; classify by ID.
+type IssueType struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Subtask bool   `json:"subtask"`
+}
+
+// TimeTracking is the "timetracking" field (absent values stay nil).
+type TimeTracking struct {
+	OriginalEstimateSeconds  *int64 `json:"originalEstimateSeconds"`
+	RemainingEstimateSeconds *int64 `json:"remainingEstimateSeconds"`
+	TimeSpentSeconds         *int64 `json:"timeSpentSeconds"`
+}
+
+// IssueLinkType names the two directions of a link type.
+type IssueLinkType struct {
+	Name    string `json:"name"`
+	Inward  string `json:"inward"`
+	Outward string `json:"outward"`
+}
+
+// IssueLink is one entry of the "issuelinks" field. Exactly one of
+// InwardIssue / OutwardIssue is set: OutwardIssue means "this issue
+// <Type.Outward> OutwardIssue", InwardIssue means "this issue <Type.Inward>
+// InwardIssue".
+type IssueLink struct {
+	ID           string        `json:"id"`
+	Type         IssueLinkType `json:"type"`
+	InwardIssue  *Issue        `json:"inwardIssue"`
+	OutwardIssue *Issue        `json:"outwardIssue"`
+}
+
+// Watches is the "watches" field.
+type Watches struct {
+	WatchCount int `json:"watchCount"`
 }
 
 // Comment on an issue.
@@ -73,11 +116,101 @@ type Fields struct {
 	Created   string       `json:"created"`
 	Updated   string       `json:"updated"`
 	Assignee  *User        `json:"assignee"`
-	IssueType *Named       `json:"issuetype"`
+	IssueType *IssueType   `json:"issuetype"`
 	Priority  *Named       `json:"priority"`
 	Project   *Project     `json:"project"`
 	Comment   *CommentPage `json:"comment"`
 	Worklog   *WorklogPage `json:"worklog"`
+
+	Description  string        `json:"description"`
+	Reporter     *User         `json:"reporter"`
+	Creator      *User         `json:"creator"`
+	DueDate      string        `json:"duedate"`
+	Resolution   *Named        `json:"resolution"`
+	Labels       []string      `json:"labels"`
+	Components   []Named       `json:"components"`
+	FixVersions  []Named       `json:"fixVersions"`
+	TimeTracking *TimeTracking `json:"timetracking"`
+	IssueLinks   []IssueLink   `json:"issuelinks"`
+	Subtasks     []Issue       `json:"subtasks"`
+	Parent       *Issue        `json:"parent"`
+	Watches      *Watches      `json:"watches"`
+
+	// Custom holds the raw values of customfield_* fields (ids differ
+	// between Jira instances, see DiscoverFields).
+	Custom map[string]json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON decodes the known fields and keeps customfield_* raw.
+func (f *Fields) UnmarshalJSON(b []byte) error {
+	type plain Fields
+	if err := json.Unmarshal(b, (*plain)(f)); err != nil {
+		return err
+	}
+	if !bytes.Contains(b, []byte(`"customfield_`)) {
+		return nil // nothing custom requested: skip the second pass
+	}
+	// Walk the top-level keys only; values are copied raw, not decoded.
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if _, err := dec.Token(); err != nil { // {
+		return err
+	}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return err
+		}
+		if k, _ := tok.(string); strings.HasPrefix(k, "customfield_") {
+			if f.Custom == nil {
+				f.Custom = map[string]json.RawMessage{}
+			}
+			f.Custom[k] = v
+		}
+	}
+	return nil
+}
+
+// CustomString returns a custom field holding a string (or an object with a
+// "key"/"value"/"name"), "" when absent, null or of another type.
+func (f *Fields) CustomString(id string) string {
+	raw, ok := f.Custom[id]
+	if id == "" || !ok {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var o struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+		Name  string `json:"name"`
+	}
+	if json.Unmarshal(raw, &o) == nil {
+		for _, v := range []string{o.Key, o.Value, o.Name} {
+			if v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// CustomNumber returns a numeric custom field, nil when absent or null.
+func (f *Fields) CustomNumber(id string) *float64 {
+	raw, ok := f.Custom[id]
+	if id == "" || !ok {
+		return nil
+	}
+	var n *float64
+	if json.Unmarshal(raw, &n) != nil {
+		return nil
+	}
+	return n
 }
 
 // ChangeItem is one changed field of a changelog history entry.
@@ -138,6 +271,15 @@ func (c *Client) Myself(ctx context.Context) (*User, error) {
 	return &u, nil
 }
 
+// SearchResult is a (possibly truncated) search: Total is what Jira matched.
+type SearchResult struct {
+	Issues []Issue
+	Total  int
+}
+
+// Truncated reports whether Jira matched more issues than were fetched.
+func (r *SearchResult) Truncated() bool { return r.Total > len(r.Issues) }
+
 type searchResult struct {
 	StartAt    int     `json:"startAt"`
 	MaxResults int     `json:"maxResults"`
@@ -150,17 +292,30 @@ type SearchOptions struct {
 	Fields []string
 	Expand string
 	Limit  int // max issues to return in total; <= 0 means 500
+	// NoValidateQuery sends validateQuery=false: Jira then ignores unknown
+	// or hidden values (e.g. issue keys in "issuekey in (…)") instead of
+	// rejecting the whole query with HTTP 400.
+	NoValidateQuery bool
 }
 
 const searchPage = 100
 
 // Search runs a JQL query and follows pagination up to opts.Limit issues.
 func (c *Client) Search(ctx context.Context, jql string, opts SearchOptions) ([]Issue, error) {
+	res, err := c.SearchAll(ctx, jql, opts)
+	if err != nil {
+		return nil, err
+	}
+	return res.Issues, nil
+}
+
+// SearchAll is Search that also reports how many issues Jira matched.
+func (c *Client) SearchAll(ctx context.Context, jql string, opts SearchOptions) (*SearchResult, error) {
 	limit := opts.Limit
 	if limit <= 0 {
 		limit = 500
 	}
-	var out []Issue
+	out := &SearchResult{}
 	for start := 0; start < limit; {
 		q := url.Values{}
 		q.Set("jql", jql)
@@ -169,6 +324,9 @@ func (c *Client) Search(ctx context.Context, jql string, opts SearchOptions) ([]
 		}
 		if opts.Expand != "" {
 			q.Set("expand", opts.Expand)
+		}
+		if opts.NoValidateQuery {
+			q.Set("validateQuery", "false")
 		}
 		page := searchPage
 		if limit-start < page {
@@ -180,7 +338,10 @@ func (c *Client) Search(ctx context.Context, jql string, opts SearchOptions) ([]
 		if err := c.do(ctx, "GET", "/rest/api/2/search", q, nil, &res); err != nil {
 			return nil, err
 		}
-		out = append(out, res.Issues...)
+		out.Issues = append(out.Issues, res.Issues...)
+		if res.Total > out.Total {
+			out.Total = res.Total
+		}
 		start += len(res.Issues)
 		if len(res.Issues) == 0 || start >= res.Total {
 			break

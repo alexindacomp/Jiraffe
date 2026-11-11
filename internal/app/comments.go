@@ -36,6 +36,14 @@ func (a *App) PollComments(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Alerts only for tracked projects. If they cannot be determined now,
+	// alert for all (as before tracking existed) rather than drop comments.
+	tracked, err := a.trackedProjects(ctx, c, identity, nil)
+	if err != nil {
+		log.Printf("comments: tracked projects unknown, not filtering: %v", err)
+		tracked = nil
+	}
+	alertFor := trackedSet(tracked)
 	s := a.cfg.Get()
 	now := a.clock.Now()
 	snap := a.st.Snapshot()
@@ -55,7 +63,7 @@ func (a *App) PollComments(ctx context.Context) error {
 	// Oldest first, so a truncated result still covers a contiguous period
 	// and the next poll continues from where this one stopped.
 	jql := fmt.Sprintf("assignee = currentUser() AND updated >= -%dm ORDER BY updated ASC", window)
-	issues, err := c.Search(ctx, jql, jira.SearchOptions{Fields: []string{"summary", "comment", "updated"}, Limit: maxPollIssues})
+	issues, err := c.Search(ctx, jql, jira.SearchOptions{Fields: []string{"summary", "comment", "updated", "project"}, Limit: maxPollIssues})
 	if err != nil {
 		return err
 	}
@@ -91,7 +99,9 @@ func (a *App) PollComments(ctx context.Context) error {
 					continue
 				}
 				tx.MarkSeen(cm.ID)
-				if initial || me.Same(cm.Author) {
+				// Comments of untracked projects are marked seen too, so
+				// tracking a project later does not replay old comments.
+				if initial || me.Same(cm.Author) || alertFor != nil && !alertFor[projectOf(is)] {
 					continue
 				}
 				created, err := jira.ParseTime(cm.Created)

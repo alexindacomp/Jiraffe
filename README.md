@@ -1,13 +1,15 @@
 # Jiraffe
 
 A small Windows tray companion for Jira Server/Data Center: automatic daily
-worklogs, a board of my open issues, quick status changes and alerts about new
-comments on my issues. One self-contained `jiraffe.exe` (Go, no CGO, WebView2
-UI, about 3.6 MB). The full specification is in [SPEC.md](SPEC.md).
+worklogs (with a load factor), a board of my or all open issues, quick status
+changes from a dropdown, issue details (description, comments, history,
+estimates, links, epic and stories), sprints, epics & stories, tracked projects
+and alerts about new comments on my issues. One self-contained `jiraffe.exe` (Go, no CGO, WebView2
+UI, about 4.0 MB). The full specification is in [SPEC.md](SPEC.md).
 
 ## Download
 
-**[⬇ jiraffe.exe](https://github.com/alexindacomp/Jiraffe/raw/master/dist/jiraffe.exe)** — Windows 10/11 x64, about 3.6 MB.
+**[⬇ jiraffe.exe](https://github.com/alexindacomp/Jiraffe/raw/master/dist/jiraffe.exe)** — Windows 10/11 x64, about 4.0 MB.
 
 Put it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\Jiraffe\jiraffe.exe`
 (autostart points to the exe's current location), run it and enter your Jira URL

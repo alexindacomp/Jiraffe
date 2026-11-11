@@ -4,6 +4,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -60,6 +61,7 @@ const (
 	CodeUnknownMethod = "unknown_method"
 	CodeForbiddenURL  = "forbidden_url"
 	CodeInternal      = "internal"
+	CodeConflict      = "conflict" // the connection changed during the call
 )
 
 // CodeBadNonce rejects calls from pages that are not the app (missing or
@@ -165,13 +167,15 @@ type App struct {
 
 	mu        sync.Mutex
 	user      *jira.User
-	userFor   string // identity (url + token) the cached user belongs to
-	board     *Board
-	boardAt   time.Time
-	boardFor  string
-	boardGen  uint64     // bumped on every invalidation; stale fetches are not cached
-	runMu     sync.Mutex // serializes worklog runs that write to Jira
-	pollMu    sync.Mutex // serializes comment polls
+	userFor   string                // identity (url + token) the cached user belongs to
+	cache     map[string]cacheEntry // board, epics, projects, … (see cache.go)
+	cacheGen  uint64                // bumped on every invalidation; stale fetches are not cached
+	meta      *metaEntry            // custom field ids and issue type ids
+	metaMu    sync.Mutex            // one metadata discovery at a time
+	epics     epicCache             // epic names/colours for epic chips
+	trackMu   sync.Mutex            // serializes the lazy trackedProjects initialisation
+	runMu     sync.Mutex            // serializes worklog runs that write to Jira
+	pollMu    sync.Mutex            // serializes comment polls
 	bgWG      sync.WaitGroup
 	bgCtx     context.Context
 	bgCancel  context.CancelFunc
@@ -258,12 +262,77 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 		return a.saveSettings(params)
 	case "getBoard":
 		var p struct {
+			Force bool   `json:"force"`
+			Scope string `json:"scope"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.getBoard(ctx, p.Force, p.Scope)
+	case "getIssue":
+		var p struct {
+			Key string `json:"key"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.getIssue(ctx, p.Key)
+	case "getProjects":
+		var p struct {
 			Force bool `json:"force"`
 		}
 		if err := a.decode(params, &p); err != nil {
 			return nil, err
 		}
-		return a.getBoard(ctx, p.Force)
+		return a.getProjects(ctx, p.Force)
+	case "setProjectTracked":
+		var p struct {
+			Key     string `json:"key"`
+			Tracked bool   `json:"tracked"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.setProjectTracked(ctx, p.Key, p.Tracked)
+	case "getAgileBoards":
+		var p struct {
+			Force bool `json:"force"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.getAgileBoards(ctx, p.Force)
+	case "getSprints":
+		var p struct {
+			BoardID int  `json:"boardId"`
+			Force   bool `json:"force"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.getSprints(ctx, p.BoardID, p.Force)
+	case "getSprint":
+		var p struct {
+			SprintID int    `json:"sprintId"`
+			Scope    string `json:"scope"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.getSprint(ctx, p.SprintID, p.Scope)
+	case "getEpics", "getStories":
+		var p struct {
+			IncludeDone bool   `json:"includeDone"`
+			Scope       string `json:"scope"`
+			Force       bool   `json:"force"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		if method == "getEpics" {
+			return a.getEpics(ctx, p.IncludeDone, p.Scope, p.Force)
+		}
+		return a.getStories(ctx, p.IncludeDone, p.Scope, p.Force)
 	case "getTransitions":
 		var p struct {
 			Key string `json:"key"`
@@ -309,6 +378,16 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 			n = []state.Notification{}
 		}
 		return n, nil
+	case "getUiPrefs":
+		return a.uiPrefs(), nil
+	case "setUiPrefs":
+		var p struct {
+			Prefs json.RawMessage `json:"prefs"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, a.setUIPrefs(p.Prefs)
 	case "markNotificationsRead":
 		var p struct {
 			IDs *[]string `json:"ids"`
@@ -470,21 +549,22 @@ func (a *App) refreshUser(ctx context.Context) {
 	a.emitState()
 }
 
+// invalidateCaches drops everything learned from Jira (connection changed).
 func (a *App) invalidateCaches() {
 	a.mu.Lock()
 	a.user, a.userFor = nil, ""
-	a.board, a.boardFor = nil, ""
-	a.boardGen++
+	a.cache = nil
+	a.meta = nil
+	a.epics = epicCache{}
+	a.cacheGen++
 	a.mu.Unlock()
 }
 
-// invalidateBoard drops the cached board; a fetch already in flight will not
-// store its (possibly stale) result.
+// invalidateBoard drops the cached issue lists (board, sprint boards, epics,
+// stories, project issue counts) after issues changed; a fetch already in
+// flight will not store its (possibly stale) result.
 func (a *App) invalidateBoard() {
-	a.mu.Lock()
-	a.board = nil
-	a.boardGen++
-	a.mu.Unlock()
+	a.dropCache(cacheBoard, cacheEpics, cacheStories, cacheProjects)
 }
 
 // --- settings --------------------------------------------------------------
@@ -572,8 +652,12 @@ func (a *App) saveSettings(params json.RawMessage) (any, error) {
 		config.Settings
 		Token *string `json:"token"`
 	}{Settings: old.Clone()}
-	if err := a.decode(params, &in); err != nil {
-		return nil, err
+	if err := json.Unmarshal(params, &in); err != nil {
+		// A non-number loadFactor is a field error, not a malformed call.
+		if fe := loadFactorTypeError(params, in.Language); fe != nil {
+			return nil, &Error{Code: CodeValidation, Message: T(in.Language, "errInvalidSettings"), Fields: []config.FieldError{*fe}}
+		}
+		return nil, &Error{Code: CodeBadParams, Message: T(a.Language(), "err_bad_params") + ": " + err.Error()}
 	}
 	if in.Token != nil && strings.TrimSpace(*in.Token) == "" {
 		in.Token = nil // empty token field means "keep the stored one"
@@ -586,6 +670,9 @@ func (a *App) saveSettings(params json.RawMessage) (any, error) {
 		lang := in.Language
 		return nil, &Error{Code: CodeValidation, Message: T(lang, "errInvalidSettings"),
 			Fields: []config.FieldError{{Field: "token", Message: T(lang, "errTokenForNewHost")}}}
+	}
+	if fe := loadFactorTypeError(params, in.Language); fe != nil {
+		return nil, &Error{Code: CodeValidation, Message: T(in.Language, "errInvalidSettings"), Fields: []config.FieldError{*fe}}
 	}
 	saved, fieldErrs, err := a.cfg.Save(in.Settings, in.Token)
 	if errors.Is(err, config.ErrValidation) {
@@ -600,8 +687,11 @@ func (a *App) saveSettings(params json.RawMessage) (any, error) {
 		warnings = append(warnings, T(saved.Language, "warn_http"))
 	}
 	connChanged := saved.JiraURL != old.JiraURL || a.cfg.Token() != oldToken
+	boardChanged := saved.BoardJQL != old.BoardJQL // the "mine" board query
 	if connChanged {
 		a.invalidateCaches()
+	} else if boardChanged {
+		a.dropCache(cacheBoard)
 	}
 	// Re-apply also when the registry disagrees with the stored preference
 	// (e.g. an earlier write failed).
@@ -616,9 +706,65 @@ func (a *App) saveSettings(params json.RawMessage) (any, error) {
 	a.emitState()
 	if connChanged {
 		a.goBackground("refresh user", func(ctx context.Context) { a.refreshUser(ctx) })
-		a.emit("board", struct{}{}) // cache already cleared by invalidateCaches
+	}
+	if connChanged || boardChanged {
+		a.emit("board", struct{}{}) // the cached board was dropped above
 	}
 	return SaveResult{SettingsView: a.settingsView(saved), Warnings: warnings}, nil
+}
+
+// loadFactorTypeError returns a field error when params carry a loadFactor
+// that is not a JSON number (e.g. a string or null).
+func loadFactorTypeError(params json.RawMessage, lang string) *config.FieldError {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(params, &raw) != nil {
+		return nil
+	}
+	v, ok := raw["loadFactor"]
+	if !ok {
+		return nil
+	}
+	var n float64
+	if t := strings.TrimSpace(string(v)); t != "null" && json.Unmarshal(v, &n) == nil {
+		return nil
+	}
+	return &config.FieldError{Field: "loadFactor", Message: config.RangeMessage(lang, 0, 1)}
+}
+
+// --- UI preferences ----------------------------------------------------------
+
+// MaxUIPrefsBytes bounds the stored UI preferences (compact JSON).
+const MaxUIPrefsBytes = 32 * 1024
+
+// uiPrefs returns the stored UI preferences object ({} if none).
+func (a *App) uiPrefs() json.RawMessage {
+	p := a.st.Snapshot().UIPrefs
+	if len(p) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	return p
+}
+
+// setUIPrefs replaces the stored UI preferences with raw, which must be a
+// JSON object of at most MaxUIPrefsBytes (compact). Contents are never logged.
+func (a *App) setUIPrefs(raw json.RawMessage) error {
+	var obj map[string]json.RawMessage
+	if t := strings.TrimSpace(string(raw)); !strings.HasPrefix(t, "{") || json.Unmarshal(raw, &obj) != nil {
+		return a.newErr(CodeBadParams, "err_prefs_object")
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		return a.newErr(CodeBadParams, "err_prefs_object")
+	}
+	if buf.Len() > MaxUIPrefsBytes {
+		return a.newErr(CodeBadParams, "err_prefs_too_large", MaxUIPrefsBytes/1024)
+	}
+	prefs := json.RawMessage(buf.Bytes())
+	if err := a.st.Update(func(tx state.Tx) { tx.UIPrefs = prefs }); err != nil {
+		log.Printf("save ui prefs: %v", err)
+		return &Error{Code: CodeInternal, Message: T(a.Language(), "err_save_failed") + ": " + err.Error()}
+	}
+	return nil
 }
 
 // --- notifications ---------------------------------------------------------

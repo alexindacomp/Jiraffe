@@ -117,6 +117,53 @@
     String(a.name || '').toLowerCase() === String(b.name || '').toLowerCase());
   const CAT_ORDER = { new: 0, indeterminate: 1, done: 2 };
 
+  /** UI preferences, one JSON object. Stored by the Go side (getUiPrefs / setUiPrefs, whole object, ≤ 32 KB)
+      because a WebView2 page loaded from a string may have no usable localStorage. If getUiPrefs fails
+      (older backend) the object lives in localStorage when available, else in memory for this window. */
+  const prefs = (() => {
+    const LS_KEY = 'jiraffe.prefs';
+    const MAX_BYTES = 24 * 1024; // stay well under the backend's 32 KB limit
+    let data = {};
+    let remote = false;
+    let timer = null;
+    let store = null;
+    try { store = window.localStorage; store.setItem('jiraffe.probe', '1'); store.removeItem('jiraffe.probe'); } catch { store = null; }
+    const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+    function readLocal() {
+      if (!store) return {};
+      try { const v = JSON.parse(store.getItem(LS_KEY) || '{}'); return isObj(v) ? v : {}; } catch { return {}; }
+    }
+    function flush() {
+      clearTimeout(timer);
+      timer = null;
+      if (remote) api('setUiPrefs', { prefs: data }).catch(() => { /* best effort: kept in memory for this window */ });
+    }
+    return {
+      /** Loads once at startup; never blocks longer than a few seconds. */
+      async load() {
+        try {
+          const res = await Promise.race([api('getUiPrefs'), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))]);
+          if (isObj(res)) { data = res; remote = true; return; }
+        } catch { /* older backend or no bridge */ }
+        remote = false;
+        data = readLocal();
+      },
+      get(key, def) { return Object.prototype.hasOwnProperty.call(data, key) ? data[key] : def; },
+      set(key, value) {
+        if (JSON.stringify(data[key]) === JSON.stringify(value)) return; // unchanged: no save
+        data[key] = value;
+        // Only the expansion list can grow; trim the oldest entries if the object gets too big.
+        while (Array.isArray(data['epics.expanded']) && data['epics.expanded'].length && JSON.stringify(data).length > MAX_BYTES) {
+          data['epics.expanded'] = data['epics.expanded'].slice(Math.ceil(data['epics.expanded'].length / 4));
+        }
+        if (remote) { clearTimeout(timer); timer = setTimeout(flush, 500); }
+        else if (store) { try { store.setItem(LS_KEY, JSON.stringify(data)); } catch { /* quota or denied: memory only */ } }
+      },
+      /** Sends a pending debounced save right away (window is going away). */
+      flushNow() { if (timer) flush(); },
+    };
+  })();
+
   function setBusy(btn, busy) {
     if (!btn) return;
     btn.disabled = !!busy;
@@ -134,17 +181,35 @@
     settings: null,          // last saved Settings from backend
     langOverride: null,      // language chosen in UI but not yet persisted
 
-    board: null,             // { columns: [{status, issues, synthetic?}], fetchedAt }
+    q: { board: '', sprints: '', epics: '', projects: '' }, // search box text per view
+
+    board: null,             // { columns: [{status, issues, synthetic?}], fetchedAt, scope, truncated, hidden }
+    hiddenDismissed: null,   // projects signature of the "issues in untracked projects" banner closed this session
+    boardScope: 'mine',      // preferences are applied in applyPrefs() once loaded
+    boardCache: {},          // the other scope's board, kept while switching "Only mine"
     boardLoading: false,
     boardError: null,
     boardSeq: 0,
     boardStale: false,
-    boardRenderDeferred: false,
-    filter: { q: '', projects: new Set() },
+    boardAnimate: false,
+    renderDeferred: new Set(), // kanbans whose re-render waits for the drag to end
+    filter: { projects: new Set() },
     pendingKeys: new Set(),  // issues with a transition in flight
     transCache: new Map(),   // key -> Promise<[Transition]>
-    drag: null,              // { key, fromId }
-    drawer: null,            // { key, issue, transitions, loading, error, busyId }
+    drag: null,              // { key, from, kb, blockedOver }
+    drawer: null,            // { stack: [{key, seed}], detail, loading, error, tab, seq }
+
+    sp: { boards: null, boardsLoading: false, boardsError: null, boardsSeq: 0, boardsStale: false,
+          boardId: null,
+          sprints: null, sprintsLoading: false, sprintsError: null, sprintsSeq: 0,
+          sprintId: null, data: null, dataLoading: false, dataError: null, dataSeq: 0, dataStale: false,
+          mine: false, animate: false },
+
+    ep: { mode: 'epics', includeDone: false, mine: false,
+          cache: new Map(), cacheGen: 0, data: null, loading: false, error: null, seq: 0, stale: false,
+          expanded: new Set(), overrides: new Map(), opening: null, focusNode: null },
+
+    pj: { list: null, loading: false, error: null, seq: 0, busy: new Set(), bulk: false, restoreFocus: null },
 
     wl: { preview: null, previewLoading: false, previewError: null, previewSeq: 0,
           result: null, running: false,
@@ -159,6 +224,18 @@
   };
 
   const isConfigured = () => !!(S.appState && S.appState.configured);
+
+  /** Remembered UI choices. Defaults: "Only mine" on for the board, off for sprints and epics. */
+  function applyPrefs() {
+    S.boardScope = prefs.get('board.mine', true) === false ? 'all' : 'mine';
+    S.sp.boardId = prefs.get('sprint.board', null);
+    S.sp.mine = prefs.get('sprint.mine', false) === true;
+    S.ep.mode = prefs.get('epics.mode', 'epics') === 'stories' ? 'stories' : 'epics';
+    S.ep.includeDone = prefs.get('epics.done', false) === true;
+    S.ep.mine = prefs.get('epics.mine', false) === true;
+    const exp = prefs.get('epics.expanded', []);
+    S.ep.expanded = new Set((Array.isArray(exp) ? exp : []).map(String));
+  }
 
   /* ================================================================
    * Layers (drawer + dialogs). Non-modal <dialog>s; the app is made
@@ -187,7 +264,7 @@
       if (top) top.el.inert = false;
       else { $('#app').inert = false; $('#scrim').hidden = true; }
       if (entry.opts.onClose) entry.opts.onClose(result);
-      const restore = entry.opts.restoreFocus ? entry.opts.restoreFocus() : entry.prevFocus;
+      const restore = (entry.opts.restoreFocus && entry.opts.restoreFocus()) || entry.prevFocus;
       if (restore && document.contains(restore) && typeof restore.focus === 'function') restore.focus({ preventScroll: true });
     },
     top() { return this.stack[this.stack.length - 1] || null; },
@@ -279,22 +356,41 @@
     </div>`;
   }
 
+  const catOf = (st) => (st && CAT_ORDER[st.category] != null ? st.category : 'new');
   function statusPill(status) {
     if (!status) return '';
-    return html`<span class="status-pill" data-cat="${status.category || 'new'}">${status.name}</span>`;
+    return html`<span class="status-pill" data-cat="${catOf(status)}">${status.name}</span>`;
+  }
+  /** Status pill that opens the transitions dropdown (cards and drawer). */
+  function statusButton(issue) {
+    const pend = S.pendingKeys.has(issue.key);
+    const name = nameOf(issue.status);
+    return html`<button type="button" class="status-btn" data-cat="${catOf(issue.status)}" data-status-menu="${issue.key}" data-role="status" aria-haspopup="menu" aria-expanded="false" aria-label="${t('status.change', { status: name })}" title="${t('status.changeTitle')}" ${pend ? html`disabled` : ''}><span class="status-btn-text">${name}</span>${pend ? html`<span class="spinner spinner-xs" aria-hidden="true"></span>` : icon('chevron-down', 'icon-xs')}</button>`;
   }
 
-  const TYPE_MAP = [
-    [/bug|ошиб|помил|дефект|defect|incident|инцидент|інцидент/i, 'bug'],
-    [/story|истор|істор/i, 'story'],
-    [/epic|эпик|епік/i, 'epic'],
-    [/task|задач|завдан/i, 'task'],
-  ];
+  /* Issue kinds (SPEC v0.2: type.kind; names are localized, so fall back to a name match). */
+  function kindOf(type) {
+    const k = type && type.kind;
+    if (k === 'epic' || k === 'story' || k === 'task' || k === 'subtask') return k;
+    const name = nameOf(type);
+    if (/sub-?task|подзадач|підзадач/i.test(name)) return 'subtask';
+    if (/epic|эпик|епік/i.test(name)) return 'epic';
+    if (/story|истор|істор/i.test(name)) return 'story';
+    return 'task';
+  }
+  const isBug = (type) => /bug|ошиб|помил|дефект|defect|incident|инцидент|інцидент/i.test(nameOf(type));
+  /** Visual type (colour + icon): epic | story | task | bug | subtask. */
+  const typeVisual = (type) => { const k = kindOf(type); return k === 'task' && isBug(type) ? 'bug' : k; };
+  function typeIcon(type, decorative) {
+    const v = typeVisual(type);
+    const name = nameOf(type) || t('kind.' + kindOf(type));
+    const a11y = decorative ? html`aria-hidden="true"` : html`role="img" aria-label="${name}" title="${name}"`;
+    return html`<span class="tico" data-type="${v}" ${a11y}><svg aria-hidden="true"><use href="#t-${v}"></use></svg></span>`;
+  }
   function typeBadge(type) {
     const name = nameOf(type);
     if (!name) return '';
-    const kind = (TYPE_MAP.find(([re]) => re.test(name)) || [, 'other'])[1];
-    return html`<span class="type-badge" data-type="${kind}">${name}</span>`;
+    return html`<span class="type-badge">${typeIcon(type, true)}<span>${name}</span></span>`;
   }
 
   const PRIO_MAP = [
@@ -312,6 +408,48 @@
     return html`<span class="prio" data-level="${m[1]}" title="${label}">${icon(m[2])}<span class="sr-only">${label}</span></span>`;
   }
 
+  /* Colours hashed from names (avatars, project badges) and Jira epic colours ghx-label-1..14. */
+  function hash(s) {
+    let h = 2166136261;
+    for (const ch of String(s || '')) { h ^= ch.codePointAt(0); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  const AVATAR_TONES = 10;
+  const avatarTone = (name) => hash(String(name || '').trim().toLowerCase()) % AVATAR_TONES;
+  function avatar(name, cls) {
+    return html`<span class="avatar ${cls || 'avatar-xs'}" data-tone="${avatarTone(name)}" aria-hidden="true">${initials(name)}</span>`;
+  }
+  function assigneeAvatar(user) {
+    const name = user && (user.displayName || user.name);
+    if (!name) return '';
+    const label = t('issue.assigneeValue', { name });
+    return html`<span class="avatar avatar-xs" data-tone="${avatarTone(name)}" role="img" aria-label="${label}" title="${label}">${initials(name)}</span>`;
+  }
+  const EPIC_TONES = 14;
+  function epicTone(color, key) {
+    const m = /ghx-label-(\d+)/.exec(String(color || ''));
+    const n = m ? Number(m[1]) : 0;
+    return n >= 1 && n <= EPIC_TONES ? n : (hash(key) % EPIC_TONES) + 1;
+  }
+  function epicChip(epic) {
+    if (!epic || !epic.key) return '';
+    const name = epic.name || epic.summary || epic.key;
+    const label = t('issue.epicValue', { name });
+    return html`<span class="epic-chip" data-epic="${epicTone(epic.color, epic.key)}" title="${label}"><span class="sr-only">${label}</span><span class="epic-chip-text" aria-hidden="true">${name}</span></span>`;
+  }
+  const fmtNum = (n) => new Intl.NumberFormat(i18n.locale, { maximumFractionDigits: 1 }).format(Number(n) || 0);
+  const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /** Progress by status category: done (green) + in progress (amber) over a "to do" track. */
+  function progressBar(p, opts = {}) {
+    const n = (v) => Math.max(0, Number(v) || 0);
+    const done = n(p && p.done); const ind = n(p && p.inProgress); const todo = n(p && p.todo);
+    const total = Math.max(n(p && p.total), done + ind + todo);
+    const pct = (v) => (total ? (v / total * 100).toFixed(2) : '0') + '%';
+    const label = t('progress.aria', { done, ind, todo, total });
+    return html`<span class="progress${opts.size ? ' progress-' + opts.size : ''}" role="img" aria-label="${label}" title="${label}"><span class="progress-track"><span class="pg pg-done" style="--w:${pct(done)}"></span><span class="pg pg-ind" style="--w:${pct(ind)}"></span></span>${opts.counts === false ? '' : html`<span class="progress-count" aria-hidden="true">${done}/${total}</span>`}</span>`;
+  }
+
   function relSpan(iso, key, cls) {
     if (!iso) return '';
     return html`<time class="${cls || ''}" datetime="${iso}" data-rel="${iso}" data-rel-key="${key || ''}" title="${i18n.dateTime(iso)}">${relText(iso, key)}</time>`;
@@ -324,12 +462,53 @@
   /* ================================================================
    * Routing / chrome
    * ================================================================ */
-  const VIEWS = ['board', 'worklog', 'notifications', 'settings'];
+  const VIEWS = ['board', 'sprints', 'epics', 'worklog', 'notifications', 'projects', 'settings'];
+  // Views with the top-bar search (placeholder / label keys) and with the "Only mine" switch.
+  const SEARCH_VIEWS = { board: 'board', sprints: 'board', epics: 'epics', projects: 'projects' };
+  const MINE_VIEWS = ['board', 'sprints', 'epics'];
 
   function showView(name) {
     if (!VIEWS.includes(name)) name = 'board';
+    menu.close(false);
     S.view = name;
     renderView(true);
+  }
+
+  const mineFor = (view) => (view === 'board' ? S.boardScope === 'mine' : view === 'sprints' ? S.sp.mine : view === 'epics' ? S.ep.mine : false);
+
+  /** Top-bar tools of the current view: search (text kept per view), "Only mine", project chips (board). */
+  function renderTools(sectionId) {
+    const v = sectionId === 'view-' + S.view ? S.view : null;
+    const tools = $('#view-tools');
+    const ns = v && SEARCH_VIEWS[v];
+    tools.hidden = !ns;
+    if (!ns) return;
+    const search = $('#search');
+    search.placeholder = t(ns + '.searchPlaceholder');
+    search.setAttribute('aria-label', t(ns + '.searchLabel'));
+    if (search.value !== S.q[v]) search.value = S.q[v];
+    $('#mine-wrap').hidden = !MINE_VIEWS.includes(v);
+    $('#mine-toggle').checked = mineFor(v);
+    if (v !== 'board') $('#project-chips').hidden = true;
+  }
+
+  function setMine(view, on) {
+    if (view === 'board') setBoardScope(on ? 'mine' : 'all');
+    else if (view === 'sprints') {
+      S.sp.mine = on;
+      prefs.set('sprint.mine', on);
+      if (S.sp.sprintId != null) loadSprint();
+    } else if (view === 'epics') setEpicsOption({ mine: on });
+  }
+
+  function onSearchInput(value) {
+    const v = S.view;
+    if (!SEARCH_VIEWS[v]) return;
+    S.q[v] = value;
+    if (v === 'board') renderBoard();
+    else if (v === 'sprints') renderSprintBoard();
+    else if (v === 'epics') { S.ep.overrides.clear(); renderEpics(); }
+    else if (v === 'projects') renderProjects();
   }
 
   /** Rail state. During onboarding only Settings is reachable; the others are disabled. */
@@ -359,9 +538,10 @@
   function renderView(enter) {
     const id = activeSectionId();
     $$('#views > .view').forEach((sec) => { sec.hidden = sec.id !== id; });
-    $('#view-title').textContent = id === 'view-onboarding' ? t('onboarding.viewTitle') : t('title.' + S.view);
-    $('#board-tools').hidden = id !== 'view-board';
+    $('#view-title').textContent = id === 'view-onboarding' ? t('onboarding.viewTitle')
+      : t(S.view === 'board' && S.boardScope === 'all' ? 'title.boardAll' : 'title.' + S.view);
     $('#refresh-btn').hidden = id === 'view-onboarding';
+    renderTools(id);
     renderNav(id);
     updateToastOffset();
     renderRefreshState();
@@ -369,6 +549,9 @@
       case 'view-status': renderStatus(); break;
       case 'view-onboarding': if (enter) enterOnboarding(); break;
       case 'view-board': if (enter && (!S.board || S.boardStale)) loadBoard(false); else renderBoard(); break;
+      case 'view-sprints': if (enter) enterSprints(false); else renderSprints(); break;
+      case 'view-epics': if (enter) enterEpics(); else renderEpics(); break;
+      case 'view-projects': if (enter) loadProjects(false); else renderProjects(); break;
       case 'view-worklog': if (enter) enterWorklog(); else renderWorklog(); break;
       case 'view-notifications': if (enter) loadNotifications(); else renderNotifications(); break;
       case 'view-settings': if (enter) enterSettings(); else renderSettingsDynamic(); break;
@@ -393,14 +576,17 @@
     let label;
     if (st && st.configured && st.user) {
       avatar.textContent = initials(st.user.displayName || st.user.name);
+      avatar.dataset.tone = avatarTone(st.user.displayName || st.user.name); // DR-13: same colour as on cards
       dot.dataset.tone = 'ok';
       label = t('chrome.connectedAs', { name: st.user.displayName || st.user.name });
     } else if (st && !st.configured) {
       setHTML(avatar, icon('plug'));
+      delete avatar.dataset.tone;
       dot.dataset.tone = 'warn';
       label = t('chrome.notConfigured');
     } else if (S.stateError) {
       setHTML(avatar, icon('alert'));
+      delete avatar.dataset.tone;
       dot.dataset.tone = 'error';
       label = t('chrome.stateError');
     } else {
@@ -430,6 +616,9 @@
   function viewIsLoading() {
     switch (S.view) {
       case 'board': return S.boardLoading;
+      case 'sprints': return S.sp.boardsLoading || S.sp.sprintsLoading || S.sp.dataLoading;
+      case 'epics': return S.ep.loading;
+      case 'projects': return S.pj.loading || S.pj.bulk;
       case 'worklog': return S.wl.previewLoading || S.wl.historyLoading;
       case 'notifications': return S.notif.loading;
       case 'settings': return S.formLoading;
@@ -448,6 +637,9 @@
     if (S.view === 'settings') { if (!formDirty()) enterSettings(true); return; }
     if (!S.appState.configured) { loadState(); return; }
     if (S.view === 'board') loadBoard(true);
+    else if (S.view === 'sprints') loadAgileBoards(true);
+    else if (S.view === 'epics') loadEpics({ force: true, silent: !!S.ep.data });
+    else if (S.view === 'projects') { if (!S.pj.bulk) loadProjects(true); }
     else if (S.view === 'worklog') {
       if (!S.wl.running) { S.wl.result = null; loadPreview(); }
       loadHistory();
@@ -486,29 +678,172 @@
   }
 
   /* ================================================================
-   * BOARD
+   * KANBAN (shared by Board and Sprints): model = { columns: [{ status, issues, synthetic? }] }
    * ================================================================ */
-  function normalizeBoard(data) {
-    const columns = (data && Array.isArray(data.columns) ? data.columns : [])
+  function normalizeColumns(data) {
+    return (data && Array.isArray(data.columns) ? data.columns : [])
       .filter((c) => c && c.status)
       .map((c) => ({ status: c.status, issues: Array.isArray(c.issues) ? c.issues.slice() : [] }));
-    return { columns, fetchedAt: data && data.fetchedAt };
+  }
+  const kbIssues = (model) => (model ? model.columns.flatMap((c) => c.issues) : []);
+  function kbFind(model, key) {
+    if (!model) return null;
+    for (const col of model.columns) {
+      const idx = col.issues.findIndex((i) => i.key === key);
+      if (idx >= 0) return { col, idx, issue: col.issues[idx] };
+    }
+    return null;
+  }
+  const kbColumn = (model, status) => model && model.columns.find((c) => sameStatus(c.status, status));
+  function kbEnsure(model, status) {
+    let col = kbColumn(model, status);
+    if (col) return col;
+    col = { status, issues: [], synthetic: true };
+    const rank = CAT_ORDER[status.category] ?? 1;
+    const cols = model.columns;
+    let at = cols.length;
+    for (let i = 0; i < cols.length; i++) {
+      if ((CAT_ORDER[cols[i].status.category] ?? 1) > rank) { at = i; break; }
+    }
+    cols.splice(at, 0, col);
+    return col;
+  }
+  /** Moves an issue into the column of `status` (creating it if needed). */
+  function kbPlace(model, key, issue, status, index) {
+    const found = kbFind(model, key);
+    if (found) {
+      found.col.issues.splice(found.idx, 1);
+      if (found.col.synthetic && !found.col.issues.length) model.columns.splice(model.columns.indexOf(found.col), 1);
+    }
+    const col = kbEnsure(model, status);
+    const next = Object.assign({}, issue, { status });
+    col.issues.splice(index == null ? 0 : Math.min(index, col.issues.length), 0, next);
+  }
+
+  const KANBAN = {
+    board: { model: () => S.board, render: () => renderBoard() },
+    sprint: { model: () => (S.sp.data ? S.sp.data.model : null), render: () => renderSprintBoard() },
+  };
+  const kanbanOf = (el) => { const root = el && el.closest && el.closest('[data-kanban]'); return root ? root.dataset.kanban : null; };
+
+  /** Text filter for cards: key, summary, epic name, assignee (+ project chips on the board). */
+  function issueMatcher(query, projects) {
+    const q = String(query || '').trim().toLowerCase();
+    return (issue) => {
+      if (q) {
+        const hay = [issue.key, issue.summary, issue.epic && issue.epic.name, issue.assignee && issue.assignee.displayName]
+          .map((x) => String(x || '').toLowerCase());
+        if (!hay.some((h) => h.includes(q))) return false;
+      }
+      if (projects && projects.size && !projects.has(projectOf(issue))) return false;
+      return true;
+    };
+  }
+
+  function spBadge(points) {
+    if (points == null || points === '') return '';
+    const n = Number.isFinite(Number(points)) ? fmtNum(points) : String(points); // sums are floats: 0.1 + 0.2 → "0.3"
+    const label = t('issue.storyPointsValue', { n });
+    return html`<span class="sp-badge" title="${label}"><span aria-hidden="true">${n}</span><span class="sr-only">${label}</span></span>`;
+  }
+
+  function cardHTML(issue, i, opts) {
+    const pend = S.pendingKeys.has(issue.key);
+    const mine = opts.highlightMine && issue.mine;
+    const anim = opts.animate ? html` style="--i:${Math.min(i, 12)}"` : '';
+    return html`<div class="card${pend ? ' is-pending' : ''}${mine ? ' is-mine' : ''}" data-type="${typeVisual(issue.type)}" data-key="${issue.key}" draggable="${pend ? 'false' : 'true'}" aria-busy="${pend ? 'true' : 'false'}"${anim}>
+      <span class="card-top">${typeIcon(issue.type)}<span class="card-key" aria-hidden="true">${issue.key}</span><span class="card-top-end">${priorityIcon(issue.priority)}${spBadge(issue.storyPoints)}${opts.showAssignee ? assigneeAvatar(issue.assignee) : ''}</span></span>
+      <button type="button" class="card-open" data-role="open" data-focus-key="${issue.key}" aria-haspopup="dialog"><span class="sr-only">${issue.key}${mine ? ' · ' + t('issue.mineMark') : ''}: </span><span class="card-sum">${issue.summary}</span></button>
+      <span class="card-meta">${statusButton(issue)}${epicChip(issue.epic)}${relSpan(issue.updated, '', 'card-upd')}</span>
+    </div>`;
+  }
+
+  function columnsHTML(model, filter, opts) {
+    let visible = 0;
+    const cols = model.columns.map((col) => {
+      const issues = col.issues.filter(filter);
+      visible += issues.length;
+      const sid = String(col.status.id ?? col.status.name);
+      const hid = opts.prefix + '-h-' + sid.replace(/[^\w-]/g, '_');
+      return html`<section class="col" data-cat="${catOf(col.status)}" data-status="${sid}" aria-labelledby="${hid}">
+        <header class="col-head"><h2 class="col-title" id="${hid}">${col.status.name}</h2><span class="col-count" aria-label="${t('board.count', { n: issues.length })}">${issues.length}</span></header>
+        <p class="col-hint">${t('board.noTransitionHint')}</p>
+        <div class="col-list">${issues.length ? issues.map((is, i) => cardHTML(is, i, opts)) : html`<p class="col-empty">${t('board.columnEmpty')}</p>`}</div>
+      </section>`;
+    });
+    return { cols, visible };
+  }
+
+  function kanbanSkeleton() {
+    const col = (n) => html`<div class="col" aria-hidden="true"><div class="col-head"><span class="skeleton sk-line" style="width:45%"></span></div><div class="col-list">${Array.from({ length: n }, () => html`<div class="skeleton sk-card"></div>`)}</div></div>`;
+    return html`<div class="board-skeleton" role="status" aria-label="${t('common.loading')}">${col(3)}${col(2)}${col(4)}${col(1)}</div>`;
+  }
+
+  /** Re-renders a kanban root keeping horizontal/column scroll and the focused control of a card. */
+  function preserveKanban(root, fn) {
+    const prevCols = $('.columns', root);
+    const scrollX = prevCols ? prevCols.scrollLeft : 0;
+    const scrollY = new Map($$('.col', root).map((c) => [c.dataset.status, $('.col-list', c).scrollTop]));
+    const a = document.activeElement;
+    const card = a && root.contains(a) && a.closest('.card');
+    const focus = card ? { key: card.dataset.key, role: a.dataset.role } : null;
+    fn();
+    const cols = $('.columns', root);
+    if (cols) cols.scrollLeft = scrollX;
+    $$('.col', root).forEach((c) => { const y = scrollY.get(c.dataset.status); if (y) $('.col-list', c).scrollTop = y; });
+    if (focus) {
+      const el = root.querySelector(`.card[data-key="${CSS.escape(focus.key)}"]`);
+      const target = el && ((focus.role && el.querySelector(`[data-role="${focus.role}"]:not(:disabled)`)) || el.querySelector('[data-role="open"]'));
+      if (target) target.focus({ preventScroll: true });
+    }
+    menu.sync();
+  }
+
+  function filterBanner() {
+    return html`<div class="filter-empty" role="status">${icon('search')}<span>${t('board.noMatches')}</span><button type="button" class="link-btn" data-action="clear-filters">${t('board.clearFilters')}</button></div>`;
+  }
+
+  /* ================================================================
+   * BOARD
+   * ================================================================ */
+  function normalizeBoard(data, scope) {
+    const h = data && data.hidden;
+    const hidden = h && Number(h.count) > 0 ? { count: Number(h.count), projects: Array.isArray(h.projects) ? h.projects.map(String) : [] } : null;
+    return { columns: normalizeColumns(data), fetchedAt: data && data.fetchedAt, scope: (data && data.scope) || scope, truncated: !!(data && data.truncated), hidden };
+  }
+
+  /** ORCH-1: "my" issues filtered out because their project is not tracked (mine scope only); closable for the session. */
+  const hiddenSignature = (h) => [...h.projects].sort().join(',');
+  function hiddenBanner() {
+    const h = S.boardScope === 'mine' && S.board && S.board.hidden;
+    if (!h || hiddenSignature(h) === S.hiddenDismissed) return '';
+    const MAX = 5;
+    const list = h.projects.slice(0, MAX).join(', ') + (h.projects.length > MAX ? ' ' + t('projects.andMore', { n: h.projects.length - MAX }) : '');
+    // Singular only for exactly one project (plural rules would also pick "one" for 21), so no plural entry here.
+    const np = h.projects.length;
+    const where = np === 0 ? t('board.hiddenProjectsNone') : np === 1 ? t('board.hiddenProject', { list }) : t('board.hiddenProjects', { list });
+    // DR-19: text and link share one inline box so the link flows after the text when it wraps.
+    return html`<div class="notice notice-hidden" role="note">${icon('info')}<span class="notice-text">${t('board.hiddenIssues', { n: h.count })} ${where} <button type="button" class="link-btn" data-action="go-projects">${t('board.hiddenConfigure')}</button></span><button type="button" class="icon-btn icon-btn-sm" data-action="hidden-dismiss" aria-label="${t('board.hiddenDismiss')}" title="${t('board.hiddenDismiss')}">${icon('x')}</button></div>`;
   }
 
   async function loadBoard(force) {
     if (S.drag || S.pendingKeys.size) { S.boardStale = true; return; }
     const seq = ++S.boardSeq;
+    const scope = S.boardScope;
     S.boardLoading = true;
     S.boardStale = false;
     if (!S.board) S.boardError = null;
     renderBoard();
     renderRefreshState();
     try {
-      const data = await api('getBoard', force ? { force: true } : {});
+      const params = { scope };
+      if (force) params.force = true;
+      const data = await api('getBoard', params);
       if (seq !== S.boardSeq) return;
       if (S.pendingKeys.size || S.drag) { S.boardStale = true; return; } // a move started meanwhile; refetch after it
-      S.board = normalizeBoard(data);
+      S.board = normalizeBoard(data, scope);
       S.boardError = null;
+      S.boardAnimate = true;
       S.transCache.clear();
     } catch (e) {
       if (seq !== S.boardSeq) return;
@@ -524,62 +859,27 @@
     }
   }
 
+  function setBoardScope(scope) {
+    if (scope === S.boardScope || S.drag) return;
+    if (S.board) S.boardCache[S.boardScope] = S.board;
+    S.boardScope = scope;
+    prefs.set('board.mine', scope === 'mine');
+    S.board = S.boardCache[scope] || null;
+    delete S.boardCache[scope];
+    S.boardError = null;
+    renderView(false);
+    loadBoard(false);
+  }
+
   function afterBoardMutation() {
     if (S.boardStale && !S.drag && !S.pendingKeys.size && S.view === 'board') loadBoard(false);
   }
 
-  function allIssues() {
-    return S.board ? S.board.columns.flatMap((c) => c.issues) : [];
-  }
-  function findIssue(key) {
-    if (!S.board) return null;
-    for (const col of S.board.columns) {
-      const idx = col.issues.findIndex((i) => i.key === key);
-      if (idx >= 0) return { col, idx, issue: col.issues[idx] };
-    }
-    return null;
-  }
-  function findColumn(status) {
-    return S.board && S.board.columns.find((c) => sameStatus(c.status, status));
-  }
-  function ensureColumn(status) {
-    let col = findColumn(status);
-    if (col) return col;
-    col = { status, issues: [], synthetic: true };
-    const rank = CAT_ORDER[status.category] ?? 1;
-    const cols = S.board.columns;
-    let at = cols.length;
-    for (let i = 0; i < cols.length; i++) {
-      if ((CAT_ORDER[cols[i].status.category] ?? 1) > rank) { at = i; break; }
-    }
-    cols.splice(at, 0, col);
-    return col;
-  }
-  /** Moves an issue into the column of `status` (creating it if needed); returns the previous position. */
-  function placeIssue(key, issue, status, index) {
-    const found = findIssue(key);
-    const prev = found ? { status: found.col.status, idx: found.idx } : null;
-    if (found) {
-      found.col.issues.splice(found.idx, 1);
-      if (found.col.synthetic && !found.col.issues.length) S.board.columns.splice(S.board.columns.indexOf(found.col), 1);
-    }
-    const col = ensureColumn(status);
-    const next = Object.assign({}, issue, { status });
-    col.issues.splice(index == null ? 0 : Math.min(index, col.issues.length), 0, next);
-    return prev;
-  }
-
-  function issueMatches(issue) {
-    const q = S.filter.q.trim().toLowerCase();
-    if (q && !(String(issue.key).toLowerCase().includes(q) || String(issue.summary || '').toLowerCase().includes(q))) return false;
-    if (S.filter.projects.size && !S.filter.projects.has(projectOf(issue))) return false;
-    return true;
-  }
-
   function renderChips() {
     const box = $('#project-chips');
+    if (S.view !== 'board') { box.hidden = true; return; }
     const counts = new Map();
-    allIssues().forEach((i) => { const p = projectOf(i); if (p) counts.set(p, (counts.get(p) || 0) + 1); });
+    kbIssues(S.board).forEach((i) => { const p = projectOf(i); if (p) counts.set(p, (counts.get(p) || 0) + 1); });
     for (const p of [...S.filter.projects]) if (!counts.has(p)) S.filter.projects.delete(p);
     const projects = [...counts.keys()].sort((a, b) => a.localeCompare(b));
     box.hidden = projects.length < 2;
@@ -588,67 +888,323 @@
     const none = S.filter.projects.size === 0;
     setHTML(box, html`<button type="button" class="chip-btn" data-project="" aria-pressed="${none ? 'true' : 'false'}">${t('board.allProjects')}</button>${projects.map((p) => html`<button type="button" class="chip-btn" data-project="${p}" aria-pressed="${S.filter.projects.has(p) ? 'true' : 'false'}">${p}<span class="chip-count">${counts.get(p)}</span></button>`)}`);
     if (focused != null) { const b = box.querySelector(`[data-project="${CSS.escape(focused)}"]`); if (b) b.focus(); }
+    updateChipsFade();
   }
 
-  function cardHTML(issue) {
-    const pend = S.pendingKeys.has(issue.key);
-    return html`<button type="button" class="card${pend ? ' is-pending' : ''}" draggable="${pend ? 'false' : 'true'}" data-key="${issue.key}" aria-busy="${pend ? 'true' : 'false'}" aria-haspopup="dialog">
-      <span class="card-top"><span class="card-key">${issue.key}</span>${priorityIcon(issue.priority)}${pend ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : ''}</span>
-      <span class="card-sum">${issue.summary}</span>
-      <span class="card-meta">${typeBadge(issue.type)}${relSpan(issue.updated, 'board.updated', 'card-upd')}</span>
-    </button>`;
-  }
-
-  function boardSkeleton() {
-    const col = (n) => html`<div class="col" aria-hidden="true"><div class="col-head"><span class="skeleton sk-line" style="width:45%"></span></div><div class="col-list">${Array.from({ length: n }, () => html`<div class="skeleton sk-card"></div>`)}</div></div>`;
-    return html`<div class="board-skeleton" role="status" aria-label="${t('common.loading')}">${col(3)}${col(2)}${col(4)}${col(1)}</div>`;
+  /** DR-7/DR-15: fade the chip row's right / left edge while chips are scrolled out of view on that side. */
+  function updateChipsFade() {
+    const box = $('#project-chips');
+    const more = !box.hidden && box.scrollLeft + box.clientWidth < box.scrollWidth - 1;
+    box.classList.toggle('is-overflowing', more);
+    box.classList.toggle('is-scrolled-start', !box.hidden && box.scrollLeft > 1);
   }
 
   function renderBoard() {
     if (S.view !== 'board' || activeSectionId() !== 'view-board') return;
-    if (S.drag) { S.boardRenderDeferred = true; return; }
+    if (S.drag) { S.renderDeferred.add('board'); return; }
     const root = $('#board');
     renderChips();
     if (!S.board) {
       if (S.boardError && !S.boardLoading) {
         setHTML(root, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('board.errorTitle'),
           text: errorText(S.boardError), action: { id: 'board-retry', label: t('common.retry') } }));
-      } else setHTML(root, boardSkeleton());
+      } else setHTML(root, kanbanSkeleton());
+      menu.sync();
       return;
     }
-    const total = allIssues().length;
+    const all = S.boardScope === 'all';
+    const total = kbIssues(S.board).length;
     if (!total) {
-      setHTML(root, stateBlock({ iconName: 'check-circle', tone: 'good', fill: true, title: t('board.emptyTitle'), text: t('board.emptyText') }));
+      setHTML(root, all
+        ? stateBlock({ iconName: 'folder', fill: true, title: t('board.emptyAllTitle'), text: t('board.emptyAllText'), action: { id: 'go-projects', label: t('board.goProjects') } })
+        : S.board.hidden // DR-18: not "all done" — my issues exist but are filtered out by the tracked projects
+          ? html`${hiddenBanner()}${stateBlock({ iconName: 'folder', fill: true, title: t('board.emptyHiddenTitle'), text: t('board.emptyTextHidden'), action: { id: 'go-projects', label: t('board.hiddenConfigure') } })}`
+          : stateBlock({ iconName: 'check-circle', tone: 'good', fill: true, title: t('board.emptyTitle'), text: t('board.emptyText') }));
+      menu.sync();
       return;
     }
-    // Preserve scroll + focus across re-render.
-    const prevCols = $('.columns', root);
-    const scrollX = prevCols ? prevCols.scrollLeft : 0;
-    const scrollY = new Map($$('.col', root).map((c) => [c.dataset.status, $('.col-list', c).scrollTop]));
-    const focusKey = document.activeElement && root.contains(document.activeElement) && document.activeElement.dataset.key;
-
-    let visible = 0;
-    const cols = S.board.columns.map((col) => {
-      const issues = col.issues.filter(issueMatches);
-      visible += issues.length;
-      const sid = String(col.status.id ?? col.status.name);
-      const hid = 'col-h-' + sid.replace(/[^\w-]/g, '_');
-      return html`<section class="col" data-cat="${col.status.category || 'new'}" data-status="${sid}" aria-labelledby="${hid}">
-        <header class="col-head"><span class="col-dot" aria-hidden="true"></span><h2 class="col-title" id="${hid}">${col.status.name}</h2><span class="col-count" aria-label="${t('board.count', { n: issues.length })}">${issues.length}</span></header>
-        <p class="col-hint">${t('board.noTransitionHint')}</p>
-        <div class="col-list">${issues.length ? issues.map(cardHTML) : html`<p class="col-empty">${t('board.columnEmpty')}</p>`}</div>
-      </section>`;
+    preserveKanban(root, () => {
+      const animate = S.boardAnimate;
+      S.boardAnimate = false;
+      const { cols, visible } = columnsHTML(S.board, issueMatcher(S.q.board, S.filter.projects), { prefix: 'b', showAssignee: all, highlightMine: all, animate });
+      const trunc = S.board.truncated ? html`<div class="notice" role="note">${icon('info')}<span>${t('board.truncated', { n: total })}</span></div>` : '';
+      setHTML(root, html`${hiddenBanner()}${trunc}${visible === 0 ? filterBanner() : ''}<div class="columns${animate ? ' is-entering' : ''}">${cols}</div>`);
     });
-    const banner = visible === 0
-      ? html`<div class="filter-empty" role="status">${icon('search')}<span>${t('board.noMatches')}</span><button type="button" class="link-btn" data-action="clear-filters">${t('board.clearFilters')}</button></div>`
-      : '';
-    setHTML(root, html`${banner}<div class="columns">${cols}</div>`);
-    const cols2 = $('.columns', root);
-    cols2.scrollLeft = scrollX;
-    $$('.col', root).forEach((c) => { const y = scrollY.get(c.dataset.status); if (y) $('.col-list', c).scrollTop = y; });
-    if (focusKey) { const card = root.querySelector(`.card[data-key="${CSS.escape(focusKey)}"]`); if (card) card.focus({ preventScroll: true }); }
   }
 
+  /* ================================================================
+   * SPRINTS
+   * ================================================================ */
+  const sprintById = (id) => (S.sp.sprints || []).find((s) => String(s.id) === String(id)) || null;
+  const boardById = (id) => (S.sp.boards || []).find((b) => String(b.id) === String(id)) || null;
+
+  async function enterSprints(force) {
+    renderSprints();
+    if (force || !S.sp.boards || S.sp.boardsStale) await loadAgileBoards(force);
+    else if (S.sp.dataStale && S.sp.sprintId != null) loadSprint({ silent: true });
+  }
+
+  async function loadAgileBoards(force) {
+    const seq = ++S.sp.boardsSeq;
+    S.sp.boardsLoading = true;
+    S.sp.boardsStale = false;
+    renderSprints(); renderRefreshState();
+    try {
+      const list = await api('getAgileBoards', force ? { force: true } : {});
+      if (seq !== S.sp.boardsSeq) return;
+      S.sp.boards = Array.isArray(list) ? list : [];
+      S.sp.boardsError = null;
+    } catch (e) {
+      if (seq !== S.sp.boardsSeq) return;
+      S.sp.boardsError = e;
+      if (S.sp.boards) toastError(t('sprints.boardsFailed'), e);
+    } finally {
+      if (seq === S.sp.boardsSeq) { S.sp.boardsLoading = false; renderRefreshState(); }
+    }
+    if (seq !== S.sp.boardsSeq || !S.sp.boards) { renderSprints(); return; }
+    const remembered = boardById(S.sp.boardId);
+    const pick = remembered || S.sp.boards.find((b) => b.type !== 'kanban') || S.sp.boards[0] || null;
+    await selectBoard(pick ? pick.id : null, { keepSprint: !!remembered, force });
+  }
+
+  async function selectBoard(id, { keepSprint, force } = {}) {
+    const changed = String(id) !== String(S.sp.boardId);
+    S.sp.boardId = id;
+    if (id != null) prefs.set('sprint.board', id);
+    if (changed || !keepSprint) { S.sp.sprints = null; S.sp.sprintId = null; S.sp.data = null; }
+    const b = boardById(id);
+    if (!b || b.type === 'kanban') {
+      // CR-9: drop answers still in flight for the previous board.
+      ++S.sp.sprintsSeq; ++S.sp.dataSeq;
+      S.sp.sprintsLoading = false; S.sp.dataLoading = false;
+      S.sp.sprints = b ? [] : null; S.sp.data = null;
+      renderSprints(); renderRefreshState();
+      return;
+    }
+    const seq = ++S.sp.sprintsSeq;
+    S.sp.sprintsLoading = true;
+    S.sp.sprintsError = null;
+    renderSprints(); renderRefreshState();
+    try {
+      const list = await api('getSprints', force ? { boardId: b.id, force: true } : { boardId: b.id });
+      if (seq !== S.sp.sprintsSeq) return;
+      S.sp.sprints = Array.isArray(list) ? list : [];
+    } catch (e) {
+      if (seq !== S.sp.sprintsSeq) return;
+      S.sp.sprintsError = e;
+    } finally {
+      if (seq === S.sp.sprintsSeq) { S.sp.sprintsLoading = false; renderRefreshState(); }
+    }
+    if (seq !== S.sp.sprintsSeq) return;
+    const list = S.sp.sprints || [];
+    const keep = keepSprint && sprintById(S.sp.sprintId);
+    const next = keep || list.find((s) => s.state === 'active') || list.find((s) => s.state === 'future') || list[0] || null;
+    S.sp.sprintId = next ? next.id : null;
+    renderSprints();
+    if (next) loadSprint({ silent: !!keep && !!S.sp.data, force });
+  }
+
+  function selectSprint(id) {
+    if (String(id) === String(S.sp.sprintId)) return;
+    S.sp.sprintId = id;
+    S.sp.data = null;
+    renderSprints();
+    loadSprint();
+  }
+
+  async function loadSprint({ silent, force } = {}) {
+    if (S.sp.sprintId == null) return;
+    if (S.drag || S.pendingKeys.size) { S.sp.dataStale = true; return; }
+    const seq = ++S.sp.dataSeq;
+    S.sp.dataLoading = true;
+    S.sp.dataStale = false;
+    if (!silent) { S.sp.data = null; S.sp.dataError = null; }
+    renderSprints(); renderRefreshState();
+    try {
+      const params = { sprintId: S.sp.sprintId, scope: S.sp.mine ? 'mine' : 'all' };
+      if (force) params.force = true;
+      const res = await api('getSprint', params);
+      if (seq !== S.sp.dataSeq) return;
+      if (S.pendingKeys.size || S.drag) { S.sp.dataStale = true; return; }
+      S.sp.data = {
+        sprint: (res && res.sprint) || sprintById(S.sp.sprintId),
+        model: { columns: normalizeColumns(res) },
+        progress: (res && res.progress) || null,
+        storyPoints: (res && res.storyPoints) || null,
+        truncated: !!(res && res.truncated),
+      };
+      S.sp.dataError = null;
+      S.sp.animate = !silent;
+    } catch (e) {
+      if (seq !== S.sp.dataSeq) return;
+      S.sp.dataError = e;
+      if (S.sp.data) toastError(t('sprints.loadFailed'), e);
+    } finally {
+      if (seq === S.sp.dataSeq) { S.sp.dataLoading = false; renderSprints(); renderRefreshState(); }
+    }
+  }
+
+  function sprintStateBadge(state) {
+    if (!state) return '';
+    return html`<span class="state-badge" data-state="${state}">${t('sprints.state.' + state)}</span>`;
+  }
+  const dayDiff = (iso) => { const d = parseDate(iso); if (!d) return null; const a = new Date(d); a.setHours(0, 0, 0, 0); const b = new Date(); b.setHours(0, 0, 0, 0); return Math.round((a - b) / 86400000); };
+  const shortDate = (iso) => i18n.date(iso, { day: 'numeric', month: 'short' });
+
+  function sprintDates(sp) {
+    const range = sp.startDate || sp.endDate ? `${shortDate(sp.startDate) || '…'} – ${shortDate(sp.endDate) || '…'}` : '';
+    let rel = '';
+    if (sp.state === 'active' && sp.endDate) {
+      const n = dayDiff(sp.endDate);
+      rel = n > 0 ? t('sprints.daysLeft', { n }) : n === 0 ? t('sprints.endsToday') : t('sprints.overdue', { n: -n });
+    } else if (sp.state === 'future' && sp.startDate) {
+      const n = dayDiff(sp.startDate);
+      rel = n > 0 ? t('sprints.startsIn', { n }) : t('sprints.notStarted');
+    } else if (sp.state === 'closed') {
+      rel = sp.completeDate || sp.endDate ? t('sprints.closedOn', { date: shortDate(sp.completeDate || sp.endDate) }) : '';
+    }
+    return { range, rel };
+  }
+
+  function sprintMenuItem(sp) {
+    const { range } = sprintDates(sp);
+    return html`<span class="mi-main"><span class="mi-title">${sp.name}</span>${range ? html`<span class="mi-sub">${range}</span>` : ''}</span>${sprintStateBadge(sp.state)}`;
+  }
+
+  function renderSprints() {
+    if (S.view !== 'sprints' || activeSectionId() !== 'view-sprints') return;
+    const sp = S.sp;
+    const bar = $('#sp-toolbar');
+    const head = $('#sp-head');
+    const root = $('#sprint-board');
+    $('#view-tools').hidden = !!(sp.boards && !sp.boards.length); // DR-12: nothing to search or filter
+    if (!sp.boards) {
+      bar.textContent = ''; head.textContent = '';
+      if (sp.boardsError && !sp.boardsLoading) setHTML(root, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('sprints.boardsFailed'), text: errorText(sp.boardsError), action: { id: 'sp-retry', label: t('common.retry') } }));
+      else setHTML(root, kanbanSkeleton());
+      menu.sync();
+      return;
+    }
+    if (!sp.boards.length) {
+      bar.textContent = ''; head.textContent = '';
+      setHTML(root, stateBlock({ iconName: 'sprint', fill: true, title: t('sprints.noBoardsTitle'), text: t('sprints.noBoardsText'), action: { id: 'go-projects', label: t('board.goProjects') } }));
+      menu.sync();
+      return;
+    }
+    const board = boardById(sp.boardId);
+    const sprint = sprintById(sp.sprintId) || (sp.data && sp.data.sprint);
+    setHTML(bar, html`
+      <button type="button" class="picker-btn" id="sp-board-btn" data-picker="board" aria-haspopup="menu" aria-expanded="false">
+        <span class="picker-label">${t('sprints.board')}</span><span class="picker-value">${board ? board.name : t('sprints.chooseBoard')}</span>${board ? html`<span class="state-badge" data-state="${board.type}">${t('sprints.boardType.' + (board.type === 'kanban' ? 'kanban' : 'scrum'))}</span>` : ''}${icon('chevron-down', 'icon-xs')}
+      </button>
+      ${board && board.type !== 'kanban' ? html`<button type="button" class="picker-btn" id="sp-sprint-btn" data-picker="sprint" aria-haspopup="menu" aria-expanded="false" ${sp.sprints && sp.sprints.length ? '' : html`disabled`}>
+        <span class="picker-label">${t('sprints.sprint')}</span><span class="picker-value">${sprint ? sprint.name : sp.sprintsLoading ? t('common.loading') : '—'}</span>${sprint ? sprintStateBadge(sprint.state) : ''}${icon('chevron-down', 'icon-xs')}
+      </button>` : ''}`);
+
+    if (board && board.type === 'kanban') {
+      head.textContent = '';
+      setHTML(root, stateBlock({ iconName: 'board', fill: true, title: t('sprints.kanbanTitle'), text: t('sprints.kanbanText', { name: board.name }) }));
+      menu.sync();
+      return;
+    }
+    if (!sp.sprints) {
+      head.textContent = '';
+      if (sp.sprintsError && !sp.sprintsLoading) setHTML(root, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('sprints.sprintsFailed'), text: errorText(sp.sprintsError), action: { id: 'sp-sprints-retry', label: t('common.retry') } }));
+      else setHTML(root, kanbanSkeleton());
+      menu.sync();
+      return;
+    }
+    if (!sp.sprints.length) {
+      head.textContent = '';
+      setHTML(root, stateBlock({ iconName: 'sprint', fill: true, title: t('sprints.noSprintsTitle'), text: t('sprints.noSprintsText') }));
+      menu.sync();
+      return;
+    }
+    renderSprintHead(sprint);
+    renderSprintBoard();
+  }
+
+  function renderSprintHead(sprint) {
+    const head = $('#sp-head');
+    if (!sprint) { head.textContent = ''; return; }
+    const d = S.sp.data;
+    const { range, rel } = sprintDates(sprint);
+    const p = d && d.progress;
+    const pts = d && d.storyPoints;
+    const stats = p
+      ? html`${progressBar(p, { size: 'lg', counts: false })}
+        <ul class="legend" role="list">
+          <li class="lg-done">${t('progress.done', { n: p.done || 0 })}</li>
+          <li class="lg-ind">${t('progress.inProgress', { n: p.inProgress || 0 })}</li>
+          <li class="lg-todo">${t('progress.todo', { n: p.todo || 0 })}</li>
+          ${pts && pts.total ? html`<li class="lg-sp">${t('sprints.points', { done: fmtNum(pts.done), total: fmtNum(pts.total) })}</li>` : ''}
+        </ul>`
+      : html`<span class="skeleton sk-line" style="height:10px"></span>`;
+    setHTML(head, html`<section class="sprint-card" aria-labelledby="sp-name">
+      <div class="sprint-main">
+        <div class="sprint-title-row"><h2 class="sprint-name" id="sp-name">${sprint.name}</h2>${sprintStateBadge(sprint.state)}</div>
+        ${sprint.goal ? html`<p class="sprint-goal">${icon('target')}<span>${sprint.goal}</span></p>` : ''}
+        <p class="sprint-dates">${icon('calendar')}<span>${range || '—'}</span>${rel ? html`<span class="chip${sprint.state === 'active' && dayDiff(sprint.endDate) < 0 ? ' chip-bad' : sprint.state === 'active' ? ' chip-accent' : ''}">${rel}</span>` : ''}</p>
+      </div>
+      <div class="sprint-stats">${stats}</div>
+    </section>`);
+  }
+
+  function renderSprintBoard() {
+    if (S.view !== 'sprints' || activeSectionId() !== 'view-sprints') return;
+    if (S.drag) { S.renderDeferred.add('sprint'); return; }
+    const sp = S.sp;
+    const root = $('#sprint-board');
+    if (!sp.sprints || !sp.sprints.length || !sprintById(sp.sprintId)) return;
+    renderSprintHead(sprintById(sp.sprintId));
+    if (!sp.data) {
+      if (sp.dataError && !sp.dataLoading) setHTML(root, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('sprints.loadFailed'), text: errorText(sp.dataError), action: { id: 'sp-data-retry', label: t('common.retry') } }));
+      else setHTML(root, kanbanSkeleton());
+      menu.sync();
+      return;
+    }
+    const total = kbIssues(sp.data.model).length;
+    if (!total) {
+      setHTML(root, stateBlock({ iconName: 'inbox', fill: true, title: sp.mine ? t('sprints.emptyMineTitle') : t('sprints.emptyTitle'), text: sp.mine ? t('sprints.emptyMineText') : t('sprints.emptyText') }));
+      menu.sync();
+      return;
+    }
+    preserveKanban(root, () => {
+      const animate = sp.animate;
+      sp.animate = false;
+      const all = !sp.mine;
+      const { cols, visible } = columnsHTML(sp.data.model, issueMatcher(S.q.sprints), { prefix: 's', showAssignee: all, highlightMine: all, animate });
+      const trunc = sp.data.truncated ? html`<div class="notice" role="note">${icon('info')}<span>${t('board.truncated', { n: total })}</span></div>` : '';
+      setHTML(root, html`${trunc}${visible === 0 ? filterBanner() : ''}<div class="columns${animate ? ' is-entering' : ''}">${cols}</div>`);
+    });
+  }
+
+  function openBoardPicker(btn) {
+    menu.open(btn, {
+      label: t('sprints.board'),
+      radio: true,
+      items: S.sp.boards || [],
+      isSelected: (b) => String(b.id) === String(S.sp.boardId),
+      item: (b) => html`<span class="mi-main"><span class="mi-title">${b.name}</span><span class="mi-sub">${b.projectKey || ''}</span></span><span class="state-badge" data-state="${b.type}">${t('sprints.boardType.' + (b.type === 'kanban' ? 'kanban' : 'scrum'))}</span>`,
+      onPick: (b) => { if (String(b.id) !== String(S.sp.boardId)) selectBoard(b.id); },
+      anchorSel: '#sp-board-btn',
+    });
+  }
+  function openSprintPicker(btn) {
+    menu.open(btn, {
+      label: t('sprints.sprint'),
+      radio: true,
+      items: S.sp.sprints || [],
+      isSelected: (s) => String(s.id) === String(S.sp.sprintId),
+      item: sprintMenuItem,
+      onPick: (s) => selectSprint(s.id),
+      anchorSel: '#sp-sprint-btn',
+    });
+  }
+
+  /* ================================================================
+   * Transitions: card / drawer dropdown, drag & drop; optimistic everywhere
+   * ================================================================ */
   function getTransitions(key, fresh) {
     if (fresh) S.transCache.delete(key);
     let p = S.transCache.get(key);
@@ -660,32 +1216,136 @@
     return p;
   }
 
-  /* --- drag & drop --- */
+  function openStatusMenu(btn) {
+    const key = btn.dataset.statusMenu;
+    if (!key || S.pendingKeys.has(key)) return;
+    const inDrawer = !!btn.closest('#drawer');
+    menu.open(btn, {
+      label: t('status.menuLabel', { key }),
+      load: () => getTransitions(key, true),
+      loadingText: t('status.loading'),
+      empty: t('drawer.noTransitions'),
+      item: (tr) => {
+        const to = tr.to || {};
+        const differs = String(tr.name || '').toLowerCase() !== String(to.name || '').toLowerCase();
+        return html`<span class="mi-dot" data-cat="${catOf(to)}" aria-hidden="true"></span><span class="mi-main"><span class="mi-title">${tr.name || to.name}</span>${differs && to.name ? html`<span class="mi-sub">${icon('arrow-right', 'icon-xs')}${to.name}</span>` : ''}</span>`;
+      },
+      onPick: (tr) => runTransition(key, tr, null),
+      anchorSel: inDrawer ? `#drawer [data-status-menu="${CSS.escape(key)}"]` : `#${activeSectionId()} .card[data-key="${CSS.escape(key)}"] [data-status-menu]`,
+    });
+  }
+
+  /** Every loaded IssueRef-like copy of `key` outside the kanban models (epic trees, drawer details). */
+  function forEachRef(key, fn) {
+    const visit = (r) => { if (r && r.key === key) fn(r); };
+    const visitStory = (s) => { if (!s) return; visit(s.story); (s.tasks || []).forEach(visit); };
+    const ep = S.ep.data;
+    if (ep) {
+      (ep.epics || []).forEach((n) => { visit(n.epic); (n.stories || []).forEach(visitStory); (n.tasks || []).forEach(visit); });
+      (ep.orphanStories || []).forEach(visitStory);
+      (ep.stories || []).forEach(visitStory);
+    }
+    for (const det of detailCache.values()) {
+      visit(det.issue); visit(det.epic); visit(det.parent);
+      (det.stories || []).forEach(visit); (det.children || []).forEach(visit);
+      (det.links || []).forEach((l) => visit(l && l.issue));
+    }
+  }
+
+  /** Puts `status` on every loaded copy of `key`; returns an undo function. */
+  function applyStatus(key, status, patch) {
+    const undo = [];
+    [S.board, S.sp.data && S.sp.data.model].forEach((model) => {
+      const f = kbFind(model, key);
+      if (!f) return;
+      const prev = { issue: f.issue, status: f.col.status, idx: f.idx };
+      kbPlace(model, key, Object.assign({}, f.issue, patch || {}), (kbColumn(model, status) || {}).status || status, 0);
+      undo.push(() => kbPlace(model, key, prev.issue, prev.status, prev.idx));
+    });
+    forEachRef(key, (ref) => { const old = ref.status; ref.status = status; undo.push(() => { ref.status = old; }); });
+    return () => undo.reverse().forEach((fn) => fn());
+  }
+
+  function renderIssueViews() {
+    renderBoard();
+    renderSprintBoard();
+    renderEpics();
+    if (S.drawer) renderDrawer();
+  }
+
+  /** After a successful status change: other caches are outdated (other board scope, progress, changelog). */
+  function afterIssueChanged(key) {
+    S.boardCache = {};
+    if (S.sp.sprintId != null) {
+      if (S.view === 'sprints') loadSprint({ silent: true }); else S.sp.dataStale = true;
+    }
+    invalidateEpics();
+    if (S.view === 'epics' && S.ep.data) loadEpics({ silent: true }); else S.ep.stale = true;
+    detailCache.delete(key);
+    if (S.drawer && drawerKey() === key) loadDetail({ silent: true });
+  }
+
+  /** Optimistically changes the status everywhere, runs the transition, reverts on error. */
+  async function runTransition(key, tr, targetStatus) {
+    if (!tr || S.pendingKeys.has(key)) return false;
+    const optimistic = targetStatus || tr.to;
+    const undo = applyStatus(key, optimistic);
+    S.pendingKeys.add(key);
+    renderIssueViews();
+    try {
+      const fresh = await api('transition', { key, transitionId: tr.id });
+      S.transCache.delete(key);
+      // CR-18: the backend may fall back to a minimal Issue (key/url/project/status); keep known fields then.
+      const f = fresh && typeof fresh === 'object' ? fresh : {};
+      const status = f.status || optimistic;
+      applyStatus(key, status, f.summary ? f : (f.url ? { url: f.url } : null));
+      toast(t('board.moved', { key, status: status.name }), { tone: 'success' });
+      afterIssueChanged(key);
+      return true;
+    } catch (e) {
+      undo();
+      toastError(t('board.transitionFailed', { key }), e);
+      return false;
+    } finally {
+      S.pendingKeys.delete(key);
+      renderIssueViews();
+      afterBoardMutation();
+      if (S.sp.dataStale && S.view === 'sprints' && !S.pendingKeys.size) loadSprint({ silent: true });
+    }
+  }
+
+  /* --- drag & drop (board and sprint kanbans) --- */
   function colStatus(colEl) {
+    const name = kanbanOf(colEl);
+    const model = name && KANBAN[name].model();
+    if (!model) return null;
     const sid = colEl.dataset.status;
-    const col = S.board.columns.find((c) => String(c.status.id ?? c.status.name) === sid);
+    const col = model.columns.find((c) => String(c.status.id ?? c.status.name) === sid);
     return col ? col.status : null;
   }
 
   function onDragStart(e) {
     const card = e.target.closest && e.target.closest('.card');
-    if (!card || !S.board) return;
+    const kb = kanbanOf(card);
+    if (!card || !kb) return;
+    const model = KANBAN[kb].model();
     const key = card.dataset.key;
-    const found = findIssue(key);
+    const found = kbFind(model, key);
     if (!found || S.pendingKeys.has(key)) { e.preventDefault(); return; }
-    S.drag = { key, from: found.col.status };
+    menu.close(false);
+    S.drag = { key, from: found.col.status, kb };
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', key);
     card.classList.add('is-dragging');
-    const colsEl = $('#board .columns');
-    colsEl.classList.add('is-dragging');
+    const root = card.closest('[data-kanban]');
+    $('.columns', root).classList.add('is-dragging');
     const srcCol = card.closest('.col');
     if (srcCol) srcCol.classList.add('is-source');
     // Prefetch transitions to dim columns that cannot be reached.
     const drag = S.drag;
     getTransitions(key).then((list) => {
       if (S.drag !== drag) return;
-      $$('#board .col').forEach((c) => {
+      $$('.col', root).forEach((c) => {
         const st = colStatus(c);
         if (!st || sameStatus(st, drag.from)) return;
         const blocked = !list.some((tr) => sameStatus(tr.to, st));
@@ -697,27 +1357,29 @@
 
   function endDrag() {
     S.drag = null;
-    $$('#board .is-dragging, #board .is-source, #board .is-over, #board .is-blocked').forEach((el) => el.classList.remove('is-dragging', 'is-source', 'is-over', 'is-blocked'));
-    if (S.boardRenderDeferred) { S.boardRenderDeferred = false; renderBoard(); }
+    $$('.kanban .is-dragging, .kanban .is-source, .kanban .is-over, .kanban .is-blocked').forEach((el) => el.classList.remove('is-dragging', 'is-source', 'is-over', 'is-blocked'));
+    const deferred = [...S.renderDeferred];
+    S.renderDeferred.clear();
+    deferred.forEach((name) => KANBAN[name].render());
     afterBoardMutation();
   }
 
   function onDragOver(e) {
     if (!S.drag) return;
     const colEl = e.target.closest && e.target.closest('.col');
-    if (!colEl || colEl.classList.contains('is-source')) { S.drag.blockedOver = null; return; }
+    if (!colEl || kanbanOf(colEl) !== S.drag.kb || colEl.classList.contains('is-source')) { S.drag.blockedOver = null; return; }
     e.preventDefault();
     if (colEl.classList.contains('is-blocked')) {
       // Known to have no transition: refuse the drop; dragend explains why with a toast.
       e.dataTransfer.dropEffect = 'none';
       S.drag.blockedOver = colStatus(colEl);
-      $$('#board .col.is-over').forEach((c) => c.classList.remove('is-over'));
+      $$('.kanban .col.is-over').forEach((c) => c.classList.remove('is-over'));
       return;
     }
     S.drag.blockedOver = null;
     e.dataTransfer.dropEffect = 'move';
     if (!colEl.classList.contains('is-over')) {
-      $$('#board .col.is-over').forEach((c) => c.classList.remove('is-over'));
+      $$('.kanban .col.is-over').forEach((c) => c.classList.remove('is-over'));
       colEl.classList.add('is-over');
     }
   }
@@ -741,56 +1403,55 @@
   function guardForeignDrag(e) {
     if (S.drag) {
       if (e.type === 'drop') e.preventDefault(); // internal card dropped outside a column: no-op
-      else if (!(e.target.closest && e.target.closest('#board .col'))) S.drag.blockedOver = null;
+      else if (!(e.target.closest && e.target.closest('.kanban .col'))) S.drag.blockedOver = null;
       return;
     }
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
   }
-  /** Only board cards may be dragged; blocks links, images and selected text from being dragged out as URLs. */
+  /** Only kanban cards may be dragged; blocks links, images and selected text from being dragged out as URLs. */
   function guardDragStart(e) {
     const el = e.target && e.target.nodeType === 1 ? e.target : e.target && e.target.parentElement;
-    if (!el || !el.closest('#board .card')) e.preventDefault();
+    if (!el || !el.closest('.kanban .card')) e.preventDefault();
   }
 
   function onDrop(e) {
     if (!S.drag) return;
     const colEl = e.target.closest && e.target.closest('.col');
-    if (!colEl) return;
+    if (!colEl || kanbanOf(colEl) !== S.drag.kb) return;
     e.preventDefault();
-    const key = S.drag.key;
+    const { key, kb } = S.drag;
     const to = colStatus(colEl);
     endDrag();
-    if (to) moveByDrop(key, to);
+    if (to) moveByDrop(kb, key, to);
   }
 
-  async function moveByDrop(key, toStatus) {
-    const found = findIssue(key);
+  async function moveByDrop(kb, key, toStatus) {
+    const found = kbFind(KANBAN[kb].model(), key);
     if (!found || sameStatus(found.col.status, toStatus) || S.pendingKeys.has(key)) return;
     const issue = found.issue;
     S.pendingKeys.add(key);
-    renderBoard();
+    KANBAN[kb].render();
     let list;
     try {
       list = await getTransitions(key);
     } catch (e) {
       S.pendingKeys.delete(key);
-      renderBoard();
+      KANBAN[kb].render();
       toastError(t('board.transitionsFailed', { key }), e);
       afterBoardMutation();
       return;
     }
     const matches = list.filter((tr) => sameStatus(tr.to, toStatus));
     let tr = matches[0];
+    S.pendingKeys.delete(key);
     if (matches.length > 1) {
-      S.pendingKeys.delete(key);
-      renderBoard();
+      KANBAN[kb].render();
       tr = await pickTransition(matches, issue, toStatus.name);
       if (!tr) { afterBoardMutation(); return; }
     }
     if (!tr) {
-      S.pendingKeys.delete(key);
-      renderBoard();
+      KANBAN[kb].render();
       toast(t('board.noTransition', { key, from: nameOf(issue.status), to: toStatus.name }), { tone: 'warn' });
       afterBoardMutation();
       return;
@@ -798,155 +1459,1113 @@
     await runTransition(key, tr, toStatus);
   }
 
-  /** Optimistically moves the card, runs the transition, reverts on error. */
-  async function runTransition(key, tr, targetStatus) {
-    const found = findIssue(key);
-    if (!found) return;
-    const original = found.issue;
-    const origIdx = found.idx;
-    const optimistic = targetStatus || (findColumn(tr.to) || {}).status || tr.to;
-    S.pendingKeys.add(key);
-    if (S.drawer && S.drawer.key === key) S.drawer.busyId = tr.id;
-    placeIssue(key, original, optimistic, 0);
-    renderBoard();
-    if (S.drawer) renderDrawer();
-    try {
-      const fresh = await api('transition', { key, transitionId: tr.id });
-      S.transCache.delete(key);
-      // CR-18: the backend may fall back to a minimal Issue (key/url/project/status, other fields zero-valued);
-      // keep the card's known fields in that case instead of wiping summary/type/priority/assignee/updated.
-      const f = fresh && typeof fresh === 'object' ? fresh : {};
-      const patch = f.summary ? f : { url: f.url || original.url, project: f.project || original.project };
-      const freshIssue = Object.assign({}, original, patch, { status: f.status || optimistic });
-      const status = freshIssue.status || optimistic;
-      placeIssue(key, freshIssue, (findColumn(status) || {}).status || status, 0);
-      toast(t('board.moved', { key, status: status.name }), { tone: 'success' });
-      if (S.drawer && S.drawer.key === key) { S.drawer.issue = freshIssue; S.drawer.transitions = null; }
-      return true;
-    } catch (e) {
-      placeIssue(key, original, original.status, origIdx);
-      toastError(t('board.transitionFailed', { key }), e);
-      return false;
-    } finally {
-      S.pendingKeys.delete(key);
-      if (S.drawer && S.drawer.key === key) S.drawer.busyId = null;
-      renderBoard();
-      if (S.drawer && S.drawer.key === key) {
-        if (!S.drawer.transitions) loadDrawerTransitions(); else renderDrawer();
+  function onKanbanClick(e) {
+    const statusBtn = e.target.closest('[data-status-menu]');
+    if (statusBtn) { openStatusMenu(statusBtn); return; }
+    const open = e.target.closest('.card-open');
+    if (open) {
+      const card = open.closest('.card');
+      const kb = kanbanOf(card);
+      const f = kbFind(KANBAN[kb].model(), card.dataset.key);
+      openIssue(card.dataset.key, f && f.issue);
+      return;
+    }
+    const a = e.target.closest('[data-action]');
+    if (!a) return;
+    switch (a.dataset.action) {
+      case 'board-retry': loadBoard(true); break;
+      case 'go-projects': showView('projects'); break;
+      case 'hidden-dismiss': {
+        if (S.board && S.board.hidden) S.hiddenDismissed = hiddenSignature(S.board.hidden);
+        renderBoard();
+        const next = $('#board .card [data-role="open"]') || $('#board .state .btn') || $('#search');
+        if (next) next.focus({ preventScroll: true });
+        break;
       }
-      afterBoardMutation();
+      case 'clear-filters':
+        if (kanbanOf(a) === 'board') { S.q.board = ''; S.filter.projects.clear(); renderBoard(); }
+        else { S.q.sprints = ''; renderSprintBoard(); }
+        $('#search').value = '';
+        break;
+      case 'sp-retry': loadAgileBoards(true); break;
+      case 'sp-sprints-retry': selectBoard(S.sp.boardId, { keepSprint: true }); break;
+      case 'sp-data-retry': loadSprint(); break;
     }
   }
 
-  /* --- drawer --- */
-  function openDrawer(key) {
-    const found = findIssue(key);
-    if (!found) return;
-    S.drawer = { key, issue: found.issue, transitions: null, loading: true, error: null, busyId: null };
+  /* ================================================================
+   * Dropdown menu (role=menu): transitions, board and sprint pickers.
+   * Lives at <body> level so it stays usable while the app is inert under the drawer.
+   * Keyboard: ↑/↓/Home/End move, Enter/Space pick, Esc/Tab close (focus returns to the trigger).
+   * ================================================================ */
+  const menu = (() => {
+    let cur = null; // { anchor, opts, items, state, error, seq }
+    const box = () => $('#menu');
+
+    function position() {
+      const m = box();
+      const r = cur.anchor.getBoundingClientRect();
+      m.style.minWidth = Math.max(Math.round(r.width), 220) + 'px';
+      const mh = m.offsetHeight; const mw = m.offsetWidth;
+      let top = r.bottom + 6;
+      let origin = 'top';
+      if (top + mh > innerHeight - 8 && r.top - 6 - mh > 8) { top = r.top - 6 - mh; origin = 'bottom'; }
+      top = Math.max(8, Math.min(top, innerHeight - mh - 8));
+      const left = Math.max(8, Math.min(r.left, innerWidth - mw - 8));
+      m.style.top = Math.round(top) + 'px';
+      m.style.left = Math.round(left) + 'px';
+      m.dataset.origin = origin;
+    }
+    const itemEls = () => $$('[role^="menuitem"]', box());
+    function focusItem(i) {
+      const items = itemEls();
+      if (!items.length) { box().focus({ preventScroll: true }); return; }
+      const k = ((i % items.length) + items.length) % items.length;
+      items[k].focus({ preventScroll: false });
+    }
+    const selectedIndex = () => (cur.opts.isSelected ? Math.max(0, cur.items.findIndex(cur.opts.isSelected)) : 0);
+    function render() {
+      const o = cur.opts;
+      let body;
+      if (cur.state === 'loading') {
+        body = html`<div class="menu-state" role="status"><span class="spinner spinner-sm" aria-hidden="true"></span><span>${o.loadingText || t('common.loading')}</span></div>`;
+      } else if (cur.state === 'error') {
+        body = html`<div class="menu-state menu-error">${icon('alert')}<span>${errorText(cur.error)}</span></div><button type="button" role="menuitem" class="menu-item" data-retry tabindex="-1">${icon('refresh')}<span class="mi-main">${t('common.retry')}</span></button>`;
+      } else if (!cur.items.length) {
+        body = html`<div class="menu-state">${o.empty || ''}</div>`;
+      } else {
+        body = cur.items.map((it, i) => html`<button type="button" role="${o.radio ? 'menuitemradio' : 'menuitem'}" class="menu-item" data-i="${i}" tabindex="-1"${o.radio ? html` aria-checked="${o.isSelected(it) ? 'true' : 'false'}"` : ''}>${o.item(it)}${o.radio && o.isSelected(it) ? icon('check', 'mi-check') : ''}</button>`);
+      }
+      const m = box();
+      setHTML(m, html`${body}`);
+      m.setAttribute('aria-busy', cur.state === 'loading' ? 'true' : 'false');
+      position();
+    }
+    async function load() {
+      const seq = ++cur.seq;
+      const mine = cur;
+      cur.state = 'loading';
+      render();
+      try {
+        const items = await mine.opts.load();
+        if (cur !== mine || seq !== mine.seq) return;
+        mine.items = Array.isArray(items) ? items : [];
+        mine.state = 'ready';
+      } catch (e) {
+        if (cur !== mine || seq !== mine.seq) return;
+        mine.error = e;
+        mine.state = 'error';
+      }
+      const focusInside = box().contains(document.activeElement);
+      render();
+      if (focusInside) focusItem(selectedIndex());
+    }
+    function open(anchor, opts) {
+      if (cur && cur.anchor === anchor) { close(true); return; } // second click on the trigger closes
+      close(false);
+      cur = { anchor, opts, items: [], state: 'ready', error: null, seq: 0 };
+      const m = box();
+      m.hidden = false;
+      m.setAttribute('role', 'menu');
+      m.setAttribute('aria-label', opts.label || '');
+      m.tabIndex = -1;
+      anchor.setAttribute('aria-expanded', 'true');
+      anchor.setAttribute('aria-controls', 'menu');
+      m.classList.remove('is-open');
+      if (Array.isArray(opts.items)) { cur.items = opts.items; render(); focusItem(selectedIndex()); }
+      else { load(); m.focus({ preventScroll: true }); }
+      void m.offsetWidth; // restart the scale-in animation
+      m.classList.add('is-open');
+    }
+    function close(restoreFocus) {
+      if (!cur) return;
+      const a = cur.anchor;
+      cur = null;
+      const m = box();
+      m.hidden = true;
+      m.classList.remove('is-open');
+      m.textContent = '';
+      if (a && a.isConnected) {
+        a.setAttribute('aria-expanded', 'false');
+        if (restoreFocus) a.focus({ preventScroll: true });
+      }
+    }
+    function pick(i) {
+      const it = cur.items[i];
+      const fn = cur.opts.onPick;
+      close(true);
+      if (it) fn(it);
+    }
+    function onKey(e) {
+      if (!cur) return;
+      const items = itemEls();
+      const i = items.indexOf(document.activeElement);
+      switch (e.key) {
+        case 'ArrowDown': e.preventDefault(); focusItem(i + 1); break;
+        case 'ArrowUp': e.preventDefault(); focusItem(i < 0 ? -1 : i - 1); break;
+        case 'Home': e.preventDefault(); focusItem(0); break;
+        case 'End': e.preventDefault(); focusItem(-1); break;
+        case 'Escape': e.preventDefault(); e.stopPropagation(); close(true); break;
+        case 'Tab': e.preventDefault(); close(true); break;
+        default: return;
+      }
+    }
+    function onClick(e) {
+      if (!cur) return;
+      if (e.target.closest('[data-retry]')) { load(); box().focus({ preventScroll: true }); return; }
+      const b = e.target.closest('[data-i]');
+      if (b) pick(Number(b.dataset.i));
+    }
+    /** Called after re-renders: follow a re-created trigger, or close if it is gone. */
+    function sync() {
+      if (!cur) return;
+      if (!cur.anchor.isConnected) {
+        const a = cur.opts.anchorSel && document.querySelector(cur.opts.anchorSel);
+        if (!a || a.disabled) { close(false); return; }
+        cur.anchor = a;
+        a.setAttribute('aria-expanded', 'true');
+        a.setAttribute('aria-controls', 'menu');
+      }
+      position();
+    }
+    function onOutside(e) {
+      if (!cur) return;
+      if (box().contains(e.target) || cur.anchor.contains(e.target)) return;
+      close(false);
+    }
+    return { open, close, sync, onKey, onClick, onOutside, isOpen: () => !!cur };
+  })();
+
+  /* ================================================================
+   * Safe Jira wiki markup subset → DOM (never innerHTML of Jira content).
+   * Blocks: h1.–h6., {code}/{noformat}, {quote}, bq., * / # / - lists (nested), ----, paragraphs.
+   * Inline: *bold*, _italic_, {{mono}}, [text|url], [url], [ISSUE-1], [~user]; {color} markers dropped;
+   * everything else is plain text.
+   * ================================================================ */
+  const wiki = (() => {
+    const ISSUE_KEY = /^[A-Z][A-Z0-9_]+-\d+$/;
+    const HTTP_URL = /^https?:\/\/[^\s]+$/i;
+    const INLINE = /\{\{([^\n]+?)\}\}|\[([^[\]\n]+)\]|(?<![\p{L}\p{N}*])\*(?=\S)([^\n*]*?\S)\*(?![\p{L}\p{N}*])|(?<![\p{L}\p{N}_])_(?=\S)([^\n_]*?\S)_(?![\p{L}\p{N}_])|\{color(?::[^}\n]*)?\}/gu;
+    const mk = (tag, cls) => { const el = document.createElement(tag); if (cls) el.className = cls; return el; };
+
+    function text(parent, s) {
+      String(s).split('\\\\').forEach((part, i) => {
+        if (i) parent.append(mk('br'));
+        if (part) parent.append(document.createTextNode(part));
+      });
+    }
+    function link(parent, inner, raw) {
+      if (inner.startsWith('~')) {
+        const m = mk('span', 'mention');
+        m.textContent = '@' + inner.slice(1).replace(/^accountid:/i, '');
+        parent.append(m);
+        return;
+      }
+      const bar = inner.lastIndexOf('|');
+      const label = (bar >= 0 ? inner.slice(0, bar) : inner).trim();
+      const target = (bar >= 0 ? inner.slice(bar + 1) : inner).trim();
+      let b = null;
+      if (ISSUE_KEY.test(target)) { b = mk('button', 'wiki-link'); b.dataset.openKey = target; }
+      else if (HTTP_URL.test(target)) { b = mk('button', 'wiki-link'); b.dataset.url = target; }
+      if (!b) { parent.append(document.createTextNode(raw)); return; }
+      b.type = 'button';
+      b.title = target;
+      b.textContent = label || target;
+      parent.append(b);
+    }
+    function inline(parent, s) {
+      let last = 0;
+      for (const m of String(s).matchAll(INLINE)) {
+        if (m.index > last) text(parent, s.slice(last, m.index));
+        if (m[1] != null) { const c = mk('code', 'wiki-mono'); c.textContent = m[1]; parent.append(c); }
+        else if (m[2] != null) link(parent, m[2], m[0]);
+        else if (m[3] != null) { const b = mk('strong'); inline(b, m[3]); parent.append(b); }
+        else if (m[4] != null) { const it = mk('em'); inline(it, m[4]); parent.append(it); }
+        last = m.index + m[0].length;
+      }
+      if (last < s.length) text(parent, s.slice(last));
+    }
+
+    function render(src) {
+      const root = mk('div', 'wiki');
+      const lines = String(src || '').replace(/\r\n?/g, '\n').split('\n');
+      let quote = null;
+      let para = null;
+      let list = null; // stack of { el, type }
+      const into = () => quote || root;
+      const reset = () => { para = null; list = null; };
+      const paragraph = (s) => {
+        if (!para) { para = mk('p'); into().append(para); } else para.append(mk('br'));
+        inline(para, s);
+      };
+      const listItem = (markers, s) => {
+        para = null;
+        if (!list) list = [];
+        const depth = markers.length;
+        if (list.length > depth) list.length = depth;
+        for (let d = 0; d < depth; d++) {
+          const type = markers[d] === '#' ? 'ol' : 'ul';
+          if (list[d] && list[d].type === type) continue;
+          list.length = d;
+          const L = mk(type, 'wiki-list');
+          if (d === 0) into().append(L);
+          else {
+            let li = list[d - 1].el.lastElementChild;
+            if (!li) { li = mk('li'); list[d - 1].el.append(li); }
+            li.append(L);
+          }
+          list.push({ el: L, type });
+        }
+        const li = mk('li');
+        inline(li, s);
+        list[depth - 1].el.append(li);
+      };
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const tr = line.trim();
+        let m;
+        if ((m = /^\{(code|noformat)(?::[^}]*)?\}(.*)$/.exec(tr))) {
+          reset();
+          const close = '{' + m[1] + '}';
+          const buf = [];
+          let rest = m[2];
+          let trailing = '';
+          for (;;) {
+            const c = rest.indexOf(close);
+            if (c >= 0) { buf.push(rest.slice(0, c)); trailing = rest.slice(c + close.length); break; }
+            buf.push(rest);
+            if (++i >= lines.length) break;
+            rest = lines[i];
+          }
+          const pre = mk('pre', 'wiki-pre');
+          const code = mk('code');
+          code.textContent = buf.join('\n').replace(/^\n+|\s+$/g, '');
+          pre.append(code);
+          into().append(pre);
+          if (trailing.trim()) paragraph(trailing.trim());
+          continue;
+        }
+        if ((m = /^\{quote\}(.*)$/.exec(tr))) {
+          reset();
+          if (quote) quote = null;
+          else { quote = mk('blockquote', 'wiki-quote'); root.append(quote); }
+          let after = m[1];
+          if (quote && after.includes('{quote}')) { const [inner, tail] = after.split('{quote}'); if (inner.trim()) paragraph(inner.trim()); quote = null; para = null; after = tail; }
+          if (after.trim()) paragraph(after.trim());
+          continue;
+        }
+        if (!tr) { reset(); continue; }
+        if ((m = /^h([1-6])\.\s*(.*)$/.exec(tr))) {
+          reset();
+          const h = mk('h' + Math.min(6, Number(m[1]) + 2), 'wiki-h wiki-h' + m[1]);
+          inline(h, m[2]);
+          into().append(h);
+          continue;
+        }
+        if ((m = /^bq\.\s+(.*)$/.exec(tr))) {
+          reset();
+          const q = mk('blockquote', 'wiki-quote');
+          const p = mk('p');
+          inline(p, m[1]);
+          q.append(p);
+          into().append(q);
+          continue;
+        }
+        if (/^-{4,}$/.test(tr)) { reset(); into().append(mk('hr')); continue; }
+        if ((m = /^([*#]+|-)\s+(.*)$/.exec(tr))) { listItem(m[1] === '-' ? '*' : m[1], m[2]); continue; }
+        list = null;
+        paragraph(line);
+      }
+      return root;
+    }
+    return { render };
+  })();
+
+  /* ================================================================
+   * ISSUE DRAWER: header (type, key, summary, status dropdown, open in Jira),
+   * tabs Details / Comments / History, related issues navigable with a back stack.
+   * ================================================================ */
+  const detailCache = new Map(); // key -> IssueDetail, for back navigation; cleared when the drawer closes
+  const drawerKey = () => (S.drawer ? S.drawer.stack[S.drawer.stack.length - 1].key : null);
+
+  function findIssueAnywhere(key) {
+    const f = kbFind(S.board, key) || kbFind(S.sp.data && S.sp.data.model, key);
+    if (f) return f.issue;
+    let hit = null;
+    forEachRef(key, (r) => { if (!hit) hit = r; });
+    return hit;
+  }
+
+  function normalizeDetail(d) {
+    const out = Object.assign({}, d || {});
+    ['labels', 'components', 'fixVersions', 'sprints', 'stories', 'children', 'links', 'comments', 'changelog'].forEach((k) => { if (!Array.isArray(out[k])) out[k] = []; });
+    out.issue = out.issue || {};
+    out.timeTracking = out.timeTracking || {};
+    return out;
+  }
+
+  function openIssue(key, seed, { push = false } = {}) {
+    if (!key) return;
+    menu.close(false);
+    const d = S.drawer;
+    if (d) {
+      if (drawerKey() === key) return;
+      if (push) d.stack.push({ key, seed });
+      else d.stack = [{ key, seed }];
+      d.tab = 'details';
+      loadDetail({ navigated: true });
+      return;
+    }
+    S.drawer = { stack: [{ key, seed }], detail: null, loading: true, error: null, tab: 'details', seq: 0 };
     renderDrawer();
     layers.open($('#drawer'), {
       focus: '#drawer-title',
-      onClose: () => { S.drawer = null; },
-      restoreFocus: () => document.querySelector(`#board .card[data-key="${CSS.escape(key)}"]`),
+      onClose: () => { S.drawer = null; detailCache.clear(); menu.close(false); },
+      restoreFocus: () => $(`#${activeSectionId()} [data-focus-key="${CSS.escape(key)}"]`),
     });
-    loadDrawerTransitions();
+    loadDetail();
   }
 
-  async function loadDrawerTransitions() {
+  function drawerBack() {
+    const d = S.drawer;
+    if (!d || d.stack.length < 2) return;
+    d.stack.pop();
+    d.tab = 'details';
+    loadDetail({ navigated: true });
+  }
+
+  async function loadDetail({ navigated, silent } = {}) {
     const d = S.drawer;
     if (!d) return;
-    d.loading = true; d.error = null;
-    renderDrawer();
+    const key = drawerKey();
+    const seq = ++d.seq;
+    const cached = !silent && detailCache.get(key);
+    if (cached) { d.detail = cached; d.loading = false; d.error = null; renderDrawer(navigated); return; }
+    if (!silent) { d.detail = null; d.error = null; }
+    d.loading = true;
+    renderDrawer(navigated);
     try {
-      const list = await getTransitions(d.key, true);
-      if (S.drawer !== d) return;
-      d.transitions = list;
+      const det = normalizeDetail(await api('getIssue', { key }));
+      if (S.drawer !== d || seq !== d.seq) return;
+      d.detail = det;
+      d.error = null;
+      detailCache.set(key, det);
     } catch (e) {
-      if (S.drawer !== d) return;
-      d.error = e;
+      if (S.drawer !== d || seq !== d.seq) return;
+      if (!silent || !d.detail) d.error = e;
     }
     d.loading = false;
     renderDrawer();
   }
 
-  function renderDrawer() {
+  /* --- drawer pieces --- */
+  function personHTML(user, emptyKey) {
+    if (!user || !(user.displayName || user.name)) return html`<span class="muted">${t(emptyKey || 'issue.unassigned')}</span>`;
+    const name = user.displayName || user.name;
+    return html`<span class="person">${avatar(name, 'avatar-xs')}<span>${name}</span></span>`;
+  }
+
+  function relRow(ref) {
+    if (!ref || !ref.key) return '';
+    const done = catOf(ref.status) === 'done';
+    const tone = ref.color || ref.name ? epicTone(ref.color, ref.key) : null;
+    return html`<li><button type="button" class="rel-row${ref.mine ? ' is-mine' : ''}${done ? ' is-done' : ''}" data-open-key="${ref.key}"${tone ? html` data-epic="${tone}"` : ''}>
+      ${ref.type ? typeIcon(ref.type) : ''}<span class="card-key">${ref.key}</span><span class="rel-sum">${ref.name && ref.name !== ref.summary ? html`<strong>${ref.name}</strong> · ` : ''}${ref.summary || ''}</span>${ref.assignee ? assigneeAvatar(ref.assignee) : ''}${statusPill(ref.status)}
+    </button></li>`;
+  }
+  function relSection(id, title, refs) {
+    if (!refs || !refs.length) return '';
+    return html`<section class="d-sec" aria-labelledby="${id}"><h3 id="${id}">${title}<span class="d-count">${refs.length}</span></h3><ul class="rel-list" role="list">${refs.map(relRow)}</ul></section>`;
+  }
+
+  function estimatesHTML(det) {
+    const tt = det.timeTracking || {};
+    const num = (v) => (v == null || v === '' ? null : Number(v));
+    const orig = num(tt.originalSeconds); const rem = num(tt.remainingSeconds); const spent = num(tt.spentSeconds);
+    const sp = det.storyPoints != null ? det.storyPoints : det.issue.storyPoints;
+    if (orig == null && rem == null && spent == null && sp == null) return '';
+    const max = Math.max(orig || 0, (spent || 0) + (rem || 0), 1);
+    const row = (cls, label, sec, str) => (sec == null && !str ? '' : html`<div class="est-row ${cls}">
+      <span class="est-label">${label}</span>
+      <span class="est-track" aria-hidden="true"><span class="est-fill" style="--w:${(Math.min(sec || 0, max) / max * 100).toFixed(2)}%"></span></span>
+      <span class="est-val">${sec != null ? dur(sec) : str}</span></div>`);
+    return html`<section class="d-sec" aria-labelledby="d-est"><h3 id="d-est">${t('drawer.estimates')}</h3>
+      <div class="estimates">
+        ${row('est-orig', t('drawer.estOriginal'), orig, tt.original)}
+        ${row('est-spent', t('drawer.estSpent'), spent, tt.spent)}
+        ${row('est-rem', t('drawer.estRemaining'), rem, tt.remaining)}
+        ${sp != null ? html`<div class="est-row est-sp"><span class="est-label">${t('drawer.storyPoints')}</span><span class="est-sp-val">${spBadge(sp)}</span></div>` : ''}
+      </div></section>`;
+  }
+
+  function chipsSection(id, title, values) {
+    const list = (values || []).map((v) => nameOf(v)).filter(Boolean);
+    if (!list.length) return '';
+    return html`<div class="tagline"><dt id="${id}">${title}</dt><dd><ul class="tag-chips" role="list" aria-labelledby="${id}">${list.map((v) => html`<li class="chip">${v}</li>`)}</ul></dd></div>`;
+  }
+
+  function childrenTitle(det) {
+    switch (kindOf(det.issue.type)) {
+      case 'epic': return t('drawer.childrenEpic');
+      case 'story': return t('drawer.childrenStory');
+      default: return t('drawer.subtasks');
+    }
+  }
+
+  function detailsHTML(det) {
+    const is = det.issue;
+    const links = new Map();
+    det.links.forEach((l) => { if (!l || !l.issue) return; const r = l.relation || t('drawer.related'); if (!links.has(r)) links.set(r, []); links.get(r).push(l.issue); });
+    const sprints = det.sprints.length ? html`<section class="d-sec" aria-labelledby="d-sprints"><h3 id="d-sprints">${t('drawer.sprints')}</h3><ul class="sprint-chips" role="list">${det.sprints.map((s) => html`<li class="sprint-chip">${icon('sprint', 'icon-xs')}<span>${s.name}</span>${sprintStateBadge(s.state)}</li>`)}</ul></section>` : '';
+    const dateRow = (label, iso, rel) => (iso ? html`<div><dt>${label}</dt><dd>${i18n.dateTime(iso)}${rel ? html` · ${relSpan(iso)}` : ''}</dd></div>` : '');
+    return html`
+      <section class="d-sec" aria-labelledby="d-desc"><h3 id="d-desc">${t('drawer.description')}</h3>
+        ${det.description && det.description.trim() ? html`<div data-wiki="desc"></div>` : html`<p class="empty-line">${t('drawer.noDescription')}</p>`}
+      </section>
+      <dl class="props props-grid">
+        <div><dt>${t('issue.assignee')}</dt><dd>${personHTML(is.assignee)}</dd></div>
+        <div><dt>${t('issue.reporter')}</dt><dd>${personHTML(det.reporter, 'issue.nobody')}</dd></div>
+        <div><dt>${t('issue.priority')}</dt><dd>${nameOf(det.priority || is.priority) ? html`<span class="person">${priorityIcon(det.priority || is.priority)}<span>${nameOf(det.priority || is.priority)}</span></span>` : '—'}</dd></div>
+        <div><dt>${t('issue.type')}</dt><dd>${is.type ? typeBadge(is.type) : '—'}</dd></div>
+        <div><dt>${t('issue.project')}</dt><dd>${projectOf(is) || '—'}</dd></div>
+        ${det.resolution ? html`<div><dt>${t('issue.resolution')}</dt><dd>${nameOf(det.resolution)}</dd></div>` : ''}
+        ${det.dueDate ? html`<div><dt>${t('issue.due')}</dt><dd>${i18n.date(det.dueDate.length <= 10 ? det.dueDate + 'T12:00:00' : det.dueDate)}</dd></div>` : ''}
+        ${dateRow(t('issue.created'), det.created, false)}
+        ${dateRow(t('issue.updated'), det.updated || is.updated, true)}
+        ${det.watchers != null ? html`<div><dt>${t('issue.watchers')}</dt><dd>${det.watchers}</dd></div>` : ''}
+      </dl>
+      ${estimatesHTML(det)}
+      ${sprints}
+      ${det.epic ? relSection('d-epic', t('drawer.epic'), [det.epic]) : ''}
+      ${det.parent ? relSection('d-parent', t('drawer.parent'), [det.parent]) : ''}
+      ${relSection('d-stories', t('drawer.stories'), det.stories)}
+      ${relSection('d-children', childrenTitle(det), det.children)}
+      ${links.size ? html`<section class="d-sec" aria-labelledby="d-links"><h3 id="d-links">${t('drawer.links')}<span class="d-count">${det.links.length}</span></h3>
+        ${[...links].map(([rel, refs]) => html`<h4 class="d-sub">${rel}</h4><ul class="rel-list" role="list">${refs.map(relRow)}</ul>`)}</section>` : ''}
+      ${det.labels.length || det.components.length || det.fixVersions.length ? html`<dl class="taglines">
+        ${chipsSection('d-labels', t('drawer.labels'), det.labels)}
+        ${chipsSection('d-components', t('drawer.components'), det.components)}
+        ${chipsSection('d-versions', t('drawer.versions'), det.fixVersions)}
+      </dl>` : ''}`;
+  }
+
+  function commentsHTML(det) {
+    if (!det.comments.length) return stateBlock({ iconName: 'message', title: t('drawer.noComments') });
+    return html`<ol class="comments" role="list">${det.comments.map((c, i) => {
+      const who = (c.author && (c.author.displayName || c.author.name)) || t('issue.nobody');
+      const edited = c.updated && c.created && c.updated !== c.created;
+      return html`<li class="comment">${avatar(who, 'avatar-sm')}<div class="comment-main">
+        <div class="comment-head"><span class="comment-author">${who}</span>${relSpan(c.created, '', 'comment-time')}${edited ? html`<span class="muted">· ${t('drawer.edited')}</span>` : ''}</div>
+        <div data-wiki="c${i}"></div></div></li>`;
+    })}</ol>`;
+  }
+
+  const FIELD_KEYS = { status: 'issue.status', assignee: 'issue.assignee', priority: 'issue.priority', resolution: 'issue.resolution', summary: 'drawer.fieldSummary', description: 'drawer.description', labels: 'drawer.labels', component: 'drawer.components', 'fix version': 'drawer.versions', sprint: 'drawer.sprintField', 'story points': 'drawer.storyPoints', 'epic link': 'drawer.epic', link: 'drawer.links', issuetype: 'issue.type', reporter: 'issue.reporter', duedate: 'issue.due', timeestimate: 'drawer.estRemaining', timeoriginalestimate: 'drawer.estOriginal', timespent: 'drawer.estSpent' };
+  function fieldName(f) {
+    const k = FIELD_KEYS[String(f || '').toLowerCase()];
+    return k ? t(k) : String(f || '');
+  }
+  function historyHTML(det) {
+    if (!det.changelog.length) return stateBlock({ iconName: 'history', title: t('drawer.noHistory') });
+    return html`<ol class="changes" role="list">${det.changelog.map((ch) => {
+      const who = (ch.author && (ch.author.displayName || ch.author.name)) || t('issue.nobody');
+      return html`<li class="change">${avatar(who, 'avatar-sm')}<div class="change-main">
+        <div class="comment-head"><span class="comment-author">${who}</span>${relSpan(ch.created, '', 'comment-time')}</div>
+        <ul class="change-items" role="list">${(ch.items || []).map((it) => html`<li><span class="ch-field">${fieldName(it.field)}</span><span class="ch-vals"><span class="ch-from">${it.from || '—'}</span>${icon('arrow-right', 'icon-xs')}<span class="ch-to">${it.to || '—'}</span></span></li>`)}</ul>
+      </div></li>`;
+    })}</ol>`;
+  }
+
+  function fillWiki(el, det) {
+    const desc = $('[data-wiki="desc"]', el);
+    if (desc) desc.replaceWith(wiki.render(det.description));
+    $$('[data-wiki^="c"]', el).forEach((slot) => {
+      const c = det.comments[Number(slot.dataset.wiki.slice(1))];
+      slot.replaceWith(wiki.render(c ? c.body : ''));
+    });
+  }
+
+  const DRAWER_TABS = ['details', 'comments', 'history'];
+  function renderDrawer(navigated) {
     const d = S.drawer;
-    const el = $('#drawer');
     if (!d) return;
-    const live = findIssue(d.key);
-    if (live) d.issue = live.issue;
-    const is = d.issue;
-    const focusedTr = el.contains(document.activeElement) ? document.activeElement.dataset.tr : null;
-    const hadFocusInside = el.contains(document.activeElement);
-    const busy = d.busyId != null || S.pendingKeys.has(d.key);
+    const el = $('#drawer');
+    const top = d.stack[d.stack.length - 1];
+    const det = d.detail;
+    const is = Object.assign({ key: top.key }, top.seed || {}, findIssueAnywhere(top.key) || {}, det ? det.issue : {});
+    const active = document.activeElement;
+    const hadFocus = el.contains(active);
+    const focusSel = hadFocus && !navigated ? (active.id ? '#' + CSS.escape(active.id) : active.dataset.action ? `[data-action="${active.dataset.action}"]` : active.dataset.statusMenu ? '[data-status-menu]' : null) : null;
+    const prevBody = $('.drawer-body', el);
+    const scrollTop = prevBody && !navigated ? prevBody.scrollTop : 0;
 
-    let transitions;
-    if (d.loading && !d.transitions) {
-      transitions = html`<div class="tr-list" role="status" aria-label="${t('common.loading')}">${[0, 1, 2].map(() => html`<div class="skeleton sk-tr"></div>`)}</div>`;
-    } else if (d.error) {
-      transitions = html`<div class="inline-error">${icon('alert')}<span>${errorText(d.error)}</span><button type="button" class="btn btn-sm" data-action="tr-retry">${t('common.retry')}</button></div>`;
-    } else if (!d.transitions || !d.transitions.length) {
-      transitions = html`<p class="empty-line">${t('drawer.noTransitions')}</p>`;
-    } else {
-      transitions = html`<ul class="tr-list" role="list">${d.transitions.map((tr) => html`<li>
-        <button type="button" class="tr-btn" data-tr="${tr.id}" ${busy ? html`disabled` : ''}>
-          <span class="tr-name">${tr.name}</span>
-          <span class="tr-to">${icon('arrow-right')}${statusPill(tr.to)}</span>
-          ${d.busyId === tr.id ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : ''}
-        </button></li>`)}</ul>`;
-    }
+    let body;
+    if (!det && d.error) {
+      body = html`<div class="inline-error">${icon('alert')}<span>${errorText(d.error)}</span><button type="button" class="btn btn-sm" data-action="detail-retry">${t('common.retry')}</button></div>`;
+    } else if (!det) {
+      body = html`<div class="d-skeleton" role="status" aria-label="${t('common.loading')}">${[90, 75, 82, 40].map((w) => html`<span class="skeleton sk-line" style="width:${w}%"></span>`)}<span class="skeleton" style="height:120px"></span></div>`;
+    } else if (d.tab === 'comments') body = commentsHTML(det);
+    else if (d.tab === 'history') body = historyHTML(det);
+    else body = detailsHTML(det);
 
-    setHTML(el, html`<div class="drawer-panel">
+    const prev = d.stack.length > 1 ? d.stack[d.stack.length - 2] : null;
+    const tabLabel = (tab) => tab === 'comments' && det ? t('drawer.tabCommentsN', { n: det.comments.length }) : t('drawer.tab.' + tab);
+    setHTML(el, html`<div class="drawer-panel" data-type="${typeVisual(is.type)}">
       <header class="drawer-head">
-        <div class="drawer-crumbs">${typeBadge(is.type)}<span class="card-key">${is.key}</span></div>
-        <button type="button" class="icon-btn" data-action="close" aria-label="${t('common.close')}" title="${t('common.closeEsc')}">${icon('x')}</button>
+        ${prev ? html`<button type="button" class="icon-btn" data-action="back" aria-label="${t('drawer.back', { key: prev.key })}" title="${t('drawer.back', { key: prev.key })}">${icon('arrow-left')}</button>` : ''}
+        <div class="drawer-crumbs">${is.type ? typeIcon(is.type) : ''}<span class="card-key">${is.key}</span>${d.loading && det ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : ''}</div>
+        <div class="drawer-head-end">
+          <button type="button" class="icon-btn" data-action="open-jira" aria-label="${t('common.openInJira')}" title="${t('common.openInJira')}" ${is.url ? '' : html`disabled`}>${icon('external')}</button>
+          <button type="button" class="icon-btn" data-action="close" aria-label="${t('common.close')}" title="${t('common.closeEsc')}">${icon('x')}</button>
+        </div>
       </header>
-      <div class="drawer-body">
-        <h2 class="drawer-title" id="drawer-title" tabindex="-1">${is.summary}</h2>
-        <dl class="props">
-          <dt>${t('issue.status')}</dt><dd>${statusPill(is.status)}${S.pendingKeys.has(is.key) ? html` <span class="spinner spinner-sm" aria-hidden="true"></span>` : ''}</dd>
-          <dt>${t('issue.type')}</dt><dd>${nameOf(is.type) || '—'}</dd>
-          <dt>${t('issue.priority')}</dt><dd>${nameOf(is.priority) || '—'}</dd>
-          <dt>${t('issue.project')}</dt><dd>${projectOf(is) || '—'}</dd>
-          <dt>${t('issue.assignee')}</dt><dd>${(is.assignee && is.assignee.displayName) || t('issue.unassigned')}</dd>
-          <dt>${t('issue.updated')}</dt><dd>${is.updated ? html`${i18n.dateTime(is.updated)} · ${relSpan(is.updated)}` : '—'}</dd>
-        </dl>
-        <section class="drawer-section" aria-labelledby="drawer-tr-h" aria-busy="${d.loading ? 'true' : 'false'}">
-          <h3 id="drawer-tr-h">${t('drawer.transitions')}</h3>
-          ${transitions}
-        </section>
+      <div class="drawer-hero">
+        <h2 class="drawer-title" id="drawer-title" tabindex="-1">${is.summary || is.key}</h2>
+        <div class="drawer-status">${is.status ? statusButton(is) : ''}${is.epic ? epicChip(is.epic) : ''}${spBadge(is.storyPoints)}</div>
       </div>
-      <footer class="drawer-foot">
-        <button type="button" class="btn btn-primary" data-action="open-jira" ${is.url ? '' : html`disabled`}>${icon('external')}<span>${t('common.openInJira')}</span></button>
-      </footer>
+      <div class="tabs" role="tablist" aria-label="${t('drawer.tabsLabel')}">${DRAWER_TABS.map((tab) => html`<button type="button" role="tab" class="tab" id="dtab-${tab}" data-tab="${tab}" aria-selected="${d.tab === tab ? 'true' : 'false'}" aria-controls="dpanel" tabindex="${d.tab === tab ? '0' : '-1'}">${tabLabel(tab)}</button>`)}</div>
+      <div class="drawer-body" id="dpanel" role="tabpanel" aria-labelledby="dtab-${d.tab}" tabindex="0" aria-busy="${d.loading ? 'true' : 'false'}">${body}</div>
     </div>`);
-
-    if (hadFocusInside) {
-      const target = (focusedTr && el.querySelector(`[data-tr="${CSS.escape(focusedTr)}"]:not(:disabled)`)) || $('#drawer-title');
-      if (target) target.focus({ preventScroll: true });
+    if (det) fillWiki(el, det);
+    const nb = $('.drawer-body', el);
+    if (nb) nb.scrollTop = scrollTop;
+    if (navigated) $('#drawer-title').focus({ preventScroll: true });
+    else if (hadFocus) {
+      const target = (focusSel && el.querySelector(focusSel)) || $('#drawer-title');
+      if (target && !target.disabled) target.focus({ preventScroll: true }); else $('#drawer-title').focus({ preventScroll: true });
     }
+    menu.sync();
+  }
+
+  function selectTab(tab, focus) {
+    const d = S.drawer;
+    if (!d || !DRAWER_TABS.includes(tab)) return;
+    d.tab = tab;
+    renderDrawer();
+    if (focus) { const b = $(`#dtab-${tab}`); if (b) b.focus(); }
+  }
+
+  function seedFromDetail(key) {
+    const det = S.drawer && S.drawer.detail;
+    if (!det) return null;
+    const pool = [det.epic, det.parent, ...det.stories, ...det.children, ...det.links.map((l) => l && l.issue)];
+    return pool.find((r) => r && r.key === key) || null;
   }
 
   function onDrawerClick(e) {
     const d = S.drawer;
     if (!d) return;
-    const a = e.target.closest('[data-action], [data-tr]');
+    const statusBtn = e.target.closest('[data-status-menu]');
+    if (statusBtn) { openStatusMenu(statusBtn); return; }
+    const tab = e.target.closest('[data-tab]');
+    if (tab) { selectTab(tab.dataset.tab, true); return; }
+    const rel = e.target.closest('[data-open-key]');
+    if (rel) { openIssue(rel.dataset.openKey, seedFromDetail(rel.dataset.openKey), { push: true }); return; }
+    const url = e.target.closest('[data-url]');
+    if (url) { openUrl(url.dataset.url); return; }
+    const a = e.target.closest('[data-action]');
     if (!a) return;
-    if (a.dataset.tr != null) {
-      const tr = (d.transitions || []).find((x) => String(x.id) === a.dataset.tr);
-      if (tr && d.busyId == null && !S.pendingKeys.has(d.key)) runTransition(d.key, tr, null);
-      return;
-    }
     switch (a.dataset.action) {
       case 'close': layers.close($('#drawer')); break;
-      case 'tr-retry': loadDrawerTransitions(); break;
-      case 'open-jira': openUrl(d.issue.url); break;
+      case 'back': drawerBack(); break;
+      case 'detail-retry': loadDetail(); break;
+      case 'open-jira': {
+        const cur = (d.detail && d.detail.issue) || findIssueAnywhere(drawerKey()) || {};
+        openUrl(cur.url);
+        break;
+      }
     }
+  }
+
+  function onDrawerKey(e) {
+    const tab = e.target.closest && e.target.closest('[role="tab"]');
+    if (tab) {
+      const i = DRAWER_TABS.indexOf(tab.dataset.tab);
+      const go = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: DRAWER_TABS.length - 1 }[e.key];
+      if (go != null) { e.preventDefault(); selectTab(DRAWER_TABS[(go + DRAWER_TABS.length) % DRAWER_TABS.length], true); }
+      return;
+    }
+    if (e.key === 'Backspace' && e.altKey) { e.preventDefault(); drawerBack(); }
   }
 
   async function openUrl(url) {
     if (!url) return;
     try { await api('openUrl', { url }); } catch (e) { toastError(t('common.openFailed'), e); }
+  }
+
+  /* ================================================================
+   * EPICS & STORIES: expandable tree (ARIA tree, roving tabindex).
+   * Epics mode: epic → stories → tasks, then the epic's direct tasks; "Stories without epic" section.
+   * Stories mode: story → tasks. Expansion is remembered.
+   * ================================================================ */
+  /** Drops cached epic/story trees; answers already in flight are not cached afterwards (CR-14). */
+  function invalidateEpics() {
+    S.ep.cache.clear();
+    S.ep.cacheGen++;
+  }
+  const epCacheKey = () => `${S.ep.mode}|${S.ep.includeDone ? 1 : 0}|${S.ep.mine ? 'mine' : 'all'}`;
+
+  function enterEpics() {
+    const cached = S.ep.cache.get(epCacheKey());
+    if (cached && !S.ep.stale) {
+      // CR-8: a request still in flight for other options must not overwrite this view.
+      ++S.ep.seq;
+      S.ep.loading = false;
+      S.ep.data = cached;
+      S.ep.error = null;
+      renderEpics(); renderRefreshState();
+      return;
+    }
+    if (cached) S.ep.data = cached;
+    loadEpics({ silent: !!cached });
+  }
+
+  async function loadEpics({ force, silent } = {}) {
+    // CR-8: options are captured now; the response is shaped and cached for them, whatever the UI shows later.
+    const key = epCacheKey();
+    const gen = S.ep.cacheGen; // CR-14: an invalidation while in flight means this answer may be outdated: don't cache it
+    const mode = S.ep.mode;
+    const params = { includeDone: S.ep.includeDone, scope: S.ep.mine ? 'mine' : 'all' };
+    if (force) params.force = true;
+    const seq = ++S.ep.seq;
+    S.ep.loading = true;
+    S.ep.stale = false;
+    const cached = S.ep.cache.get(key);
+    if (!silent || !S.ep.data || S.ep.data.mode !== mode) { S.ep.data = cached || null; S.ep.error = null; }
+    renderEpics(); renderRefreshState();
+    try {
+      const res = await api(mode === 'stories' ? 'getStories' : 'getEpics', params);
+      const data = mode === 'stories'
+        ? { mode, stories: (res && res.stories) || [], fetchedAt: res && res.fetchedAt, truncated: !!(res && res.truncated) }
+        : { mode, epics: (res && res.epics) || [], orphanStories: (res && res.orphanStories) || [], fetchedAt: res && res.fetchedAt, truncated: !!(res && res.truncated) };
+      if (gen === S.ep.cacheGen) S.ep.cache.set(key, data);
+      if (seq !== S.ep.seq) return;
+      S.ep.data = data;
+      S.ep.error = null;
+    } catch (e) {
+      if (seq !== S.ep.seq) return;
+      S.ep.error = e;
+      if (S.ep.data) toastError(t('epics.loadFailed'), e);
+    } finally {
+      if (seq === S.ep.seq) { S.ep.loading = false; renderEpics(); renderRefreshState(); }
+    }
+  }
+
+  function setEpicsOption(patch) {
+    Object.assign(S.ep, patch);
+    prefs.set('epics.mode', S.ep.mode);
+    prefs.set('epics.done', S.ep.includeDone);
+    prefs.set('epics.mine', S.ep.mine);
+    S.ep.overrides.clear();
+    enterEpics();
+  }
+
+  const refText = (r) => [r && r.key, r && r.summary, r && r.name].map((x) => String(x || '').toLowerCase());
+  const refHit = (r, q) => !q || refText(r).some((s) => s.includes(q));
+  function filterStory(node, q) {
+    const tasks = node.tasks || [];
+    if (!q || refHit(node.story, q)) return { node, tasks, forced: false };
+    const hits = tasks.filter((r) => refHit(r, q));
+    return hits.length ? { node, tasks: hits, forced: true } : null;
+  }
+  function filterEpic(node, q) {
+    const stories = node.stories || [];
+    const tasks = node.tasks || [];
+    if (!q || refHit(node.epic, q)) return { node, stories: stories.map((s) => ({ node: s, tasks: s.tasks || [], forced: false })), tasks, forced: false };
+    const fs = stories.map((s) => filterStory(s, q)).filter(Boolean);
+    const ft = tasks.filter((r) => refHit(r, q));
+    return fs.length || ft.length ? { node, stories: fs, tasks: ft, forced: true } : null;
+  }
+  function isOpen(id, forced) {
+    if (S.ep.overrides.has(id)) return S.ep.overrides.get(id);
+    return forced || S.ep.expanded.has(id);
+  }
+
+  function treeBuilder() {
+    let seq = 0;
+    const lid = () => 'tl-' + (++seq);
+    const kids = (id, inner) => html`<div class="tkids-wrap${S.ep.opening === id ? ' is-opening' : ''}"><ul role="group" class="tkids">${inner}</ul></div>`;
+    const chev = (expandable) => (expandable ? html`<span class="tchev" aria-hidden="true">${icon('chevron-right')}</span>` : html`<span class="tchev tchev-leaf" aria-hidden="true"></span>`);
+    const mineCls = (r) => (r && r.mine ? ' is-mine' : '');
+    /** DR-11: fixed slots (extra · assignee · progress · status) so bars and pills line up across levels. */
+    const meta = (extra, av, pg, status) => html`<span class="tmeta"><span class="tm-extra">${extra}</span><span class="tm-av">${av}</span><span class="tm-pg">${pg}</span><span class="tm-st">${statusPill(status)}</span></span>`;
+    const doneCls = (r) => (catOf(r && r.status) === 'done' ? ' is-done' : '');
+
+    function taskRow(r, parentId, level) {
+      const id = 't:' + parentId + '/' + r.key;
+      const l = lid();
+      return html`<li role="treeitem" class="tnode tnode-task${mineCls(r)}${doneCls(r)}" aria-level="${level}" aria-labelledby="${l}" tabindex="-1" data-node="${id}" data-key="${r.key}" data-focus-key="${r.key}">
+        <div class="trow">${chev(false)}${typeIcon(r.type)}<span class="tlabel" id="${l}" data-act="open"><span class="tkey">${r.key}</span><span class="tsum" title="${r.summary || ''}">${r.summary || ''}</span></span>
+          ${meta('', assigneeAvatar(r.assignee), '', r.status)}</div></li>`;
+    }
+    function storyRow(f, level, showEpic) {
+      const s = f.node;
+      const r = s.story || {};
+      const id = 's:' + r.key;
+      const tasks = f.tasks;
+      const open = tasks.length > 0 && isOpen(id, f.forced);
+      const l = lid();
+      return html`<li role="treeitem" class="tnode tnode-story${mineCls(r)}${doneCls(r)}" aria-level="${level}" ${tasks.length ? html`aria-expanded="${open ? 'true' : 'false'}"` : ''} aria-labelledby="${l}" tabindex="-1" data-node="${id}" data-key="${r.key}" data-focus-key="${r.key}">
+        <div class="trow">${chev(tasks.length > 0)}${typeIcon(r.type || { kind: 'story' })}<span class="tlabel" id="${l}" data-act="open"><span class="tkey">${r.key}</span><span class="tsum" title="${r.summary || ''}">${r.summary || ''}</span></span>
+          ${meta(html`${showEpic && s.epic ? epicChip(s.epic) : ''}${spBadge(s.storyPoints != null ? s.storyPoints : r.storyPoints)}${(s.tasks || []).length ? html`<span class="tcount">${t('epics.tasksCount', { n: s.tasks.length })}</span>` : ''}`, assigneeAvatar(r.assignee), (s.tasks || []).length ? progressBar(s.progress, { size: 'sm' }) : '', r.status)}</div>
+        ${open ? kids(id, tasks.map((tk) => taskRow(tk, r.key, level + 1))) : ''}</li>`;
+    }
+    function epicRow(f) {
+      const n = f.node;
+      const e = n.epic || {};
+      const id = 'e:' + e.key;
+      const has = f.stories.length + f.tasks.length > 0;
+      const open = has && isOpen(id, f.forced);
+      const l = lid();
+      const counts = [(n.stories || []).length ? t('epics.storiesCount', { n: n.stories.length }) : '', (n.tasks || []).length ? t('epics.tasksCount', { n: n.tasks.length }) : ''].filter(Boolean).join(' · ') || t('epics.noChildren');
+      return html`<li role="treeitem" class="tnode tnode-epic${mineCls(e)}${doneCls(e)}" aria-level="1" ${has ? html`aria-expanded="${open ? 'true' : 'false'}"` : ''} aria-labelledby="${l}" tabindex="-1" data-node="${id}" data-key="${e.key}" data-focus-key="${e.key}" data-epic="${epicTone(e.color, e.key)}">
+        <div class="trow">${chev(has)}${typeIcon(e.type || { kind: 'epic' })}<span class="tlabel" id="${l}" data-act="open"><span class="tname" title="${e.summary && e.summary !== e.name ? (e.name || '') + ' · ' + e.summary : e.name || e.summary || ''}">${e.name || e.summary || e.key}</span><span class="tkey">${e.key}</span></span>
+          ${meta(html`<span class="tcount">${counts}</span>`, '', progressBar(n.progress, { size: 'sm' }), e.status)}</div>
+        ${open ? kids(id, html`${f.stories.map((s) => storyRow(s, 2, false))}${f.tasks.length && f.stories.length ? html`<li role="none" class="tdivider"><span>${t('epics.directTasks')}</span></li>` : ''}${f.tasks.map((tk) => taskRow(tk, e.key, 2))}`) : ''}</li>`;
+    }
+    return { epicRow, storyRow };
+  }
+
+  function treeSkeleton() {
+    return html`<div class="tree-skeleton" role="status" aria-label="${t('common.loading')}">${[70, 55, 80, 62, 48, 74].map((w) => html`<div class="sk-row"><span class="skeleton sk-dot"></span><span class="skeleton sk-line" style="width:${w}%"></span><span class="skeleton sk-bar"></span></div>`)}</div>`;
+  }
+
+  function renderEpics() {
+    if (S.view !== 'epics' || activeSectionId() !== 'view-epics') return;
+    $$('#ep-mode [data-mode]').forEach((b) => {
+      const on = b.dataset.mode === S.ep.mode;
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+      b.tabIndex = on ? 0 : -1;
+    });
+    $('#ep-done').checked = S.ep.includeDone;
+    const el = $('#ep-list');
+    const summary = $('#ep-summary');
+    const data = S.ep.data && S.ep.data.mode === S.ep.mode ? S.ep.data : null;
+    if (!data) {
+      summary.textContent = '';
+      if (S.ep.error && !S.ep.loading) setHTML(el, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('epics.loadFailed'), text: errorText(S.ep.error), action: { id: 'ep-retry', label: t('common.retry') } }));
+      else setHTML(el, treeSkeleton());
+      return;
+    }
+    const q = String(S.q.epics || '').trim().toLowerCase();
+    const b = treeBuilder();
+    const active = document.activeElement;
+    const focusNode = active && el.contains(active) && active.dataset.node ? active.dataset.node : S.ep.focusNode;
+    const hadFocus = active && el.contains(active);
+    const scroller = $('#ep-scroll');
+    const scrollTop = scroller.scrollTop;
+
+    const sections = [];
+    let shown = 0;
+    if (S.ep.mode === 'stories') {
+      const list = (data.stories || []).map((s) => filterStory(s, q)).filter(Boolean);
+      shown = list.length;
+      summary.textContent = t('epics.storiesTotal', { n: (data.stories || []).length });
+      if (list.length) sections.push(html`<section class="tsec" aria-labelledby="ts-stories"><h2 class="tsec-head" id="ts-stories">${t('epics.sectionStories')}<span class="d-count">${list.length}</span></h2><ul role="tree" class="tree" aria-labelledby="ts-stories">${list.map((f) => b.storyRow(f, 1, true))}</ul></section>`);
+    } else {
+      const epics = (data.epics || []).map((n) => filterEpic(n, q)).filter(Boolean);
+      const orphans = (data.orphanStories || []).map((s) => filterStory(s, q)).filter(Boolean);
+      shown = epics.length + orphans.length;
+      summary.textContent = t('epics.epicsTotal', { n: (data.epics || []).length });
+      if (epics.length) sections.push(html`<section class="tsec" aria-labelledby="ts-epics"><h2 class="tsec-head" id="ts-epics">${t('epics.sectionEpics')}<span class="d-count">${epics.length}</span></h2><ul role="tree" class="tree" aria-labelledby="ts-epics">${epics.map(b.epicRow)}</ul></section>`);
+      if (orphans.length) sections.push(html`<section class="tsec" aria-labelledby="ts-orphans"><h2 class="tsec-head" id="ts-orphans">${t('epics.sectionOrphans')}<span class="d-count">${orphans.length}</span></h2><ul role="tree" class="tree" aria-labelledby="ts-orphans">${orphans.map((f) => b.storyRow(f, 1, false))}</ul></section>`);
+    }
+    S.ep.opening = null;
+    if (!shown) {
+      if (!q) summary.textContent = '';
+      const empty = q
+        ? html`<div class="filter-empty" role="status">${icon('search')}<span>${t('epics.noMatches')}</span><button type="button" class="link-btn" data-action="ep-clear">${t('board.clearFilters')}</button></div>`
+        : stateBlock({ iconName: 'layers', fill: true, title: S.ep.mode === 'stories' ? t('epics.emptyStoriesTitle') : t('epics.emptyTitle'), text: S.ep.mine ? t('epics.emptyMineText') : t('epics.emptyText'),
+          action: S.ep.mine ? null : { id: 'go-projects', label: t('board.goProjects') } });
+      setHTML(el, empty);
+      return;
+    }
+    const trunc = data.truncated ? html`<div class="notice" role="note">${icon('info')}<span>${t('epics.truncated')}</span></div>` : '';
+    setHTML(el, html`${trunc}${sections}<p class="tree-hint" aria-hidden="true">${t('epics.keyboardHint')}</p>`);
+    scroller.scrollTop = scrollTop;
+    // Roving tabindex: one tab stop per tree, on the remembered node when present.
+    $$('.tree', el).forEach((tree) => {
+      const items = $$('[role="treeitem"]', tree);
+      const target = items.find((li) => li.dataset.node === focusNode) || items[0];
+      if (target) target.tabIndex = 0;
+    });
+    if (hadFocus && focusNode) {
+      const li = el.querySelector(`[role="treeitem"][data-node="${CSS.escape(focusNode)}"]`);
+      if (li) li.focus({ preventScroll: true });
+    }
+  }
+
+  function saveExpanded() {
+    if (S.ep.expanded.size > 300) S.ep.expanded = new Set([...S.ep.expanded].slice(-300));
+    const list = [...S.ep.expanded];
+    prefs.set('epics.expanded', list.slice(-300));
+  }
+
+  function toggleNode(li) {
+    if (!li || !li.hasAttribute('aria-expanded')) return false;
+    const id = li.dataset.node;
+    const open = li.getAttribute('aria-expanded') !== 'true';
+    if (String(S.q.epics || '').trim()) S.ep.overrides.set(id, open);
+    else { if (open) S.ep.expanded.add(id); else S.ep.expanded.delete(id); saveExpanded(); }
+    S.ep.focusNode = id;
+    const wrap = li.querySelector(':scope > .tkids-wrap');
+    if (!open && wrap && !reducedMotion()) {
+      li.setAttribute('aria-expanded', 'false');
+      wrap.classList.add('is-closing');
+      setTimeout(renderEpics, 170);
+      return true;
+    }
+    S.ep.opening = open ? id : null;
+    renderEpics();
+    return true;
+  }
+
+  function openTreeIssue(li) {
+    const key = li.dataset.key;
+    let seed = null;
+    forEachRef(key, (r) => { if (!seed) seed = r; });
+    openIssue(key, seed);
+  }
+
+  function focusTreeItem(li) {
+    if (!li) return;
+    const tree = li.closest('[role="tree"]');
+    $$('[role="treeitem"][tabindex="0"]', tree).forEach((x) => { x.tabIndex = -1; });
+    li.tabIndex = 0;
+    S.ep.focusNode = li.dataset.node;
+    li.focus();
+  }
+
+  function onTreeKey(e) {
+    const li = e.target.closest && e.target.closest('[role="treeitem"]');
+    if (!li || e.target !== li || e.ctrlKey || e.metaKey || e.altKey) return;
+    const tree = li.closest('[role="tree"]');
+    const items = $$('[role="treeitem"]', tree).filter((x) => !x.closest('.is-closing'));
+    const i = items.indexOf(li);
+    const expanded = li.getAttribute('aria-expanded');
+    let handled = true;
+    switch (e.key) {
+      case 'ArrowDown': focusTreeItem(items[i + 1]); break;
+      case 'ArrowUp': focusTreeItem(items[i - 1]); break;
+      case 'Home': focusTreeItem(items[0]); break;
+      case 'End': focusTreeItem(items[items.length - 1]); break;
+      case 'ArrowRight':
+        if (expanded === 'false') toggleNode(li);
+        else if (expanded === 'true') focusTreeItem($('[role="treeitem"]', li));
+        break;
+      case 'ArrowLeft':
+        if (expanded === 'true') toggleNode(li);
+        else focusTreeItem(li.parentElement.closest('[role="treeitem"]'));
+        break;
+      case 'Enter':
+        if (e.shiftKey || expanded == null) openTreeIssue(li); else toggleNode(li);
+        break;
+      case ' ':
+        if (expanded == null) openTreeIssue(li); else toggleNode(li);
+        break;
+      default:
+        if (e.code === 'KeyO' && !e.shiftKey) openTreeIssue(li); else handled = false;
+    }
+    if (handled) e.preventDefault();
+  }
+
+  function onTreeClick(e) {
+    const a = e.target.closest('[data-action]');
+    if (a) {
+      if (a.dataset.action === 'ep-retry') loadEpics({ force: true });
+      if (a.dataset.action === 'go-projects') showView('projects');
+      if (a.dataset.action === 'ep-clear') { S.q.epics = ''; $('#search').value = ''; S.ep.overrides.clear(); renderEpics(); }
+      return;
+    }
+    const li = e.target.closest('[role="treeitem"]');
+    if (!li) return;
+    // The li of a parent row also contains its children: act on the row that was clicked.
+    const row = e.target.closest('.trow');
+    if (!row || row.parentElement !== li) return;
+    focusTreeItem(li);
+    if (e.target.closest('[data-act="open"]') || !li.hasAttribute('aria-expanded')) openTreeIssue(li);
+    else toggleNode(li);
+  }
+
+  function onSegKey(e) {
+    const btn = e.target.closest('[data-mode]');
+    if (!btn) return;
+    const modes = ['epics', 'stories'];
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    const i = modes.indexOf(btn.dataset.mode);
+    const next = e.key === 'Home' ? 0 : e.key === 'End' ? 1 : (i + (e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1) + 2) % 2;
+    setEpicsOption({ mode: modes[next] });
+    $(`#ep-mode [data-mode="${modes[next]}"]`).focus();
+  }
+
+  /* ================================================================
+   * PROJECTS: tracked projects filter the board, sprints, epics and alerts (not the worklog).
+   * ================================================================ */
+  async function loadProjects(force) {
+    const seq = ++S.pj.seq;
+    S.pj.loading = true;
+    renderProjects(); renderRefreshState();
+    try {
+      const list = await api('getProjects', force ? { force: true } : {});
+      if (seq !== S.pj.seq) return;
+      S.pj.list = Array.isArray(list) ? list.slice() : [];
+      S.pj.error = null;
+      syncTrackedSetting();
+    } catch (e) {
+      if (seq !== S.pj.seq) return;
+      S.pj.error = e;
+      if (S.pj.list) toastError(t('projects.loadFailed'), e);
+    } finally {
+      if (seq === S.pj.seq) { S.pj.loading = false; renderProjects(); renderRefreshState(); }
+    }
+  }
+
+  /** Applies a fresh [Project] without re-sorting rows under the pointer (order changes on the next visit).
+      With `onlyKey` (CR-10) only that row's `tracked` is taken from the answer: answers to concurrent toggles
+      may arrive out of order, so other rows keep their own (possibly optimistic) tracked state. */
+  function mergeProjects(list, onlyKey) {
+    if (!Array.isArray(list)) return;
+    const byKey = new Map(list.map((p) => [p.key, p]));
+    const cur = S.pj.list || [];
+    const merged = cur.filter((p) => byKey.has(p.key) || (onlyKey && p.key !== onlyKey)).map((p) => {
+      const next = byKey.get(p.key);
+      if (!next) return p;
+      return onlyKey && p.key !== onlyKey ? Object.assign({}, p, next, { tracked: p.tracked }) : Object.assign({}, p, next);
+    });
+    list.forEach((p) => { if (!cur.some((c) => c.key === p.key)) merged.push(p); });
+    S.pj.list = merged;
+    syncTrackedSetting();
+  }
+
+  /** Keeps the cached Settings in step so a later saveSettings does not send an old trackedProjects list. */
+  function syncTrackedSetting() {
+    if (S.settings && S.pj.list) S.settings.trackedProjects = S.pj.list.filter((p) => p.tracked).map((p) => p.key);
+  }
+
+  function afterTrackingChange() {
+    S.boardCache = {};
+    S.boardStale = true;
+    invalidateEpics();
+    S.ep.stale = true;
+    S.sp.boardsStale = true;
+  }
+
+  async function setTracked(key, tracked) {
+    const p = (S.pj.list || []).find((x) => x.key === key);
+    if (!p || S.pj.busy.has(key) || S.pj.bulk) return;
+    const prev = !!p.tracked;
+    p.tracked = tracked;
+    S.pj.restoreFocus = key;
+    S.pj.busy.add(key);
+    renderProjects();
+    try {
+      mergeProjects(await api('setProjectTracked', { key, tracked }), key);
+      afterTrackingChange();
+    } catch (e) {
+      const row = (S.pj.list || []).find((x) => x.key === key);
+      if (row) row.tracked = prev;
+      trackingError(key, e);
+    } finally {
+      S.pj.busy.delete(key);
+      renderProjects();
+    }
+  }
+
+  /** setProjectTracked errors; `validation` (e.g. too many tracked projects) carries a ready, localized message. */
+  function trackingError(key, e) {
+    if (e && e.code === 'validation' && e.message) toast(e.message, { tone: 'error' });
+    else toastError(t('projects.toggleFailed', { key }), e);
+  }
+  /** CR-13: a tracked key Jira no longer lists comes back with `available: false`. */
+  const projectUnavailable = (p) => p.available === false;
+
+  async function trackOnlyMine() {
+    const list = S.pj.list || [];
+    if (S.pj.bulk || !list.length) return;
+    const withMine = list.filter((p) => (Number(p.myOpen) || 0) > 0);
+    if (!withMine.length) { toast(t('projects.bulkNone'), { tone: 'warn' }); return; }
+    // Track first, untrack after, so there is never a moment with nothing tracked.
+    const changes = list.filter((p) => (Number(p.myOpen) || 0) > 0 !== !!p.tracked)
+      .sort((a, b) => Number(!!a.tracked) - Number(!!b.tracked));
+    if (!changes.length) { toast(t('projects.bulkNothing'), { tone: 'success' }); return; }
+    const keys = (arr) => {
+      const shown = arr.slice(0, 12).map((p) => p.key).join(', ');
+      return arr.length > 12 ? shown + ' ' + t('projects.andMore', { n: arr.length - 12 }) : shown;
+    };
+    const on = changes.filter((p) => !p.tracked);
+    const off = changes.filter((p) => p.tracked);
+    const ok = await confirmDialog({
+      title: t('projects.bulkTitle'),
+      body: [t('projects.bulkBody', { n: withMine.length }),
+        on.length ? t('projects.bulkAdd', { n: on.length, list: keys(on) }) : '',
+        off.length ? t('projects.bulkOff', { n: off.length, list: keys(off) }) : ''].filter(Boolean).join(' '),
+      okLabel: t('projects.bulkOk'),
+    });
+    if (!ok) return;
+    S.pj.bulk = true;
+    renderProjects();
+    let failed = 0;
+    let limitError = null;
+    for (const p of changes) {
+      try { mergeProjects(await api('setProjectTracked', { key: p.key, tracked: !p.tracked })); } catch (e) {
+        failed++;
+        if (e && e.code === 'validation' && e.message) limitError = e;
+      }
+      renderProjects();
+    }
+    S.pj.bulk = false;
+    afterTrackingChange();
+    renderProjects();
+    if (limitError) toast(limitError.message, { tone: 'error' });
+    if (failed) toast(t('projects.bulkPartial', { n: failed }), { tone: 'error' });
+    else toast(t('projects.bulkDone', { n: withMine.length }), { tone: 'success' });
+  }
+
+  function renderProjects() {
+    if (S.view !== 'projects' || activeSectionId() !== 'view-projects') return;
+    const el = $('#pj-list');
+    const { list, loading, error } = S.pj;
+    const bulk = $('#pj-bulk');
+    setBusy(bulk, S.pj.bulk);
+    bulk.disabled = S.pj.bulk || !list || !list.length;
+    if (!list) {
+      $('#pj-summary').textContent = '';
+      if (error && !loading) setHTML(el, stateBlock({ iconName: 'alert', tone: 'error', title: t('projects.loadFailed'), text: errorText(error), action: { id: 'pj-retry', label: t('common.retry') } }));
+      else setHTML(el, html`<div class="pj-list" role="status" aria-label="${t('common.loading')}">${[0, 1, 2, 3, 4].map(() => html`<div class="skeleton" style="height:60px;border-radius:10px"></div>`)}</div>`);
+      return;
+    }
+    const tracked = list.filter((p) => p.tracked).length;
+    $('#pj-summary').textContent = t('projects.summary', { n: tracked, total: list.length });
+    if (!list.length) { setHTML(el, stateBlock({ iconName: 'folder', title: t('projects.emptyTitle'), text: t('projects.emptyText') })); return; }
+    const q = String(S.q.projects || '').trim().toLowerCase();
+    const shown = list.filter((p) => !q || [p.key, p.name, p.category, p.lead].some((x) => String(x || '').toLowerCase().includes(q)));
+    const focusKey = (document.activeElement && el.contains(document.activeElement) ? document.activeElement.dataset.project : null) || S.pj.restoreFocus;
+    const warn = tracked === 0 ? html`<div class="notice notice-warn" role="note">${icon('alert')}<span>${t('projects.noneTracked')}</span></div>` : '';
+    if (!shown.length) {
+      setHTML(el, html`${warn}<div class="filter-empty" role="status">${icon('search')}<span>${t('projects.noMatches')}</span><button type="button" class="link-btn" data-action="pj-clear">${t('board.clearFilters')}</button></div>`);
+      return;
+    }
+    setHTML(el, html`${warn}<div class="pj-head" aria-hidden="true"><span>${t('projects.colProject')}</span><span>${t('projects.colMine')}</span><span>${t('projects.colTracked')}</span></div>
+      <ul class="pj-list" role="list">${shown.map((p) => {
+        const busy = S.pj.busy.has(p.key) || S.pj.bulk;
+        const mine = Number(p.myOpen) || 0;
+        const gone = projectUnavailable(p);
+        const meta = gone ? t('projects.unavailable')
+          : [p.key, nameOf(p.category), p.lead ? t('projects.lead', { name: nameOf(p.lead) }) : ''].filter(Boolean).join(' · ');
+        return html`<li class="pj-row${p.tracked ? ' is-tracked' : ''}${gone ? ' is-unavailable' : ''}">
+          <span class="pj-avatar" data-tone="${avatarTone(p.key)}" aria-hidden="true">${String(p.key).slice(0, 3)}</span>
+          <span class="pj-main"><span class="pj-name">${p.name || p.key}</span><span class="pj-meta">${gone ? icon('alert', 'icon-xs') : ''}${meta}</span></span>
+          <span class="pj-mine${mine ? '' : ' is-zero'}" title="${t('projects.myOpen', { n: mine })}"><span aria-hidden="true">${mine}</span><span class="sr-only">${t('projects.myOpen', { n: mine })}</span></span>
+          <span class="pj-track">${S.pj.busy.has(p.key) ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : ''}<input type="checkbox" role="switch" class="switch" data-project="${p.key}" aria-label="${t('projects.trackAria', { name: p.name || p.key })}" ${p.tracked ? html`checked` : ''} ${busy ? html`disabled` : ''}></span>
+        </li>`;
+      })}</ul>`);
+    if (focusKey) {
+      const sw = el.querySelector(`[data-project="${CSS.escape(focusKey)}"]`);
+      // A switch is disabled while its request runs; focus comes back to it when it is enabled again.
+      if (sw && !sw.disabled) { sw.focus({ preventScroll: true }); S.pj.restoreFocus = null; } else if (sw) S.pj.restoreFocus = focusKey;
+    }
   }
 
   /* ================================================================
@@ -1004,7 +2623,15 @@
 
   const isToday = (v) => { const d = parseDate(v); return !!d && d.toDateString() === new Date().toDateString(); };
   const sumOf = (items, field) => (items || []).reduce((s, it) => s + (Number(it[field]) || 0), 0);
-  const capSeconds = () => Math.round(((S.settings && Number(S.settings.dailyCapHours)) || 8) * 3600);
+  /** Load factor 0..1 from settings (missing / invalid = 1, as in v0.1). */
+  const loadFactorOf = (s) => { const v = Number(s && s.loadFactor); return s && s.loadFactor != null && Number.isFinite(v) && v >= 0 && v <= 1 ? v : 1; };
+  /** Effective daily cap: WorklogRun.capSeconds when the backend sent it, else dailyCapHours × loadFactor. */
+  function capSeconds(run) {
+    const c = run && Number(run.capSeconds);
+    if (run && run.capSeconds != null && Number.isFinite(c) && c >= 0) return c;
+    return Math.round(((S.settings && Number(S.settings.dailyCapHours)) || 8) * loadFactorOf(S.settings) * 3600);
+  }
+  const capKnown = (run) => !!S.settings || !!(run && run.capSeconds != null);
 
   function renderWorklog() {
     if (S.view !== 'worklog' || !isConfigured()) return;
@@ -1048,7 +2675,7 @@
       <dl class="facts">
         <div><dt>${t('worklog.nextRun')}</dt><dd>${next}</dd></div>
         <div><dt>${t('worklog.workHours')}</dt><dd>${hours}</dd></div>
-        <div><dt>${t('worklog.dailyCap')}</dt><dd>${s ? dur(capSeconds()) : '—'}</dd></div>
+        <div><dt>${t('worklog.dailyCap')}</dt><dd>${capKnown(p) ? dur(capSeconds(p)) : '—'}${s && loadFactorOf(s) < 1 ? html`<span class="sub">${t('worklog.capFactor', { cap: dur(Math.round((Number(s.dailyCapHours) || 0) * 3600)), pct: Math.round(loadFactorOf(s) * 100) })}</span>` : ''}</dd></div>
         <div><dt>${t('worklog.lastRun')}</dt><dd>${lastHtml}</dd></div>
       </dl>`);
   }
@@ -1106,14 +2733,14 @@
 
   /** Daily cap covers all my worklogs: [other issues | rows already logged | will log | free]. */
   function capBar(run, items, isResult) {
-    const cap = capSeconds();
+    const cap = capSeconds(run);
     const other = otherLogged(run);
     const done = isResult ? items.filter((i) => i.result === 'logged').reduce((s, i) => s + (Number(i.todoSeconds) || 0), 0) : 0;
     const logged = sumOf(items, 'loggedSeconds') + done;
     const todo = isResult ? 0 : sumOf(items, 'todoSeconds');
     const total = other + logged + todo;
     const free = Math.max(0, cap - total);
-    const pct = (v) => Math.max(0, Math.min(100, (v / cap) * 100)).toFixed(2) + '%';
+    const pct = (v) => (cap > 0 ? Math.max(0, Math.min(100, (v / cap) * 100)) : v > 0 ? 100 : 0).toFixed(2) + '%';
     const left = (used) => Math.max(0, cap - used);
     const label = t('worklog.capAria', { other: dur(other), logged: dur(logged), todo: dur(todo), cap: dur(cap), free: dur(free) });
     return html`<div class="capbar">
@@ -1309,7 +2936,7 @@
     const focusId = document.activeElement && el.contains(document.activeElement) ? document.activeElement.dataset.id : null;
     setHTML(el, html`<ul class="notif-list" role="list">${list.map((n) => html`<li>
       <button type="button" class="notif${n.read ? '' : ' is-unread'}" data-id="${n.id}" aria-label="${t(n.read ? 'notif.itemAria' : 'notif.itemAriaUnread', { author: n.author, key: n.issueKey })}" aria-describedby="nb-${n.id}">
-        <span class="avatar avatar-sm" aria-hidden="true">${initials(n.author)}</span>
+        ${avatar(n.author, 'avatar-sm')}
         <span class="notif-main">
           <span class="notif-line"><span class="notif-author">${n.author}</span>${relSpan(n.created, '', 'notif-time')}</span>
           <span class="notif-issue"><span class="card-key">${n.issueKey}</span><span class="sum">${n.issueSummary || ''}</span></span>
@@ -1370,7 +2997,7 @@
    * ================================================================ */
   const FORM_SCALARS = ['jiraUrl', 'language', 'worklogTime', 'workdayStart', 'workdayEnd', 'lunchStart', 'lunchEnd', 'boardJql'];
   const FORM_BOOLS = ['autostart', 'worklogEnabled', 'notifyComments'];
-  const FORM_NUMS = ['dailyCapHours', 'hoursPerDay', 'commentPollMinutes'];
+  const FORM_NUMS = ['dailyCapHours', 'loadFactor', 'hoursPerDay', 'commentPollMinutes'];
   const form = () => $('#settings-form');
 
   async function enterSettings(forceReload) {
@@ -1408,6 +3035,7 @@
     FORM_SCALARS.forEach((k) => { f.elements[k].value = s[k] == null ? '' : String(s[k]); });
     FORM_BOOLS.forEach((k) => { f.elements[k].checked = !!s[k]; });
     FORM_NUMS.forEach((k) => { f.elements[k].value = s[k] == null ? '' : String(s[k]); });
+    syncLoadFactor('number');
     if (S.langOverride) f.elements.language.value = S.langOverride;
     f.elements.token.value = '';
     S.form = {
@@ -1445,6 +3073,7 @@
   function comparable(s) {
     const c = Object.assign({}, s);
     delete c.token; delete c.hasToken;
+    delete c.trackedProjects; // changed from the Projects page, not by this form
     if (Array.isArray(c.workDays)) c.workDays = c.workDays.map(Number).sort((a, b) => a - b);
     if (Array.isArray(c.holidays)) c.holidays = c.holidays.slice().sort();
     if (Array.isArray(c.vacations)) c.vacations = c.vacations.map((v) => ({ from: v.from || '', to: v.to || '', note: (v.note || '').trim() }));
@@ -1467,8 +3096,27 @@
     $('#s-discard').disabled = S.saving || !dirty;
   }
 
+  /** Slider ⇄ number field for loadFactor, plus the live "max per day" hint (cap × factor). */
+  function syncLoadFactor(from) {
+    const num = $('#s-loadFactor');
+    const range = $('#s-loadFactor-range');
+    if (from === 'range') num.value = String(Number(range.value));
+    else {
+      const v = Number(num.value);
+      if (num.value.trim() !== '' && Number.isFinite(v)) range.value = String(Math.min(1, Math.max(0, v)));
+    }
+    const lf = Number(num.value);
+    const cap = Number($('#s-dailyCapHours').value);
+    const valid = num.value.trim() !== '' && Number.isFinite(lf) && lf >= 0 && lf <= 1;
+    range.setAttribute('aria-valuetext', valid ? Math.round(lf * 100) + ' %' : num.value);
+    $('#lf-max').textContent = valid && Number.isFinite(cap) && cap > 0
+      ? t('settings.loadFactorMax', { v: dur(Math.round(cap * lf * 3600)) })
+      : '';
+  }
+
   function renderSettingsDynamic() {
     if (!S.form) return;
+    syncLoadFactor('number');
     const s = S.settings || {};
     $('#s-token').placeholder = s.hasToken ? t('settings.tokenSaved') : t('settings.tokenPlaceholder');
     $('#w-autostart').hidden = !S.autostartMismatch;
@@ -1560,7 +3208,7 @@
       const adv = first.closest('details');
       if (adv) adv.open = true;
       first.focus();
-      first.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      first.scrollIntoView({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' });
     }
     return unmatched;
   }
@@ -1662,6 +3310,7 @@
     const asked = typeof requested === 'boolean' ? requested : !!out.autostart;
     delete out.autostartEffective;
     out.autostart = effective;
+    if (out.loadFactor == null) out.loadFactor = 1; // v0.1 backends do not send it
     S.autostartMismatch = asked !== effective;
     return out;
   }
@@ -1871,10 +3520,17 @@
     switch (detail.type) {
       case 'notification': onNotificationEvent(payload); break;
       case 'state': S.stateError = null; applyState(payload); break;
-      case 'board':
-        if (S.view === 'board' && activeSectionId() === 'view-board') loadBoard(false);
-        else S.boardStale = true;
+      case 'board': {
+        // Board data, tracked projects or issues changed on the Go side: everything issue-based may be stale.
+        const here = (v) => S.view === v && activeSectionId() === 'view-' + v;
+        S.boardCache = {};
+        if (here('board')) loadBoard(false); else S.boardStale = true;
+        invalidateEpics();
+        if (here('epics') && S.ep.data) loadEpics({ silent: true }); else S.ep.stale = true;
+        S.sp.boardsStale = true;
+        if (here('sprints') && S.sp.data) loadSprint({ silent: true }); else S.sp.dataStale = true;
         break;
+      }
       case 'worklog':
         if (payload && payload.trigger !== 'preview') {
           if (S.wl.history && !S.wl.history.some((r) => r.at === payload.at)) S.wl.history.unshift(payload);
@@ -1903,9 +3559,12 @@
     $('#avatar-btn').addEventListener('click', () => showView('settings'));
     $('#refresh-btn').addEventListener('click', refreshCurrent);
 
-    // Search + project chips
+    // Search (per view) + "Only mine" + project chips
     const search = $('#search');
-    search.addEventListener('input', () => { S.filter.q = search.value; renderBoard(); });
+    search.addEventListener('input', () => onSearchInput(search.value));
+    $('#mine-toggle').addEventListener('change', (e) => setMine(S.view, e.target.checked));
+    $('#project-chips').addEventListener('scroll', updateChipsFade, { passive: true });
+    window.addEventListener('resize', updateChipsFade);
     $('#project-chips').addEventListener('click', (e) => {
       const b = e.target.closest('[data-project]');
       if (!b) return;
@@ -1916,29 +3575,60 @@
       renderBoard();
     });
 
-    // Board
-    const board = $('#board');
-    board.addEventListener('click', (e) => {
-      const card = e.target.closest('.card');
-      if (card) { if (!S.pendingKeys.has(card.dataset.key)) openDrawer(card.dataset.key); return; }
-      const a = e.target.closest('[data-action]');
-      if (!a) return;
-      if (a.dataset.action === 'board-retry') loadBoard(true);
-      if (a.dataset.action === 'clear-filters') {
-        S.filter.q = ''; S.filter.projects.clear(); search.value = ''; renderBoard();
-      }
+    // Kanbans (board + sprint): open card, status dropdown, drag & drop
+    $$('.kanban').forEach((root) => {
+      root.addEventListener('click', onKanbanClick);
+      root.addEventListener('dragstart', onDragStart);
+      root.addEventListener('dragend', onDragEnd);
+      root.addEventListener('dragenter', onDragOver); // highlight immediately; dragenter must also be cancelled for a valid target
+      root.addEventListener('dragover', onDragOver);
+      root.addEventListener('dragleave', onDragLeave);
+      root.addEventListener('drop', onDrop);
     });
-    board.addEventListener('dragstart', onDragStart);
-    board.addEventListener('dragend', onDragEnd);
     document.addEventListener('dragstart', guardDragStart, true);
     ['dragenter', 'dragover', 'drop'].forEach((type) => document.addEventListener(type, guardForeignDrag));
-    board.addEventListener('dragenter', onDragOver); // highlight immediately; dragenter must also be cancelled for a valid target
-    board.addEventListener('dragover', onDragOver);
-    board.addEventListener('dragleave', onDragLeave);
-    board.addEventListener('drop', onDrop);
+
+    // Sprints: board / sprint pickers
+    $('#sp-toolbar').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-picker]');
+      if (!b || b.disabled) return;
+      if (b.dataset.picker === 'board') openBoardPicker(b); else openSprintPicker(b);
+    });
+
+    // Epics & stories
+    $('#ep-mode').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-mode]');
+      if (b && b.dataset.mode !== S.ep.mode) setEpicsOption({ mode: b.dataset.mode });
+    });
+    $('#ep-mode').addEventListener('keydown', onSegKey);
+    $('#ep-done').addEventListener('change', (e) => setEpicsOption({ includeDone: e.target.checked }));
+    $('#ep-list').addEventListener('click', onTreeClick);
+    $('#ep-list').addEventListener('keydown', onTreeKey);
+
+    // Projects
+    $('#pj-bulk').addEventListener('click', trackOnlyMine);
+    $('#pj-list').addEventListener('change', (e) => {
+      const sw = e.target.closest('[data-project]');
+      if (sw) setTracked(sw.dataset.project, sw.checked);
+    });
+    $('#pj-list').addEventListener('click', (e) => {
+      const a = e.target.closest('[data-action]');
+      if (!a) return;
+      if (a.dataset.action === 'pj-retry') loadProjects(true);
+      if (a.dataset.action === 'pj-clear') { S.q.projects = ''; search.value = ''; renderProjects(); }
+    });
+
+    // Dropdown menu
+    const menuEl = $('#menu');
+    menuEl.addEventListener('keydown', menu.onKey);
+    menuEl.addEventListener('click', menu.onClick);
+    document.addEventListener('pointerdown', menu.onOutside, true);
+    window.addEventListener('resize', () => menu.close(false));
+    document.addEventListener('scroll', (e) => { if (!menuEl.contains(e.target)) menu.sync(); }, true);
 
     // Drawer / dialogs
     $('#drawer').addEventListener('click', onDrawerClick);
+    $('#drawer').addEventListener('keydown', onDrawerKey);
     $('#scrim').addEventListener('click', () => layers.closeTop());
 
     // Status view
@@ -1972,6 +3662,8 @@
       const el = e.target;
       if (el.dataset.mask) autoMask(el, e);
       if (el.dataset.vac && S.form) S.form.vacations[Number(el.dataset.i)][el.dataset.vac] = el.value;
+      if (el.id === 's-loadFactor-range') { syncLoadFactor('range'); clearFieldError(sf, $('#s-loadFactor')); }
+      else if (el.id === 's-loadFactor' || el.id === 's-dailyCapHours') syncLoadFactor('number');
       clearFieldError(sf, el);
       if (el.name === 'jiraUrl' || el.name === 'token') setTestResult($('#s-test-result'), null);
       renderSavebar();
@@ -2014,19 +3706,20 @@
 
     // Keyboard shortcuts. e.code keeps them working on ru/uk layouts.
     document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && menu.isOpen()) { e.preventDefault(); menu.close(true); return; }
       if (e.key === 'Escape' && layers.top()) { e.preventDefault(); layers.closeTop(); return; }
-      if (layers.top() || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+      if (layers.top() || menu.isOpen() || e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
       const target = e.target;
       if (target === search && e.key === 'Escape') {
-        if (search.value) { search.value = ''; S.filter.q = ''; renderBoard(); } else search.blur();
+        if (search.value) { search.value = ''; onSearchInput(''); } else search.blur();
         return;
       }
       if (isTyping(target)) return;
       if (e.key === '/' || (e.code === 'Slash' && !e.shiftKey)) {
         e.preventDefault();
         if (S.appState && !S.appState.configured) return; // onboarding: board is not reachable (DR-9)
-        if (S.view !== 'board') showView('board');
-        if (!$('#board-tools').hidden) { search.focus(); search.select(); }
+        if (!SEARCH_VIEWS[S.view]) showView('board'); // views with a search box keep their own
+        if (!$('#view-tools').hidden) { search.focus(); search.select(); }
       } else if (e.code === 'KeyR' && !e.shiftKey) {
         e.preventDefault();
         refreshCurrent();
@@ -2047,15 +3740,19 @@
       renderChrome();
       renderView(false);
       if (S.drawer) renderDrawer();
+      menu.close(false);
       if (S.form) renderSettingsDynamic();
     });
   }
 
-  function init() {
+  async function init() {
     i18n.apply();
     bind();
-    showView('board');
     renderChrome();
+    await prefs.load(); // before the first render, so remembered choices apply from the start
+    applyPrefs();
+    window.addEventListener('pagehide', () => prefs.flushNow());
+    showView('board');
     loadState();
   }
 

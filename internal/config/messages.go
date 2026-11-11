@@ -19,6 +19,8 @@ var messages = map[string]map[string]string{
 		"statuses":         "Add at least one status",
 		"jqlLong":          "The query is too long",
 		"worklogBeforeEnd": "The run time must not be earlier than the end of the workday",
+		"projectsMany":     "Too many projects (at most %d)",
+		"projectKey":       "Invalid project key %q",
 	},
 	"ru": {
 		"url":              "Укажите полный адрес http(s), например https://jira.example.com",
@@ -35,6 +37,8 @@ var messages = map[string]map[string]string{
 		"statuses":         "Добавьте хотя бы один статус",
 		"jqlLong":          "Слишком длинный запрос",
 		"worklogBeforeEnd": "Время запуска не может быть раньше конца рабочего дня",
+		"projectsMany":     "Слишком много проектов (не больше %d)",
+		"projectKey":       "Неверный ключ проекта %q",
 	},
 	"uk": {
 		"url":              "Вкажіть повну адресу http(s), наприклад https://jira.example.com",
@@ -51,6 +55,8 @@ var messages = map[string]map[string]string{
 		"statuses":         "Додайте хоча б один статус",
 		"jqlLong":          "Занадто довгий запит",
 		"worklogBeforeEnd": "Час запуску не може бути раніше за кінець робочого дня",
+		"projectsMany":     "Забагато проєктів (не більше %d)",
+		"projectKey":       "Невірний ключ проєкту %q",
 	},
 }
 
@@ -68,3 +74,6 @@ func msg(lang, key string, args ...any) string {
 	}
 	return fmt.Sprintf(f, args...)
 }
+
+// RangeMessage is the localized "must be between min and max" field error.
+func RangeMessage(lang string, min, max any) string { return msg(lang, "range", min, max) }
