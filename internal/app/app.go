@@ -25,7 +25,7 @@ import (
 )
 
 // Version is set at build time with -ldflags "-X jiraffe/internal/app.Version=…".
-var Version = "1.0.0"
+var Version = "0.2.0"
 
 // Platform provides the OS services the app needs.
 type Platform interface {

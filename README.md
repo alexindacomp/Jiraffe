@@ -9,14 +9,18 @@ UI, about 4.0 MB). The full specification is in [SPEC.md](SPEC.md).
 
 ## Download
 
-**[⬇ jiraffe.exe](https://github.com/alexindacomp/Jiraffe/raw/master/dist/jiraffe.exe)** — Windows 10/11 x64, about 4.0 MB.
+**[⬇ jiraffe.exe](https://github.com/alexindacomp/Jiraffe/releases/latest/download/jiraffe.exe)** — latest release, Windows 10/11 x64, about 4.0 MB.
+All versions and changes: [Releases](https://github.com/alexindacomp/Jiraffe/releases).
 
 Put it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\Jiraffe\jiraffe.exe`
 (autostart points to the exe's current location), run it and enter your Jira URL
 and personal access token. Requires the Microsoft Edge WebView2 Runtime
 (preinstalled on Windows 10/11).
 
-To publish a new build, run `./build.sh` and copy `build/jiraffe.exe` to `dist/`.
+To publish a new version: bump `VERSION` in `build.sh` (and `assets/winres.json`,
+`internal/app.Version`), run `./build.sh`, copy `build/jiraffe.exe` to `dist/`,
+commit, then create a GitHub release `vX.Y.Z` with `build/jiraffe.exe` attached —
+the download link always points to the latest release's `jiraffe.exe`.
 
 ## Build (WSL / Linux)
 
