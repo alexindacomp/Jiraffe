@@ -82,7 +82,12 @@ type fakeJira struct {
 	kanban       map[int]bool      // boards that do not support sprints (400)
 	comments2    map[string]int    // issue key → number of comments of GET …/comment
 	byKey        map[string]string // issue JSON served for "issuekey in (…)"
-	paths        []string          // every request path with its query
+
+	// v0.3: board configurations, project statuses and single statuses.
+	boardConfigs    map[int]string    // board id → configuration JSON (absent = 404)
+	projectStatuses map[string]string // project key → /project/{key}/statuses JSON (absent = 404)
+	statuses        map[string]string // status id → /status/{id} JSON (absent = 404)
+	paths           []string          // every request path with its query
 
 	searchHook func()                    // called (unlocked) before answering a search
 	transErr   error                     // returned by issue GETs after a transition POST
@@ -207,6 +212,23 @@ func (f *fakeJira) v2(r *jira.Request, u *url.URL) (*jira.Response, bool) {
 			return &jira.Response{StatusCode: code, Body: []byte(`{"errorMessages":["forced"]}`)}, true
 		}
 		return f.agilePage(rawList(f.agileBoards[q.Get("projectKeyOrId")]), q), true
+	case strings.HasPrefix(path, "/rest/agile/1.0/board/") && strings.HasSuffix(path, "/configuration"):
+		id, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(path, "/rest/agile/1.0/board/"), "/configuration"))
+		if body, found := f.boardConfigs[id]; found {
+			return ok(body)
+		}
+		return &jira.Response{StatusCode: 404, Body: []byte(`{"errorMessages":["no board"]}`)}, true
+	case strings.HasPrefix(path, "/rest/api/2/project/") && strings.HasSuffix(path, "/statuses"):
+		key := strings.TrimSuffix(strings.TrimPrefix(path, "/rest/api/2/project/"), "/statuses")
+		if body, found := f.projectStatuses[key]; found {
+			return ok(body)
+		}
+		return &jira.Response{StatusCode: 404, Body: []byte(`{"errorMessages":["no project"]}`)}, true
+	case strings.HasPrefix(path, "/rest/api/2/status/"):
+		if body, found := f.statuses[strings.TrimPrefix(path, "/rest/api/2/status/")]; found {
+			return ok(body)
+		}
+		return &jira.Response{StatusCode: 404, Body: []byte(`{"errorMessages":["no status"]}`)}, true
 	case strings.HasPrefix(path, "/rest/agile/1.0/board/") && strings.HasSuffix(path, "/sprint"):
 		id, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(path, "/rest/agile/1.0/board/"), "/sprint"))
 		if f.kanban[id] {
@@ -227,20 +249,6 @@ func (f *fakeJira) v2(r *jira.Request, u *url.URL) (*jira.Response, bool) {
 			}
 		}
 		return f.agilePage(list, q), true
-	case strings.HasPrefix(path, "/rest/agile/1.0/sprint/"):
-		id := strings.TrimPrefix(path, "/rest/agile/1.0/sprint/")
-		for _, list := range f.sprints {
-			for _, sp := range list {
-				var o struct {
-					ID int `json:"id"`
-				}
-				_ = json.Unmarshal([]byte(sp), &o)
-				if strconv.Itoa(o.ID) == id {
-					return ok(sp)
-				}
-			}
-		}
-		return &jira.Response{StatusCode: 404, Body: []byte(`{"errorMessages":["no sprint"]}`)}, true
 	case strings.HasPrefix(path, "/rest/api/2/issue/") && strings.HasSuffix(path, "/comment"):
 		key := strings.TrimSuffix(strings.TrimPrefix(path, "/rest/api/2/issue/"), "/comment")
 		n := f.comments2[key]

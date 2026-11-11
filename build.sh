@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 export PATH="$PATH:/usr/local/go/bin"
 
-VERSION="${VERSION:-0.2.0}"
+VERSION="${VERSION:-0.3.0}"
 WINRES="github.com/tc-hib/go-winres@v0.3.3"
 MAX_BYTES=$((5 * 1024 * 1024))
 

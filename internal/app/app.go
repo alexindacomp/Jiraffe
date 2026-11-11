@@ -25,7 +25,7 @@ import (
 )
 
 // Version is set at build time with -ldflags "-X jiraffe/internal/app.Version=…".
-var Version = "0.2.0"
+var Version = "0.3.0"
 
 // Platform provides the OS services the app needs.
 type Platform interface {
@@ -62,6 +62,9 @@ const (
 	CodeForbiddenURL  = "forbidden_url"
 	CodeInternal      = "internal"
 	CodeConflict      = "conflict" // the connection changed during the call
+	// CodeProjectUnavailable: the project parameter names no project I can
+	// browse (distinct from Jira's own HTTP 400s, which are "bad_request").
+	CodeProjectUnavailable = "project_unavailable"
 )
 
 // CodeBadNonce rejects calls from pages that are not the app (missing or
@@ -165,21 +168,24 @@ type App struct {
 	emit  Emitter
 	sched *scheduler.Scheduler
 
-	mu        sync.Mutex
-	user      *jira.User
-	userFor   string                // identity (url + token) the cached user belongs to
-	cache     map[string]cacheEntry // board, epics, projects, … (see cache.go)
-	cacheGen  uint64                // bumped on every invalidation; stale fetches are not cached
-	meta      *metaEntry            // custom field ids and issue type ids
-	metaMu    sync.Mutex            // one metadata discovery at a time
-	epics     epicCache             // epic names/colours for epic chips
-	trackMu   sync.Mutex            // serializes the lazy trackedProjects initialisation
-	runMu     sync.Mutex            // serializes worklog runs that write to Jira
-	pollMu    sync.Mutex            // serializes comment polls
-	bgWG      sync.WaitGroup
-	bgCtx     context.Context
-	bgCancel  context.CancelFunc
-	startOnce sync.Once
+	mu       sync.Mutex
+	user     *jira.User
+	userFor  string                // identity (url + token) the cached user belongs to
+	cache    map[string]cacheEntry // board, epics, projects, … (see cache.go)
+	cacheGen uint64                // bumped on every invalidation; stale fetches are not cached
+	meta     *metaEntry            // custom field ids and issue type ids
+	metaMu   sync.Mutex            // one metadata discovery at a time
+	// layoutBuilds marks the projects whose board layout is being built
+	// (closed when done); guarded by mu.
+	layoutBuilds map[string]chan struct{}
+	epics        epicCache  // epic names/colours for epic chips
+	trackMu      sync.Mutex // serializes the lazy trackedProjects initialisation
+	runMu        sync.Mutex // serializes worklog runs that write to Jira
+	pollMu       sync.Mutex // serializes comment polls
+	bgWG         sync.WaitGroup
+	bgCtx        context.Context
+	bgCancel     context.CancelFunc
+	startOnce    sync.Once
 }
 
 // New creates the app. emit may be nil.
@@ -262,13 +268,15 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 		return a.saveSettings(params)
 	case "getBoard":
 		var p struct {
-			Force bool   `json:"force"`
-			Scope string `json:"scope"`
+			Force   bool   `json:"force"`
+			Scope   string `json:"scope"`
+			Project string `json:"project"`
+			BoardID int    `json:"boardId"`
 		}
 		if err := a.decode(params, &p); err != nil {
 			return nil, err
 		}
-		return a.getBoard(ctx, p.Force, p.Scope)
+		return a.getBoard(ctx, p.Force, p.Scope, p.Project, p.BoardID)
 	case "getIssue":
 		var p struct {
 			Key string `json:"key"`
@@ -311,28 +319,31 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 			return nil, err
 		}
 		return a.getSprints(ctx, p.BoardID, p.Force)
-	case "getSprint":
+	case "getSprintGroups":
 		var p struct {
-			SprintID int    `json:"sprintId"`
-			Scope    string `json:"scope"`
+			Project       string `json:"project"`
+			Scope         string `json:"scope"`
+			IncludeClosed bool   `json:"includeClosed"`
+			Force         bool   `json:"force"`
 		}
 		if err := a.decode(params, &p); err != nil {
 			return nil, err
 		}
-		return a.getSprint(ctx, p.SprintID, p.Scope)
+		return a.getSprintGroups(ctx, p.Project, p.Scope, p.IncludeClosed, p.Force)
 	case "getEpics", "getStories":
 		var p struct {
 			IncludeDone bool   `json:"includeDone"`
 			Scope       string `json:"scope"`
+			Project     string `json:"project"`
 			Force       bool   `json:"force"`
 		}
 		if err := a.decode(params, &p); err != nil {
 			return nil, err
 		}
 		if method == "getEpics" {
-			return a.getEpics(ctx, p.IncludeDone, p.Scope, p.Force)
+			return a.getEpics(ctx, p.IncludeDone, p.Scope, p.Project, p.Force)
 		}
-		return a.getStories(ctx, p.IncludeDone, p.Scope, p.Force)
+		return a.getStories(ctx, p.IncludeDone, p.Scope, p.Project, p.Force)
 	case "getTransitions":
 		var p struct {
 			Key string `json:"key"`
@@ -560,11 +571,11 @@ func (a *App) invalidateCaches() {
 	a.mu.Unlock()
 }
 
-// invalidateBoard drops the cached issue lists (board, sprint boards, epics,
-// stories, project issue counts) after issues changed; a fetch already in
-// flight will not store its (possibly stale) result.
+// invalidateBoard drops the cached issue lists (boards, sprint groups,
+// epics, stories, project issue counts) after issues changed; a fetch
+// already in flight will not store its (possibly stale) result.
 func (a *App) invalidateBoard() {
-	a.dropCache(cacheBoard, cacheEpics, cacheStories, cacheProjects)
+	a.dropCache(cacheBoard, cacheSprintGroups, cacheEpics, cacheStories, cacheProjects)
 }
 
 // --- settings --------------------------------------------------------------
@@ -691,7 +702,7 @@ func (a *App) saveSettings(params json.RawMessage) (any, error) {
 	if connChanged {
 		a.invalidateCaches()
 	} else if boardChanged {
-		a.dropCache(cacheBoard)
+		a.dropCache(cacheBoard, cacheSprintGroups)
 	}
 	// Re-apply also when the registry disagrees with the stored preference
 	// (e.g. an earlier write failed).

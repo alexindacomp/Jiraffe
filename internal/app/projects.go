@@ -325,7 +325,7 @@ func (a *App) setProjectTracked(ctx context.Context, key string, tracked bool) (
 		log.Printf("save tracked projects: %v", err)
 		return nil, &Error{Code: CodeInternal, Message: T(a.Language(), "err_save_failed") + ": " + err.Error()}
 	}
-	a.dropCache(cacheBoard, cacheEpics, cacheStories, cacheAgile)
+	a.dropCache(cacheBoard, cacheSprintGroups, cacheEpics, cacheStories, cacheAgile)
 	a.emit("board", struct{}{})
 	return renderProjects(d, s.TrackedProjects), nil
 }

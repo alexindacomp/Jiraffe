@@ -415,3 +415,158 @@ Nav rail: **Board, Sprints, Epics & stories, Worklog, Notifications, Projects, S
 9. `go vet`, `go test` pass; `build/jiraffe.exe` ≤ 5 MB.
 
 Note (v0.2): `saveSettings` invalidates the board caches and emits `board` when `jiraUrl`, the token or `boardJql` changed.
+
+---
+
+# v0.3 — project filter everywhere, project columns on the Board, Sprints as a grouped list
+
+Everything above stays valid unless changed here.
+
+Facts from the real Jira (sd.local): `sprint in openSprints()`, `sprint in futureSprints()` and
+`ORDER BY Rank ASC` work in JQL. A project usually has **several agile boards** and boards are often
+**shared** between projects (board 880 "BI DEV Agile board" belongs to both MB and CMA; MB also has
+673 "ETL board"; CMA has 937 "CMA dev board" kanban and 951 "CMA general" scrum). Statuses differ per
+project (e.g. MB has "Reject", CMA has "ForTesting", both have "Закрыт").
+
+## Project filter (Board, Sprints, Epics & stories)
+
+One **shared** project selection for the three views (`uiPrefs.project`: a project key or `""` =
+all tracked projects). Shown as a single-select chip row in the top bar: **"All projects"** + one
+chip per **tracked** project (from `getProjects`, `tracked && available`, sorted by key). Hidden when
+fewer than 2 tracked projects; when the chips do not fit, the row collapses into a compact "Project: KEY ▾" menu; then the only tracked project (if exactly one) is the **effective
+project**. A selected key that is no longer tracked falls back to `""`. The previous client-side
+multi-select chips on the Board are replaced. Chips may show counts of the current view's issues
+(optional; never hide a tracked project because it has 0 issues).
+
+## Jira (additions)
+
+- `GET /rest/agile/1.0/board?projectKeyOrId=KEY` — board objects may include
+  `location: { projectKey, … }` (optional, older versions lack it).
+- `GET /rest/agile/1.0/board/{id}/configuration` →
+  `columnConfig.columns: [{ name, statuses: [{ id, self }] }]` (statuses carry only ids).
+- `GET /rest/api/2/project/{key}/statuses` → `[{ id (issue type id), name, subtask, statuses: [{ id, name, statusCategory: { key } }] }]` —
+  the project's statuses per issue type; used to name/categorise column statuses and as the fallback layout.
+
+## Board — project columns
+
+`getBoard { force?, scope?, project?, boardId? }`.
+
+- `project` empty ⇒ unchanged v0.2 behaviour (tracked projects, not-done issues, columns = statuses
+  that have issues, ordered by category), `layout` absent.
+- `project` = KEY (must be an accessible project; tracking not required ⇒ else error `project_unavailable` (localized message; a distinct code so the UI can tell it from Jira 400s, which stay `bad_request`)):
+  - JQL "mine": `project = KEY AND ((<boardJql without ORDER BY>) OR (assignee = currentUser() AND statusCategory = Done AND updated >= -14d)) ORDER BY Rank ASC`
+    (if `boardJql` has no where-part, use `assignee = currentUser() AND (statusCategory != Done OR updated >= -14d)`).
+  - JQL "all": `project = KEY AND (statusCategory != Done OR updated >= -14d) ORDER BY Rank ASC`.
+    If ordering by Rank fails (400 — no Jira Software), retry with `ORDER BY updated DESC`.
+  - Limits as before (mine 500 total cap applies, all 500) ⇒ `truncated`.
+  - **Layout** (cached per project+board for 1 h, single-flight like other metadata):
+    1. Agile boards of the project (`/board?projectKeyOrId=KEY`, all pages, max 50). Chosen board =
+       `boardId` param if it is in that list; else the first board whose `location.projectKey == KEY`;
+       else the first board (lowest id). Columns = the board configuration columns in order; a column's
+       statuses = its status ids resolved to `Status` via the project statuses (unknown id ⇒ fetch
+       `/rest/api/2/status/{id}` once, or name = id, category "indeterminate"); columns with no statuses are dropped.
+       **Shared boards:** when the project statuses are known, a column keeps only the statuses that belong
+       to this project's workflow (statuses of other projects on a shared board are removed, and no
+       `/status/{id}` lookup is made for them); columns left without statuses are dropped. If that
+       leaves no columns at all, use the workflow fallback. Issues of this project in a status not on
+       the board still go to the "other" column.
+    2. No Agile API / no boards / configuration fails ⇒ fallback `source: "workflow"`: one column per
+       distinct status of `/project/{key}/statuses` (union over issue types, sub-tasks included),
+       ordered by category new → indeterminate → done, then by first appearance.
+  - `source: "issues"`: neither a usable agile board nor the project statuses could be read ⇒ columns
+    are built from the issues (statuses that have issues, as without a project); UI note "Only statuses that have issues are shown".
+- Every column is returned **even if empty**. Issues whose status is in no column go to a trailing
+    column `{ id: "other", name: "" (UI shows "Other statuses"), statuses: [the distinct statuses of those issues] }`, present only when non-empty. Its category = the shared category of its statuses, else "indeterminate".
+  - `hidden` is not computed in project mode (absent).
+- Column (both modes) becomes:
+  `Column { id: string, name: string, category: "new"|"indeterminate"|"done", statuses: [Status], issues: [Issue], status: Status }`
+  - status-mode (no project / workflow fallback): `id = status.id`, `name = status.name`, `statuses = [status]`, `status` = that status (kept for compatibility).
+  - agile mode: `id = "col-<index>"`, `name` = column name, `category` = category of the column's
+    statuses if all equal, else `"done"` if it is the last column of the board and **any** of its statuses is done, else `"indeterminate"`;
+    `status` = first status of the column.
+- Result adds `layout?: { source: "agile"|"workflow"|"issues", project, boardId?, boardName?, boards: [AgileBoard] }`
+  (`boards` = all agile boards of the project, for a picker — also when the chosen board fell back to the workflow layout because it has none of the project's statuses; `[]` only when the project has no boards or the Agile API is unavailable; `boardId`/`boardName` = the chosen board whenever there is one).
+- Cache key includes scope, project and boardId. `setProjectTracked`/`saveSettings` invalidation unchanged.
+- Drag & drop: target statuses = the column's `statuses`; transitions whose `to.id` is one of them
+  (name fallback); one ⇒ run it, several ⇒ picker, none ⇒ toast (unchanged UX).
+
+## Sprints — grouped list (replaces the v0.2 boards → sprint → kanban page)
+
+New method `getSprintGroups { project?, scope?, includeClosed?, force? }` (scope default "all")
+→ `{ groups: [SprintGroup], backlog: SprintGroup|null, fetchedAt, truncated, available: bool, closedUnavailable?: bool }`
+(`closedUnavailable: true` only when `includeClosed` was requested and the closed-sprint part failed; the UI then shows a short note "Closed sprints could not be loaded" in place of the closed sections).
+
+```
+SprintGroup { sprint?: Sprint (absent for backlog), issues: [Issue], progress: Progress,
+              storyPoints: { done, total }, truncated: bool }
+```
+
+- Projects = `project` if given (accessible), else tracked projects (∩ accessible, as elsewhere).
+- Open sprints: JQL `project in (P) AND (sprint in openSprints() OR sprint in futureSprints())`
+  (+ `AND assignee = currentUser()` for scope mine) `ORDER BY Rank ASC`, fields as the board plus the
+  Sprint field, max 1000 ⇒ `truncated`. Group by the issue's sprints whose state is active or future
+  (an issue carried over keeps closed sprints in the field — ignore them; an issue in two open sprints
+  appears in both). Sprint metadata (name, state, dates, goal, board) comes from the Sprint field values.
+  Group order: active (by startDate, then id), then future (by id). Issues inside a group keep JQL (Rank) order.
+- Backlog: `project in (P) AND statusCategory != Done AND (sprint is EMPTY OR sprint not in (openSprints(), futureSprints()))`
+  (+ mine) `ORDER BY Rank ASC`, max 300 ⇒ group `truncated`. Returned as `backlog` (null if 0 issues).
+- `includeClosed`: additionally the **last 3 closed sprints** of the selected projects: collect
+  closed sprints from the projects' agile boards (`getSprints`-style, existing agile cache), keep those
+  whose sprint issues include the projects (JQL below filters), order by completeDate desc, take 3, JQL
+  `project in (P) AND sprint in (ids)` (+ mine) `ORDER BY Rank ASC`, grouped by those sprint ids, appended after future sprints (newest first).
+- Progress/storyPoints per group as in `getSprint` (by status category; story points done = sum of SP of done issues).
+- Agile API / Jira Software missing (JQL `openSprints()` returns 400) ⇒ `{ available: false, groups: [], backlog: null }`.
+- Cache per (project, scope, includeClosed) 2 min; `force` bypasses. Invalidated where board caches are.
+- `getSprint` and the UI board/sprint pickers are removed. `getAgileBoards` / `getSprints` stay
+  (used by `includeClosed` and the board layout).
+
+## Epics & stories — project filter
+
+`getEpics` / `getStories` get `project?` (KEY): restrict the epic/story queries to `project = KEY`
+instead of the tracked list. Children (stories/tasks/linked issues) are not filtered by project.
+Cache key includes project.
+
+## UI v0.3
+
+- **Top bar**: shared project chip row on Board, Sprints, Epics & stories (see above); selection
+  persisted in uiPrefs and applied immediately (reload of the current view).
+- **Board** with a project: all its columns, empty ones included (empty column shows a subtle
+  "No issues" placeholder and still accepts drops); a column header shows the column name, count and,
+  for multi-status columns, the statuses as small muted text/tooltip; done columns visually calmer;
+  hint "Done: last 14 days" on done columns. Agile layout with several boards ⇒ a compact board
+  picker ("Board: CMA dev board ▾") in a board bar row under the top bar (together with the workflow note), remembered per project
+  (`uiPrefs.boardByProject[KEY]`). Workflow fallback ⇒ small note "Columns from the project workflow".
+  Without a project ("All projects") ⇒ v0.2 behaviour plus a dismissible hint
+  "Select a project to see all its columns".
+- **Sprints** — Jira-backlog-like list:
+  - Toolbar: project chips, search, "Only mine", "Show closed sprints" (off by default, remembered).
+  - One collapsible **section per sprint**: header = chevron, sprint name, state badge (active /
+    future / closed), dates + "N days left" (active) or "starts …" (future), issue count, story points
+    done/total, progress bar by category; goal shown under the header (2 lines, full on expand).
+    Active sprints expanded by default, future/closed collapsed; expansion remembered per sprint id.
+  - Rows (dense list, not cards): type icon, key, summary (1 line, ellipsis), epic chip, status
+    dropdown pill (same component as the board), priority icon, story points, assignee avatar
+    (always in this view). Click/Enter ⇒ issue drawer. Done issues muted.
+  - Last section **Backlog** (collapsed by default) with the backlog issues.
+  - "All projects" mode: sprint headers also show the project keys present in the sprint.
+  - Search filters rows (key/summary/epic/assignee); sections with no matching rows are hidden; a
+    banner shows when the filter hides everything. Keyboard: arrows move between rows/headers,
+    Enter/Space toggles a header; ARIA: section headers are buttons with `aria-expanded`.
+  - States: skeleton loading, empty (no open sprints ⇒ friendly text + backlog still shown),
+    unavailable (`available: false`), error with retry.
+- **Epics & stories**: the shared project chips; changing the project reloads the tree.
+- `ui/mock.js`: projects with **different status sets** (e.g. one with "Reject"/"ForTesting"),
+  agile boards with column configurations (multi-status columns, a project with 2 boards, a shared
+  board, a project without boards ⇒ workflow fallback), sprints across projects (active, future,
+  closed), backlog issues, issues carried over from a closed sprint.
+- i18n ru/uk/en for every new string; reduced motion, contrast, light/dark as before.
+
+## Acceptance criteria v0.3
+
+1. Board with a selected project shows all its columns (agile board configuration, or project workflow
+   statuses as fallback), including empty ones; multi-status columns work for drag & drop; board picker when a project has several boards.
+2. Board "All projects" keeps v0.2 behaviour.
+3. Sprints page is a list of issues grouped by sprint (active, future, optional last 3 closed) plus backlog, with the project filter, "Only mine" and search.
+4. Epics & stories have the same project filter; selection is shared between the three views and persisted.
+5. Real-Jira facts honoured: shared boards, several boards per project, Rank ordering with fallback.
+6. `go vet`, `go test` pass; `build/jiraffe.exe` ≤ 5 MB; ru/uk/en; light/dark; no network resources.

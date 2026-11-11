@@ -219,12 +219,61 @@ func (c *Client) BoardSprints(ctx context.Context, boardID int, states string, l
 	return out, nil
 }
 
-// GetSprint returns one sprint (GET /rest/agile/1.0/sprint/{id}).
-func (c *Client) GetSprint(ctx context.Context, id int) (*Sprint, error) {
-	var s sprintJSON
-	if err := c.do(ctx, "GET", "/rest/agile/1.0/sprint/"+strconv.Itoa(id), nil, nil, &s); err != nil {
+// BoardColumn is a column of an agile board configuration. Statuses carry
+// only the status ids.
+type BoardColumn struct {
+	Name     string      `json:"name"`
+	Statuses []StatusRef `json:"statuses"`
+}
+
+// StatusRef is a reference to a status by id.
+type StatusRef struct {
+	ID string `json:"id"`
+}
+
+// UnmarshalJSON accepts the id as a JSON string or number.
+func (r *StatusRef) UnmarshalJSON(b []byte) error {
+	var o struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(b, &o); err != nil {
+		return err
+	}
+	r.ID = ""
+	if len(o.ID) == 0 || string(o.ID) == "null" {
+		return nil
+	}
+	var s string
+	if json.Unmarshal(o.ID, &s) == nil {
+		r.ID = s
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(o.ID, &n); err != nil {
+		return err
+	}
+	r.ID = n.String()
+	return nil
+}
+
+// BoardConfig is the configuration of an agile board.
+type BoardConfig struct {
+	ID           int    `json:"id"`
+	Name         string `json:"name"`
+	ColumnConfig struct {
+		Columns []BoardColumn `json:"columns"`
+	} `json:"columnConfig"`
+}
+
+// BoardConfiguration returns the column configuration of an agile board
+// (GET /rest/agile/1.0/board/{id}/configuration).
+func (c *Client) BoardConfiguration(ctx context.Context, boardID int) (*BoardConfig, error) {
+	if boardID <= 0 {
+		return nil, &Error{Code: CodeBadRequest, Message: "invalid board id " + strconv.Itoa(boardID)}
+	}
+	var out BoardConfig
+	if err := c.do(ctx, "GET", "/rest/agile/1.0/board/"+strconv.Itoa(boardID)+"/configuration", nil, nil, &out); err != nil {
 		return nil, err
 	}
-	sp := s.sprint()
-	return &sp, nil
+	return &out, nil
 }

@@ -97,6 +97,8 @@
   --control-stroke-strong: #8a857d;
   --menu-hover: #fff3c4;
   --card-mine-bg: color-mix(in srgb, var(--accent) 9%, var(--card-bg));
+  --row-mine-bg: color-mix(in srgb, var(--accent) 8%, var(--surface));   /* "mine" sprint rows */
+  --sp-active-bg: color-mix(in srgb, var(--accent) 7%, var(--surface));  /* active sprint header (opaque: sticky) */
   --bar-ind: #b07d00;       /* in-progress segment: 3.6:1 on white (DR-5) */
   --drop-ring: #b07d00;     /* drop-target outline, ≥ 3:1 on the column background */
 
@@ -113,6 +115,7 @@
 
   --danger: #c62828;
   --danger-soft: #fdecec;
+  --chip-bad-fg: var(--danger);
   --success: #1d7a45;
   --success-soft: #e3f4ea;
   --warning: #8a5a00;
@@ -165,6 +168,8 @@
     --control-stroke-strong: #8a8f98;
     --menu-hover: rgb(255 196 0 / .14);
     --card-mine-bg: color-mix(in srgb, var(--accent) 3%, var(--card-bg)); /* keeps --text-3 at 4.65:1 (DR-1) */
+    --row-mine-bg: color-mix(in srgb, var(--accent) 4%, var(--surface));
+    --sp-active-bg: color-mix(in srgb, var(--accent) 5%, var(--surface));
     --bar-ind: #ffc400;
     --drop-ring: var(--accent-pressed);
 
@@ -180,6 +185,7 @@
 
     --danger: #f87171;
     --danger-soft: rgb(248 113 113 / .14);
+    --chip-bad-fg: #fca5a5;  /* DR-25: ≥ 5.4:1 on --danger-soft over the active sprint header */
     --success: #4cc38a;
     --success-soft: rgb(76 195 138 / .14);
     --warning: #ffd54a;
@@ -300,7 +306,7 @@ kbd {
   border-bottom: 1px solid var(--border);
   background: var(--bg);
 }
-.view-title { font-size: var(--fs-lg); font-weight: var(--fw-bold); white-space: nowrap; letter-spacing: -.01em; }
+.view-title { min-width: 140px; font-size: var(--fs-lg); font-weight: var(--fw-bold); white-space: nowrap; letter-spacing: -.01em; } /* DR-28: anchors the top-bar tools across views */
 .view-tools { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; flex: 1; }
 .topbar-end { display: flex; align-items: center; gap: var(--sp-2); margin-left: auto; }
 
@@ -331,11 +337,12 @@ kbd {
 .mine-toggle:hover { background: color-mix(in srgb, var(--text) 6%, transparent); color: var(--text); }
 .mine-toggle:has(:checked) { color: var(--text); }
 
-.chips { display: flex; gap: var(--sp-1); overflow-x: auto; scrollbar-width: none; min-width: 0; padding: 4px; }
-/* DR-7/DR-15: fade the edge(s) behind which chips are scrolled out of view (classes set by app.js) */
-.chips.is-overflowing { mask-image: linear-gradient(to right, #000 calc(100% - 40px), transparent); }
-.chips.is-scrolled-start { mask-image: linear-gradient(to right, transparent, #000 40px); }
-.chips.is-scrolled-start.is-overflowing { mask-image: linear-gradient(to right, transparent, #000 40px, #000 calc(100% - 40px), transparent); }
+.chips { flex: 0 1 auto; display: flex; gap: var(--sp-1); overflow-x: auto; scrollbar-width: none; min-width: 0; padding: 4px; }
+/* DR-20: project chips + board picker share the rest of the top bar; when the chips do not fit they give way to a
+   compact "Project: KEY ▾" menu (app.js syncProjectFilter). In compact mode the chips stay laid out, invisible,
+   so their natural width can still be measured. */
+.project-filter { position: relative; flex: 1 1 0; min-width: 0; display: flex; align-items: center; gap: var(--sp-2); }
+.project-filter.is-compact .chips { position: absolute; top: 0; left: 0; width: max-content; visibility: hidden; pointer-events: none; }
 .chip-btn {
   flex: none; display: inline-flex; align-items: center; gap: 6px;
   height: 28px; padding: 0 10px;
@@ -345,9 +352,7 @@ kbd {
   transition: background var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
 }
 .chip-btn:hover { border-color: var(--control-stroke-strong); color: var(--text); }
-.chip-btn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.chip-count { font-size: var(--fs-xs); color: var(--text-3); font-variant-numeric: tabular-nums; }
-.chip-btn[aria-pressed="true"] .chip-count { color: inherit; }
+.chip-btn[aria-checked="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
 .avatar-btn {
   position: relative; display: inline-flex; padding: 0; border: 0; border-radius: var(--r-full); background: none;
@@ -508,7 +513,7 @@ kbd {
 .chip .icon { width: 13px; height: 13px; }
 .chip-good { background: var(--cat-done-bg); color: var(--cat-done-fg); }
 .chip-warn { background: var(--warning-soft); color: var(--warning); }
-.chip-bad { background: var(--danger-soft); color: var(--danger); }
+.chip-bad { background: var(--danger-soft); color: var(--chip-bad-fg); }
 .chip-accent { background: var(--accent); color: var(--on-accent); }
 
 /* Status category colours: --cat (bars, dots), --cat-bg / --cat-fg (pills, ≥ 4.5:1) */
@@ -613,17 +618,6 @@ kbd {
 .progress-count { font-size: var(--fs-xs); font-weight: var(--fw-semibold); color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .progress-sm .progress-track { width: 56px; flex: none; }
 .progress-md .progress-track { width: 120px; flex: none; }
-.progress-lg { width: 100%; }
-.progress-lg .progress-track { height: 10px; }
-
-.legend { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-4); font-size: var(--fs-md); color: var(--text-2); }
-.legend li { display: inline-flex; align-items: center; gap: 6px; }
-.legend li::before { content: ""; width: 10px; height: 10px; border-radius: 3px; background: var(--sw, transparent); }
-.legend .lg-done { --sw: var(--cat-done); }
-.legend .lg-ind { --sw: var(--bar-ind); }
-.legend .lg-todo { --sw: color-mix(in srgb, var(--cat-new) 45%, transparent); }
-.legend .lg-sp { margin-left: auto; font-weight: var(--fw-semibold); color: var(--text); }
-.legend .lg-sp::before { display: none; }
 
 /* ---------- Empty / error / loading blocks ---------- */
 .state {
@@ -662,6 +656,9 @@ kbd {
 .notice-warn { margin: 0 0 var(--sp-3); }
 /* ORCH-1: "my issues in untracked projects" — action link after the text, close button at the far end */
 .notice-hidden { align-items: flex-start; }
+/* DR-29: neutral tip (not a warning): sunken surface, muted stripe */
+.notice-tip { border-left-color: var(--border-strong); background: var(--surface-sunken); color: var(--text-2); }
+.notice-tip .icon { color: var(--text-3); }
 .notice-hidden > .icon { flex: none; margin-top: 2px; }
 .notice-hidden .notice-text { flex: 1; min-width: 0; align-self: center; }
 .notice-hidden .link-btn { margin-left: var(--sp-1); }
@@ -669,7 +666,7 @@ kbd {
 .notice-hidden .icon-btn .icon { width: 14px; height: 14px; color: currentColor; }
 .board > .state-fill { flex: 1; height: auto; }
 
-/* ---------- Kanban (Board + Sprint) ---------- */
+/* ---------- Kanban (Board) ---------- */
 .view-board, .view-sprints { display: flex; flex-direction: column; }
 .board { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .columns {
@@ -762,7 +759,23 @@ kbd {
 .sk-card { height: 96px; border-radius: var(--r-card); }
 .sk-line { height: 12px; }
 
-/* ---------- Sprints ---------- */
+/* v0.3 project boards: columns share the width (DR-21); muted line under each header; done columns are calmer. */
+.columns.is-project .col { flex: 1 1 0; width: auto; min-width: 272px; max-width: 340px; container-type: inline-size; } /* 4 columns still fit at 1280 */
+/* DR-30: in narrow project columns the epic name beats the relative "updated" time */
+@container (max-width: 299px) { .card-upd { display: none; } }
+.col-sub {
+  min-height: calc(var(--fs-xs) * var(--lh) + var(--sp-2)); margin-top: calc(-1 * var(--sp-1)); padding: 0 var(--sp-3) var(--sp-2); /* border-box: one line + padding */
+  font-size: var(--fs-xs); color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.col-other { border-top-style: dashed; }
+.col[data-cat="done"] { background: color-mix(in srgb, var(--col-bg) 55%, var(--bg)); border-top-color: color-mix(in srgb, var(--cat-done) 60%, var(--col-bg)); }
+.col[data-cat="done"] .card { background: color-mix(in srgb, var(--card-bg) 70%, var(--col-bg)); box-shadow: none; }
+.col[data-cat="done"] .card:hover { box-shadow: var(--shadow-1); }
+.col[data-cat="done"] .card-sum { color: var(--text-2); }
+.board-bar { gap: var(--sp-4); }
+.board-note { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-3); }
+
+/* Compact pickers (top bar board picker) */
 .picker-btn {
   display: inline-flex; align-items: center; gap: var(--sp-2); min-width: 0; max-width: 420px;
   height: 36px; padding: 0 var(--sp-3);
@@ -776,22 +789,102 @@ kbd {
 .picker-label { font-size: var(--fs-xs); font-weight: var(--fw-semibold); text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); }
 .picker-value { font-weight: var(--fw-semibold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-btn > .icon { color: var(--text-3); }
+.picker-btn-sm { flex: none; height: 28px; max-width: 280px; padding: 0 var(--sp-2) 0 10px; border-radius: var(--r-full); box-shadow: none; font-size: var(--fs-md); }
+.picker-btn-sm .picker-label { font-size: var(--fs-2xs); }
 
-.sprint-head { flex: none; padding: var(--sp-3) var(--sp-6) 0; }
-.sprint-head:empty { display: none; }
-.sprint-card {
-  display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(260px, 1fr); gap: var(--sp-4) var(--sp-8); align-items: center;
-  padding: var(--sp-4) var(--sp-5); border-radius: var(--r-card);
-  background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-1);
-  border-left: var(--stripe-w) solid var(--accent);
+/* ---------- Sprints: grouped list (Jira-backlog-like) ---------- */
+.sp-sections { display: flex; flex-direction: column; gap: var(--sp-3); padding-top: var(--sp-3); }
+.sp-sections.is-entering .sp-sec { animation: card-in var(--dur-3) var(--ease-out) both; animation-delay: calc(var(--i, 0) * var(--stagger) * 2); }
+.sp-sec {
+  --sp-state: var(--border-strong);
+  position: relative;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-card); box-shadow: var(--shadow-1);
 }
-.sprint-main { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.sprint-title-row { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
-.sprint-name { font-size: var(--fs-lg); font-weight: var(--fw-bold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sprint-goal, .sprint-dates { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-md); color: var(--text-2); min-width: 0; }
-.sprint-goal span { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-.sprint-goal .icon, .sprint-dates .icon { width: 15px; height: 15px; color: var(--text-3); }
-.sprint-stats { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+/* State stripe: above the sticky header so it runs the full height of the section */
+.sp-sec::before {
+  content: ""; position: absolute; left: -1px; top: -1px; bottom: -1px; width: var(--stripe-w); z-index: calc(var(--z-sticky) + 1);
+  border-radius: var(--r-card) 0 0 var(--r-card); background: var(--sp-state);
+}
+.sp-sec[data-state="active"] { --sp-state: var(--accent-pressed); }
+.sp-sec[data-state="future"] { --sp-state: var(--cat-new); }
+.sp-sec[data-state="closed"] { --sp-state: var(--cat-done); }
+.sp-head {
+  position: sticky; top: 0; z-index: var(--z-sticky);
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3);
+  min-height: 48px; padding: var(--sp-2) var(--sp-4) var(--sp-2) calc(var(--sp-3) + var(--stripe-w));
+  background: var(--surface); border-radius: calc(var(--r-card) - 1px);
+}
+.sp-sec[data-state="active"] .sp-head { background: var(--sp-active-bg); }
+.sp-sec.is-open .sp-head, .sp-sec:has(.sp-goal) .sp-head { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.sp-sec.is-open .sp-head { border-bottom: 1px solid var(--border); }
+.sp-title { display: flex; min-width: 0; flex: 0 1 auto; font-size: inherit; }
+/* The toggle covers the whole header (stretched button); text and bar inside stay readable. */
+.sp-toggle { all: unset; display: inline-flex; align-items: center; gap: var(--sp-2); min-width: 0; cursor: pointer; }
+.sp-toggle::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
+.sp-toggle:focus-visible { outline: none; box-shadow: none; }
+.sp-head:has(.sp-toggle:focus-visible) { outline: 2px solid var(--focus); outline-offset: -2px; box-shadow: inset 0 0 0 3px var(--focus-halo); }
+.sp-chev { width: 16px; height: 16px; color: var(--text-3); transition: rotate var(--dur-2) var(--ease-out), color var(--dur-1) var(--ease-out); }
+.sp-toggle[aria-expanded="true"] .sp-chev { rotate: 90deg; }
+.sp-head:hover .sp-chev { color: var(--text); }
+.sp-name { font-size: var(--fs-base); font-weight: var(--fw-bold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-pkeys { display: inline-flex; flex-wrap: wrap; gap: var(--sp-1); }
+.sp-pkey {
+  padding: 1px 6px; border-radius: var(--r-sm);
+  background: var(--surface-sunken); color: var(--text-2); box-shadow: inset 0 0 0 1px var(--border);
+  font-family: var(--font-mono); font-size: var(--fs-2xs); font-weight: var(--fw-semibold);
+}
+.sp-meta { margin-left: auto; display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); font-size: var(--fs-sm); color: var(--text-2); }
+.sp-dates { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.sp-dates .icon { color: var(--text-3); }
+.sp-count, .sp-points { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.sp-points { font-weight: var(--fw-semibold); color: var(--text); }
+.sp-progress { display: inline-flex; width: 168px; }
+.sp-goal { display: flex; gap: var(--sp-2); padding: var(--sp-2) var(--sp-4) var(--sp-2) calc(var(--sp-3) + var(--stripe-w)); font-size: var(--fs-md); color: var(--text-2); }
+.sp-goal > span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.sp-goal.is-open > span { display: block; }
+.sp-goal .icon { flex: none; margin-top: 3px; color: var(--text-3); }
+.sp-sec.is-open .sp-goal { border-bottom: 1px solid var(--border); }
+.sp-body.is-opening { animation: sp-open var(--dur-3) var(--ease-out); }
+@keyframes sp-open { from { opacity: 0; transform: translateY(-4px); } }
+
+/* Dense rows; fixed slots so status, priority, points and assignee line up across sprints. */
+.sp-row {
+  --sp-key-w: 84px;
+  position: relative;
+  display: grid; grid-template-columns: 16px var(--sp-key-w) minmax(0, 1fr) 136px 16px 30px 22px; align-items: center; gap: 10px;
+  min-height: 38px; padding: 3px var(--sp-4) 3px calc(var(--sp-3) + var(--stripe-w));
+  border-top: 1px solid var(--border);
+  scroll-margin-top: 56px; /* keep a focused row clear of the sticky header */
+  transition: background var(--dur-1) var(--ease-out);
+}
+.sp-rows > .sp-row:first-child { border-top: 0; }
+.sp-row:last-child { border-radius: 0 0 calc(var(--r-card) - 1px) calc(var(--r-card) - 1px); }
+.sp-row:hover { background: var(--surface-hover); }
+.sp-row.is-mine { background: var(--row-mine-bg); }
+.sp-row.is-pending { opacity: .75; cursor: progress; }
+.sp-key { font-family: var(--font-mono); font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sp-main { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.sp-open { all: unset; min-width: 0; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-open::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
+.sp-open:focus-visible { outline: none; box-shadow: none; }
+.sp-row:has(.sp-open:focus-visible) { outline: 2px solid var(--focus); outline-offset: -2px; box-shadow: inset 0 0 0 3px var(--focus-halo); }
+.sp-sum { font-size: var(--fs-md); font-weight: var(--fw-medium); }
+.sp-row:hover .sp-sum { text-decoration: underline; text-underline-offset: 2px; }
+.sp-main .epic-chip { flex: 0 1 auto; min-width: 28px; max-width: 180px; }
+.sp-st { display: flex; min-width: 0; }
+.sp-st .status-btn { max-width: 100%; }
+.sp-prio, .sp-pts, .sp-av { position: relative; z-index: 1; display: flex; justify-content: center; } /* above the stretched button: tooltips */
+.sp-row.is-done .sp-sum, .sp-row.is-done .sp-key { color: var(--text-3); }
+.sp-foot { padding: var(--sp-2) var(--sp-4) var(--sp-2) calc(var(--sp-3) + var(--stripe-w)); border-top: 1px solid var(--border); font-size: var(--fs-sm); color: var(--text-3); }
+.sp-empty {
+  display: flex; align-items: flex-start; gap: var(--sp-2);
+  margin-top: var(--sp-3); padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-card); background: var(--surface-sunken); color: var(--text-2); font-size: var(--fs-md);
+}
+.sp-empty strong { color: var(--text); font-weight: var(--fw-semibold); }
+.sp-empty .icon { flex: none; width: 16px; height: 16px; margin-top: 2px; color: var(--text-3); }
+.sp-sections > .sp-empty { margin-top: 0; }
+.sp-closed-note .icon { color: var(--warning); }
 
 /* ---------- Epics & stories tree ---------- */
 .view-epics { display: flex; flex-direction: column; }
@@ -1275,7 +1368,7 @@ ol.wiki-list { list-style: decimal; }
 /* ---------- Dropdown menu ---------- */
 .menu {
   position: fixed; z-index: var(--z-menu); top: 0; left: 0;
-  min-width: 220px; max-width: min(380px, calc(100vw - 16px)); max-height: min(420px, calc(100vh - 16px)); overflow: auto;
+  min-width: 220px; max-width: min(380px, calc(100vw - 16px)); max-height: min(70vh, calc(100vh - 16px)); overflow: auto; /* app.js narrows it to the room on the open side */
   padding: var(--sp-1); border-radius: var(--r-card);
   background: var(--surface-raised); border: 1px solid var(--border); box-shadow: var(--shadow-3);
   transform-origin: top left;
@@ -1330,10 +1423,12 @@ ol.wiki-list { list-style: decimal; }
 
 /* ---------- Narrow windows (min 960) ---------- */
 @media (max-width: 1100px) {
-  .search { width: 200px; }
+  .search { width: 176px; } /* v0.3: room for the project chips */
   .today { grid-template-columns: 1fr; }
   .facts { padding-left: 0; border-left: 0; padding-top: var(--sp-4); border-top: 1px solid var(--border); }
-  .sprint-card { padding: var(--sp-3) var(--sp-4); gap: var(--sp-3) var(--sp-5); }
+  .sp-row { --sp-key-w: 76px; grid-template-columns: 16px var(--sp-key-w) minmax(0, 1fr) 112px 16px 30px 22px; }
+  .sp-main .epic-chip { max-width: 120px; }
+  .sp-progress { width: 140px; }
   .search kbd { display: none; }
   .search input { padding-right: var(--sp-2); }
   .tmeta { grid-template-columns: minmax(0, auto) 22px 96px 104px; }

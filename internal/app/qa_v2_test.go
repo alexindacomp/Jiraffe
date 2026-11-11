@@ -659,62 +659,48 @@ func TestGetIssueStoryChildrenAreDeduplicated(t *testing.T) {
 
 // --- sprints -----------------------------------------------------------------------
 
-// Fewer than 5 closed sprints, no open ones; an empty sprint has empty
-// columns and zero progress.
-func TestSprintsFewClosedAndEmptySprint(t *testing.T) {
+// Fewer than 5 closed sprints, no open ones.
+func TestSprintsFewClosed(t *testing.T) {
 	fj := &fakeJira{
 		sprints: map[int][]string{880: {sprintJSON(101, "closed"), sprintJSON(102, "closed")}},
-		routes:  map[string]string{`sprint = 102 ORDER BY Rank ASC`: "[]"},
 	}
 	a := v2App(t, fj, []string{"RBI"})
-	ctx := context.Background()
-	res, err := a.Call(ctx, "getSprints", json.RawMessage(`{"boardId":880}`))
+	res, err := a.Call(context.Background(), "getSprints", json.RawMessage(`{"boardId":880}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ss := res.([]SprintDTO); len(ss) != 2 || ss[0].ID != 102 || ss[1].ID != 101 {
 		t.Errorf("sprints %+v", ss)
 	}
-	res, err = a.Call(ctx, "getSprint", json.RawMessage(`{"sprintId":102,"scope":"mine"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	sb := res.(*SprintBoard)
-	js, _ := json.Marshal(sb)
-	if sb.Progress != (Progress{}) || sb.StoryPoints != (PointsDTO{}) || !strings.Contains(string(js), `"columns":[]`) {
-		t.Errorf("empty sprint %s", js)
-	}
 }
 
-// Story points of other people's done issues are not counted in "mine";
+// Story points of a sprint group: done points count only done issues;
 // fractional points add up.
-func TestSprintMineStoryPointsAndFractions(t *testing.T) {
-	fj := &fakeJira{
-		sprints: map[int][]string{880: {sprintJSON(201, "active")}},
-		routes: map[string]string{`sprint = 201 ORDER BY Rank ASC`: fxList(
-			fx{key: "RBI-1", cat: "done", assignee: "alex", sp: 0.5},
-			fx{key: "RBI-2", cat: "done", assignee: "bob", sp: 8},
-			fx{key: "RBI-3", cat: "indeterminate", assignee: "alex", sp: 1.5},
-			fx{key: "RBI-4", cat: "new", assignee: "bob"},
-		)},
-	}
+func TestSprintGroupStoryPointsAndFractions(t *testing.T) {
+	sp := `"customfield_10107":["com.atlassian.greenhopper.service.sprint.Sprint@1[id=201,rapidViewId=880,state=ACTIVE,name=S201,startDate=2026-11-03T10:00:00.000+02:00,endDate=<null>,completeDate=<null>,goal=]"]`
+	with := func(x fx) string { return strings.Replace(x.json(), `"fields":{`, `"fields":{`+sp+`,`, 1) }
+	fj := &fakeJira{routes: map[string]string{
+		`project in ("RBI") AND (sprint in openSprints() OR sprint in futureSprints()) ORDER BY Rank ASC`: "[" + strings.Join([]string{
+			with(fx{key: "RBI-1", cat: "done", assignee: "alex", sp: 0.5}),
+			with(fx{key: "RBI-2", cat: "done", assignee: "bob", sp: 8}),
+			with(fx{key: "RBI-3", cat: "indeterminate", assignee: "alex", sp: 1.5}),
+			with(fx{key: "RBI-4", cat: "new", assignee: "bob"}),
+		}, ",") + "]",
+		`project in ("RBI") AND statusCategory != Done AND (sprint is EMPTY OR sprint not in (openSprints(), futureSprints())) ORDER BY Rank ASC`: "[]",
+	}}
 	a := v2App(t, fj, []string{"RBI"})
-	ctx := context.Background()
-	res, err := a.Call(ctx, "getSprint", json.RawMessage(`{"sprintId":201,"scope":"mine"}`))
+	res, err := a.Call(context.Background(), "getSprintGroups", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sb := res.(*SprintBoard); sb.StoryPoints != (PointsDTO{Done: 0.5, Total: 2}) || sb.Progress != (Progress{Done: 1, InProgress: 1, Total: 2}) {
-		t.Errorf("mine: %+v %+v", sb.StoryPoints, sb.Progress)
+	g := res.(*SprintGroups)
+	if len(g.Groups) != 1 {
+		t.Fatalf("groups %+v", g.Groups)
 	}
-	res, err = a.Call(ctx, "getSprint", json.RawMessage(`{"sprintId":201}`))
-	if err != nil {
-		t.Fatal(err)
+	if sg := g.Groups[0]; sg.StoryPoints != (PointsDTO{Done: 8.5, Total: 10}) || sg.Progress != (Progress{Done: 2, InProgress: 1, Todo: 1, Total: 4}) {
+		t.Errorf("points %+v progress %+v", sg.StoryPoints, sg.Progress)
 	}
-	if sb := res.(*SprintBoard); sb.StoryPoints != (PointsDTO{Done: 8.5, Total: 10}) || sb.Progress.Total != 4 {
-		t.Errorf("all: %+v %+v", sb.StoryPoints, sb.Progress)
-	}
-	if _, err := a.Call(ctx, "getSprint", json.RawMessage(`{"sprintId":201,"scope":"team"}`)); ToError(err).Code != CodeBadParams {
+	if _, err := a.Call(context.Background(), "getSprintGroups", json.RawMessage(`{"scope":"team"}`)); ToError(err).Code != CodeBadParams {
 		t.Errorf("bad scope: %v", err)
 	}
 }

@@ -1,10 +1,12 @@
 # Jiraffe
 
 A small Windows tray companion for Jira Server/Data Center: automatic daily
-worklogs (with a load factor), a board of my or all open issues, quick status
-changes from a dropdown, issue details (description, comments, history,
-estimates, links, epic and stories), sprints, epics & stories, tracked projects
-and alerts about new comments on my issues. One self-contained `jiraffe.exe` (Go, no CGO, WebView2
+worklogs (with a load factor), a board of my or all open issues with a project
+filter and each project's own columns (from its agile board or workflow), quick
+status changes from a dropdown, issue details (description, comments, history,
+estimates, links, epic and stories), sprints as a backlog-style list grouped by
+sprint, epics & stories, tracked projects and alerts about new comments on my
+issues. One self-contained `jiraffe.exe` (Go, no CGO, WebView2
 UI, about 4.0 MB). The full specification is in [SPEC.md](SPEC.md).
 
 ## Download

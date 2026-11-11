@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,10 +72,26 @@ type TransitionDTO struct {
 	To   StatusDTO `json:"to"`
 }
 
-// Column of the board.
+// Column of the board. A status-mode column (no project, workflow
+// fallback) holds one status: ID is the status id, Statuses = [Status]. An
+// agile column ("col-<index>") holds the statuses of a board configuration
+// column; Status is its first status (kept for compatibility).
 type Column struct {
-	Status StatusDTO  `json:"status"`
-	Issues []IssueDTO `json:"issues"`
+	ID       string      `json:"id"`
+	Name     string      `json:"name"`
+	Category string      `json:"category"` // new | indeterminate | done
+	Statuses []StatusDTO `json:"statuses"`
+	Issues   []IssueDTO  `json:"issues"`
+	Status   StatusDTO   `json:"status"`
+}
+
+// statusColumn is the empty status-mode column of s.
+func statusColumn(s StatusDTO) Column {
+	id := s.ID
+	if id == "" {
+		id = "name:" + s.Name
+	}
+	return Column{ID: id, Name: s.Name, Category: s.Category, Statuses: []StatusDTO{s}, Issues: []IssueDTO{}, Status: s}
 }
 
 // Board is the getBoard result.
@@ -83,9 +100,11 @@ type Board struct {
 	FetchedAt string   `json:"fetchedAt"`
 	Scope     string   `json:"scope"`
 	Truncated bool     `json:"truncated"`
-	// Hidden (scope "mine" only) counts my issues left out because their
-	// project is not tracked.
+	// Hidden (scope "mine" without a project only) counts my issues left
+	// out because their project is not tracked.
 	Hidden *HiddenDTO `json:"hidden,omitempty"`
+	// Layout describes the columns of a project board (project mode only).
+	Layout *BoardLayoutDTO `json:"layout,omitempty"`
 }
 
 // HiddenDTO is Board.hidden.
@@ -122,10 +141,15 @@ const (
 )
 
 const (
-	boardTTL      = 60 * time.Second
-	mineBoardMax  = 300
-	allBoardMax   = 500
-	allBoardOrder = " AND statusCategory != Done ORDER BY updated DESC"
+	boardTTL        = 60 * time.Second
+	mineBoardMax    = 300
+	allBoardMax     = 500
+	projectBoardMax = 500 // both scopes of a project board
+	allBoardOrder   = " AND statusCategory != Done ORDER BY updated DESC"
+	rankOrder       = " ORDER BY Rank ASC"
+	updatedOrder    = " ORDER BY updated DESC"
+	// recentlyDone keeps issues done in the last 14 days on a project board.
+	recentlyDone = "updated >= -14d"
 )
 
 var boardFields = []string{"summary", "status", "issuetype", "priority", "updated", "assignee", "project"}
@@ -180,14 +204,10 @@ func BuildColumns(issues []IssueDTO) []Column {
 	var cols []*col
 	byID := map[string]*col{}
 	for i, is := range issues {
-		id := is.Status.ID
-		if id == "" {
-			id = "name:" + is.Status.Name
-		}
-		c, ok := byID[id]
+		c, ok := byID[statusColumn(is.Status).ID]
 		if !ok {
-			c = &col{Column: Column{Status: is.Status, Issues: []IssueDTO{}}, first: i}
-			byID[id] = c
+			c = &col{Column: statusColumn(is.Status), first: i}
+			byID[c.ID] = c
 			cols = append(cols, c)
 		}
 		c.Issues = append(c.Issues, is)
@@ -217,24 +237,136 @@ func (a *App) parseScope(scope, def string) (string, error) {
 	return "", a.newErr(CodeBadParams, "err_bad_scope")
 }
 
-func (a *App) getBoard(ctx context.Context, force bool, scope string) (*Board, error) {
+// projectParam validates a project parameter: "" stays "" (all tracked
+// projects); anything else must be the key of a project I can browse
+// (tracking is not required). It returns the key upper-cased.
+func (a *App) projectParam(ctx context.Context, c *jira.Client, identity, project string) (string, error) {
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return "", nil
+	}
+	if !jira.ValidProjectKey(project) {
+		return "", a.newErr(CodeProjectUnavailable, "err_project_unavailable")
+	}
+	projects, err := a.accessibleProjects(ctx, c, identity, false)
+	if err != nil {
+		return "", err
+	}
+	if !hasProject(projects, project) {
+		return "", a.newErr(CodeProjectUnavailable, "err_project_unavailable")
+	}
+	return strings.ToUpper(project), nil
+}
+
+// boardCacheKey is the cache key of a board: scope, project ("" = tracked
+// projects) and requested agile board id (0 = default).
+func boardCacheKey(scope, project string, boardID int) string {
+	return cacheBoard + ":" + scope + ":" + project + ":" + strconv.Itoa(boardID)
+}
+
+// ProjectBoardJQL is the query of a project board without ORDER BY: not-done
+// issues plus those done in the last 14 days. "mine" uses the condition of
+// boardJQL (its ORDER BY dropped) and adds my recently done issues.
+func ProjectBoardJQL(scope, project, boardJQL string) string {
+	p := "project = " + quoteKeys([]string{project})
+	if scope == ScopeAll {
+		return p + " AND (statusCategory != Done OR " + recentlyDone + ")"
+	}
+	if w := jqlWhere(boardJQL); w != "" {
+		return p + " AND ((" + w + ") OR (assignee = currentUser() AND statusCategory = Done AND " + recentlyDone + "))"
+	}
+	return p + " AND assignee = currentUser() AND (statusCategory != Done OR " + recentlyDone + ")"
+}
+
+// jqlWhere returns the condition of a JQL query: the text before its
+// ORDER BY clause (outside quoted strings), trimmed.
+func jqlWhere(jql string) string {
+	var quote byte
+	for i := 0; i < len(jql); i++ {
+		ch := jql[i]
+		switch {
+		case quote != 0:
+			if ch == '\\' {
+				i++
+			} else if ch == quote {
+				quote = 0
+			}
+		case ch == '"' || ch == '\'':
+			quote = ch
+		case (i == 0 || !jqlWordByte(jql[i-1])) && orderByAt(jql, i):
+			return strings.TrimSpace(jql[:i])
+		}
+	}
+	return strings.TrimSpace(jql)
+}
+
+// orderByAt reports whether the keywords ORDER BY (any case, any blanks
+// between) start at jql[i].
+func orderByAt(jql string, i int) bool {
+	if len(jql)-i < len("order") || !strings.EqualFold(jql[i:i+5], "order") {
+		return false
+	}
+	k := i + 5
+	for k < len(jql) && (jql[k] == ' ' || jql[k] == '\t' || jql[k] == '\n' || jql[k] == '\r') {
+		k++
+	}
+	if k == i+5 || len(jql)-k < 2 || !strings.EqualFold(jql[k:k+2], "by") {
+		return false
+	}
+	return k+2 == len(jql) || !jqlWordByte(jql[k+2])
+}
+
+func jqlWordByte(b byte) bool {
+	return b == '_' || b == '.' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
+
+// searchRanked runs where ORDER BY Rank ASC. A Jira without Jira Software
+// rejects ordering by Rank (HTTP 400): the query is then retried ORDER BY
+// updated DESC.
+func searchRanked(ctx context.Context, c *jira.Client, where string, opts jira.SearchOptions) (*jira.SearchResult, error) {
+	res, err := c.SearchAll(ctx, where+rankOrder, opts)
+	if jira.IsCode(err, jira.CodeBadRequest) && ctx.Err() == nil {
+		log.Printf("ordering by Rank was rejected, ordering by updated: %v", err)
+		return c.SearchAll(ctx, where+updatedOrder, opts)
+	}
+	return res, err
+}
+
+func (a *App) getBoard(ctx context.Context, force bool, scope, project string, boardID int) (*Board, error) {
 	scope, err := a.parseScope(scope, ScopeMine)
 	if err != nil {
 		return nil, err
+	}
+	if boardID < 0 {
+		return nil, a.newErr(CodeBadParams, "err_bad_params")
 	}
 	c, id, err := a.client()
 	if err != nil {
 		return nil, err
 	}
-	key := cacheBoard + ":" + scope
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if project, err = a.projectParam(ctx, c, id, project); err != nil {
+		return nil, err
+	}
+	if project == "" {
+		boardID = 0 // the agile board only matters for a project layout
+	}
+	key := boardCacheKey(scope, project, boardID)
 	cached, gen, ok := a.cacheGet(key, id, boardTTL)
 	if ok && !force {
 		return cached.(*Board), nil
 	}
 	now := a.clock.Now()
+	if project != "" {
+		b, err := a.projectBoard(ctx, c, id, scope, project, boardID, force, now)
+		if err != nil {
+			return nil, err
+		}
+		a.cachePut(key, id, gen, now, b)
+		return b, nil
+	}
 
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
 	tracked, err := a.trackedProjects(ctx, c, id, nil)
 	if err != nil {
 		return nil, err
@@ -279,6 +411,42 @@ func (a *App) getBoard(ctx context.Context, force bool, scope string) (*Board, e
 	// possibly stale: return it, but do not cache it.
 	a.cachePut(key, id, gen, now, b)
 	return b, nil
+}
+
+// projectBoard builds the board of one project: the columns of its layout
+// (empty ones included) filled with its not-done and recently done issues.
+// force also re-reads the layout.
+func (a *App) projectBoard(ctx context.Context, c *jira.Client, id, scope, project string, boardID int, force bool, now time.Time) (*Board, error) {
+	lay, err := a.projectLayout(ctx, c, id, project, boardID, force)
+	if err != nil {
+		return nil, err
+	}
+	v, err := a.newView(ctx, c, id)
+	if err != nil {
+		return nil, err
+	}
+	res, err := searchRanked(ctx, c, ProjectBoardJQL(scope, project, a.cfg.Get().BoardJQL),
+		jira.SearchOptions{Fields: v.fields(boardFields, false), Limit: projectBoardMax})
+	if err != nil {
+		return nil, err
+	}
+	epicKeys := make([]string, 0, len(res.Issues))
+	for i := range res.Issues {
+		epicKeys = append(epicKeys, v.epicLink(&res.Issues[i]))
+	}
+	a.loadEpics(ctx, v, epicKeys)
+	dtos := make([]IssueDTO, 0, len(res.Issues))
+	for _, is := range res.Issues {
+		dtos = append(dtos, v.issue(is))
+	}
+	layout := lay.dto
+	return &Board{
+		Columns:   lay.place(dtos),
+		FetchedAt: now.Format(time.RFC3339),
+		Scope:     scope,
+		Truncated: res.Truncated(),
+		Layout:    &layout,
+	}, nil
 }
 
 func (a *App) getTransitions(ctx context.Context, key string) ([]TransitionDTO, error) {

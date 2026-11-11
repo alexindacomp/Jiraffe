@@ -225,6 +225,20 @@ func (p *treePool) fetchRelated(ctx context.Context, stories []*treeNode, budget
 // projectClause is the JQL restriction to the tracked projects.
 func projectClause(tracked []string) string { return "project in (" + quoteKeys(tracked) + ")" }
 
+// treeProjects returns the JQL restriction of the epic/story queries: the
+// given project (validated, see projectParam) or the tracked projects;
+// "" when there is nothing to query.
+func (a *App) treeProjects(ctx context.Context, c *jira.Client, identity, project string) (string, error) {
+	if project != "" {
+		return "project = " + quoteKeys([]string{project}), nil
+	}
+	tracked, err := a.trackedForQuery(ctx, c, identity)
+	if err != nil || len(tracked) == 0 {
+		return "", err
+	}
+	return projectClause(tracked), nil
+}
+
 func notDone(includeDone bool) string {
 	if includeDone {
 		return ""
@@ -232,11 +246,11 @@ func notDone(includeDone bool) string {
 	return " AND statusCategory != Done"
 }
 
-func treeCacheKey(prefix string, includeDone bool, scope string) string {
-	return prefix + ":" + strconv.FormatBool(includeDone) + ":" + scope
+func treeCacheKey(prefix string, includeDone bool, scope, project string) string {
+	return prefix + ":" + strconv.FormatBool(includeDone) + ":" + scope + ":" + project
 }
 
-func (a *App) getEpics(ctx context.Context, includeDone bool, scope string, force bool) (*EpicsResult, error) {
+func (a *App) getEpics(ctx context.Context, includeDone bool, scope, project string, force bool) (*EpicsResult, error) {
 	scope, err := a.parseScope(scope, ScopeAll)
 	if err != nil {
 		return nil, err
@@ -245,20 +259,23 @@ func (a *App) getEpics(ctx context.Context, includeDone bool, scope string, forc
 	if err != nil {
 		return nil, err
 	}
-	key := treeCacheKey(cacheEpics, includeDone, scope)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	if project, err = a.projectParam(ctx, c, id, project); err != nil {
+		return nil, err
+	}
+	key := treeCacheKey(cacheEpics, includeDone, scope, project)
 	cached, gen, ok := a.cacheGet(key, id, listTTL)
 	if ok && !force {
 		return cached.(*EpicsResult), nil
 	}
 	now := a.clock.Now()
 	out := &EpicsResult{Epics: []EpicNode{}, OrphanStories: []StoryNode{}, FetchedAt: now.Format(time.RFC3339)}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	tracked, err := a.trackedForQuery(ctx, c, id)
+	inProjects, err := a.treeProjects(ctx, c, id, project)
 	if err != nil {
 		return nil, err
 	}
-	if len(tracked) == 0 {
+	if inProjects == "" {
 		a.cachePut(key, id, gen, now, out)
 		return out, nil
 	}
@@ -267,7 +284,7 @@ func (a *App) getEpics(ctx context.Context, includeDone bool, scope string, forc
 		return nil, err
 	}
 	fields := v.fields(treeFields, true)
-	epics, err := c.SearchAll(ctx, "issuetype = Epic AND "+projectClause(tracked)+notDone(includeDone)+" ORDER BY key DESC",
+	epics, err := c.SearchAll(ctx, "issuetype = Epic AND "+inProjects+notDone(includeDone)+" ORDER BY key DESC",
 		jira.SearchOptions{Fields: fields, Limit: maxTreeTop})
 	if err != nil {
 		return nil, err
@@ -277,7 +294,7 @@ func (a *App) getEpics(ctx context.Context, includeDone bool, scope string, forc
 		v.meta = m
 	}
 	link := jira.ClauseRef(v.meta.fields.EpicLink)
-	orphanJQL := "issuetype = Story AND " + projectClause(tracked)
+	orphanJQL := "issuetype = Story AND " + inProjects
 	if link != "" {
 		orphanJQL += " AND " + link + " is EMPTY"
 	}
@@ -372,7 +389,7 @@ func sortEpics(e []EpicNode) {
 	}
 }
 
-func (a *App) getStories(ctx context.Context, includeDone bool, scope string, force bool) (*StoriesResult, error) {
+func (a *App) getStories(ctx context.Context, includeDone bool, scope, project string, force bool) (*StoriesResult, error) {
 	scope, err := a.parseScope(scope, ScopeAll)
 	if err != nil {
 		return nil, err
@@ -381,20 +398,23 @@ func (a *App) getStories(ctx context.Context, includeDone bool, scope string, fo
 	if err != nil {
 		return nil, err
 	}
-	key := treeCacheKey(cacheStories, includeDone, scope)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	if project, err = a.projectParam(ctx, c, id, project); err != nil {
+		return nil, err
+	}
+	key := treeCacheKey(cacheStories, includeDone, scope, project)
 	cached, gen, ok := a.cacheGet(key, id, listTTL)
 	if ok && !force {
 		return cached.(*StoriesResult), nil
 	}
 	now := a.clock.Now()
 	out := &StoriesResult{Stories: []StoryNode{}, FetchedAt: now.Format(time.RFC3339)}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	tracked, err := a.trackedForQuery(ctx, c, id)
+	inProjects, err := a.treeProjects(ctx, c, id, project)
 	if err != nil {
 		return nil, err
 	}
-	if len(tracked) == 0 {
+	if inProjects == "" {
 		a.cachePut(key, id, gen, now, out)
 		return out, nil
 	}
@@ -402,7 +422,7 @@ func (a *App) getStories(ctx context.Context, includeDone bool, scope string, fo
 	if err != nil {
 		return nil, err
 	}
-	res, err := c.SearchAll(ctx, "issuetype = Story AND "+projectClause(tracked)+notDone(includeDone)+" ORDER BY key DESC",
+	res, err := c.SearchAll(ctx, "issuetype = Story AND "+inProjects+notDone(includeDone)+" ORDER BY key DESC",
 		jira.SearchOptions{Fields: v.fields(treeFields, false), Limit: maxTreeTop})
 	if err != nil {
 		return nil, err

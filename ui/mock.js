@@ -1,9 +1,14 @@
 /* Jiraffe UI: fake backend for development / review in a normal browser.
    Installed only when the Go binding window.__jiraffe is absent. Implements every contract method
-   (SPEC v0.1 + v0.2) with latency, occasional errors and periodic `notification` events.
+   (SPEC v0.1 – v0.3) with latency, occasional errors and periodic `notification` events.
+   v0.3 data: projects with different status sets (MB has "Reject", CMA "ForTesting", both "Закрыт"), agile boards
+   with column configurations (multi-status columns; MB and CMA have several boards; 880 is shared by MB and CMA;
+   HR's default board has none of its statuses ⇒ workflow columns with a board picker; EDS/OPS/SEC/DWH have no boards
+   ⇒ workflow columns), sprints across projects, backlog, carried-over issues.
    URL flags (?mock=a,b): unconfigured | empty | errors (frequent failures) | noerrors | slow | fast (notification every 10 s)
    | warnings (toggling autostart "fails": warning + autostartEffective = previous value)
-   | noagile (agile API missing: no boards) | truncated (board/epics report truncated) | untracked (trackedProjects = null)
+   | noagile (agile API missing: no boards, workflow columns, sprints unavailable) | truncated (board/epics/sprints report truncated)
+   | untracked (trackedProjects = null) | closedfail (getSprintGroups: closed sprints fail ⇒ closedUnavailable)
    | limit (tracking more than 6 projects fails with a validation error, like the Go limit of 200) | noprefs (no getUiPrefs: older backend). */
 (function () {
   'use strict';
@@ -52,23 +57,36 @@
     forTesting: { id: '10102', name: 'ForTesting', category: 'indeterminate' },
     solved:     { id: '10200', name: 'Предоставлено решение', category: 'done' },
     done:       { id: '10201', name: 'Готово', category: 'done' },
+    closed:     { id: '6', name: 'Закрыт', category: 'done' },
     reject:     { id: '10202', name: 'Reject', category: 'done' },
   };
-  const ORDER = ['backlog', 'todo', 'inprog', 'forReview', 'inReview', 'forTesting', 'solved', 'done', 'reject'];
+  const ORDER = ['backlog', 'todo', 'inprog', 'forReview', 'inReview', 'forTesting', 'solved', 'done', 'closed', 'reject'];
   const CAT_RANK = { new: 0, indeterminate: 1, done: 2 };
-  // [transitionId, name, target status key]
+  // [transitionId, name, target status key]; only targets in the issue's project workflow are offered.
   const FLOW = {
     backlog: [['11', 'Запланировать', 'todo'], ['21', 'Взять в работу', 'inprog']],
     todo: [['21', 'Взять в работу', 'inprog'], ['12', 'Вернуть в бэклог', 'backlog'], ['91', 'Отклонить', 'reject']],
-    inprog: [['31', 'На ревью', 'forReview'], ['32', 'Срочное ревью', 'forReview'], ['41', 'Приостановить', 'todo'], ['51', 'Предоставить решение', 'solved']],
+    inprog: [['31', 'На ревью', 'forReview'], ['32', 'Срочное ревью', 'forReview'], ['33', 'На ревью', 'inReview'], ['41', 'Приостановить', 'todo'], ['51', 'Предоставить решение', 'solved'], ['52', 'Готово', 'done']],
     forReview: [['61', 'Начать ревью', 'inReview'], ['22', 'Вернуть в работу', 'inprog']],
-    inReview: [['71', 'Ревью пройдено', 'forTesting'], ['23', 'На доработку', 'inprog']],
-    forTesting: [['81', 'Тестирование пройдено', 'done'], ['24', 'Найдены ошибки', 'inprog']],
-    solved: [['25', 'Переоткрыть', 'inprog']],
+    inReview: [['71', 'Ревью пройдено', 'forTesting'], ['72', 'Ревью пройдено', 'done'], ['73', 'Закрыть', 'closed'], ['23', 'На доработку', 'inprog'], ['92', 'Отклонить', 'reject']],
+    forTesting: [['81', 'Тестирование пройдено', 'closed'], ['24', 'Найдены ошибки', 'inprog']],
+    solved: [['25', 'Переоткрыть', 'inprog'], ['82', 'Закрыть', 'closed']],
     done: [['26', 'Переоткрыть', 'inprog']],
+    closed: [['28', 'Переоткрыть', 'inprog']],
     reject: [['27', 'Переоткрыть', 'todo']],
   };
+  // Statuses per project workflow (GET /project/{key}/statuses, union over issue types), in workflow order.
+  const PSTAT = {
+    RBI: ['backlog', 'todo', 'inprog', 'forReview', 'inReview', 'done'],
+    CMA: ['backlog', 'todo', 'inprog', 'forReview', 'inReview', 'forTesting', 'solved', 'closed'],
+    MB: ['backlog', 'todo', 'inprog', 'inReview', 'reject', 'closed'],
+    EDS: ['todo', 'inprog', 'forReview', 'done'],
+  };
+  const PSTAT_DEFAULT = ['todo', 'inprog', 'done'];
+  const projOf = (r) => r.key.split('-')[0];
+  const statusesOf = (project) => PSTAT[project] || PSTAT_DEFAULT;
   const statusKey = (st) => Object.keys(ST).find((k) => ST[k].id === st.id);
+  const flowOf = (r) => (FLOW[statusKey(r.status)] || []).filter(([, , to]) => statusesOf(projOf(r)).includes(to));
   const isDone = (rec) => rec.status.category === 'done';
 
   /* ---------- projects, types ---------- */
@@ -109,36 +127,40 @@
     ['EDS-150', 'Миграция архива документов', 'done', 'epic', 'Low', 'do', 60 * 24 * 20, { name: 'Миграция архива', color: 'ghx-label-11' }],
     // Stories
     ['RBI-1031', 'Перенести авторизацию на OAuth2 (Keycloak)', 'todo', 'story', 'Medium', 'me', 95, { epic: 'RBI-950', sp: 5, sprints: [6338], labels: ['security', 'backend'], comps: ['Auth'], versions: ['4.2.0'] }],
-    ['RBI-1040', 'Экспорт отчётов в Excel без ограничения по строкам', 'inprog', 'story', 'High', 'is', 180, { epic: 'RBI-900', sp: 8, sprints: [6338], comps: ['Export'], versions: ['4.2.0'], est: [24, 10, 14] }],
+    ['RBI-1040', 'Экспорт отчётов в Excel без ограничения по строкам', 'inprog', 'story', 'High', 'is', 180, { epic: 'RBI-900', sp: 8, sprints: [6337, 6338], comps: ['Export'], versions: ['4.2.0'], est: [24, 10, 14] }],
     ['RBI-1041', 'Конструктор фильтров отчёта', 'todo', 'story', 'Medium', 'do', 60 * 8, { epic: 'RBI-900', sp: 5, sprints: [6338] }],
-    ['CMA-412', 'Добавить фильтр по дате в журнал операций', 'inprog', 'story', 'Medium', 'me', 47, { epic: 'CMA-300', sp: 3, labels: ['ux'] }],
-    ['CMA-420', 'Выгрузка журнала операций в CSV', 'done', 'story', 'Low', 'mh', 60 * 24 * 4, { epic: 'CMA-300', sp: 2 }],
-    ['MB-77', 'Push-сповіщення для iOS', 'forTesting', 'story', 'High', 'me', 300, { epic: 'MB-50', sp: 8, versions: ['3.14'] }],
-    ['MB-90', 'Налаштування сповіщень у профілі', 'todo', 'story', 'Medium', 'sk', 60 * 26, { epic: 'MB-50', sp: 3 }],
+    ['CMA-412', 'Добавить фильтр по дате в журнал операций', 'inprog', 'story', 'Medium', 'me', 47, { epic: 'CMA-300', sp: 3, labels: ['ux'], sprints: [7101] }],
+    ['CMA-420', 'Выгрузка журнала операций в CSV', 'closed', 'story', 'Low', 'mh', 60 * 24 * 4, { epic: 'CMA-300', sp: 2, sprints: [7200] }],
+    ['MB-77', 'Push-сповіщення для iOS', 'inReview', 'story', 'High', 'me', 300, { epic: 'MB-50', sp: 8, versions: ['3.14'], sprints: [7100, 7101] }],
+    ['MB-90', 'Налаштування сповіщень у профілі', 'todo', 'story', 'Medium', 'sk', 60 * 26, { epic: 'MB-50', sp: 3, sprints: [7102] }],
     ['EDS-230', 'Интеграция с сервисом электронного документооборота: подписание пакета', 'inprog', 'story', 'Medium', 'me', 5, { epic: 'EDS-200', sp: 8, comps: ['Signing'], est: [36, 12, 20] }],
     ['EDS-240', 'Статусы подписания в карточке документа', 'inprog', 'story', 'Medium', 'nb', 60 * 5, { epic: 'EDS-200', sp: 5 }],
     ['RBI-1050', 'Тёмная тема для портала отчётов', 'backlog', 'story', 'Low', 'mh', 60 * 24 * 9, { sp: 3, sprints: [6339] }],
-    ['CMA-430', 'Онбординг новых клиентов в кабинете', 'todo', 'story', 'Medium', null, 60 * 24 * 2, { sp: 5 }],
+    ['CMA-430', 'Онбординг новых клиентов в кабинете', 'todo', 'story', 'Medium', null, 60 * 24 * 2, { sp: 5, sprints: [7202] }],
     // Tasks, bugs, sub-tasks
     ['RBI-1028', 'Відділити frontend від backend', 'inprog', 'task', 'High', 'me', 12, { epic: 'RBI-950', sprints: [6338], labels: ['architecture'], est: [16, 6, 9.5] }],
     ['RBI-1019', 'Помилка 500 при експорті звіту в Excel, якщо в періоді більше 10 000 рядків', 'forReview', 'bug', 'Highest', 'me', 38, { epic: 'RBI-900', sprints: [6338], comps: ['Export'], due: 3 }],
     ['RBI-997', 'Оновити залежності Spring Boot до 3.3', 'backlog', 'task', 'Low', 'me', 60 * 26, { epic: 'RBI-900', sprints: [6339], sp: 2 }],
     ['RBI-1042', 'Индексы для таблицы фактов отчётов', 'inprog', 'task', 'Medium', 'is', 60 * 3, { epic: 'RBI-900', sprints: [6338], sp: 3 }],
     ['RBI-1043', 'Покрыть экспорт интеграционными тестами', 'todo', 'sub', 'Medium', 'do', 60 * 6, { parent: 'RBI-1040', sprints: [6338] }],
-    ['RBI-1044', 'Нагрузочное тестирование движка', 'todo', 'task', 'Medium', 'sk', 60 * 30, { epic: 'RBI-900', sprints: [6338], sp: 3 }],
+    ['RBI-1044', 'Нагрузочное тестирование движка', 'todo', 'task', 'Medium', 'sk', 60 * 30, { epic: 'RBI-900', sprints: [6336, 6337, 6338], sp: 3 }],
     ['RBI-1045', 'Обновить документацию API отчётов', 'done', 'task', 'Low', 'is', 60 * 24, { epic: 'RBI-900', sprints: [6338], sp: 1 }],
     ['RBI-1046', 'Метрики времени построения отчёта в Grafana', 'done', 'task', 'Medium', 'me', 60 * 24 * 2, { epic: 'RBI-900', sprints: [6338], sp: 2 }],
     ['RBI-1029', 'Кэширование справочников', 'done', 'task', 'Medium', 'me', 60 * 24 * 16, { epic: 'RBI-900', sprints: [6337], sp: 3 }],
     ['RBI-1030', 'Логирование запросов к отчётам', 'done', 'task', 'Low', 'is', 60 * 24 * 15, { sprints: [6337], sp: 2 }],
-    ['CMA-415', 'Не обновляется счётчик непрочитанных сообщений после перехода по push', 'inReview', 'bug', 'High', 'me', 180, {}],
+    ['CMA-415', 'Не обновляется счётчик непрочитанных сообщений после перехода по push', 'inReview', 'bug', 'High', 'me', 180, { sprints: [7201], sp: 2 }],
     ['CMA-399', 'Рефакторинг модуля уведомлений', 'backlog', 'task', 'Medium', 'me', 60 * 24 * 6, {}],
-    ['CMA-421', 'API фильтрации журнала по дате', 'done', 'task', 'Medium', 'nb', 60 * 24, { epic: 'CMA-300' }],
-    ['CMA-422', 'UI-компонент выбора периода', 'inprog', 'task', 'Medium', 'mh', 60 * 2, { epic: 'CMA-300' }],
-    ['CMA-433', 'Падает сборка на CI после обновления Gradle', 'forReview', 'bug', 'High', 'do', 60 * 4, {}],
-    ['MB-81', 'Краш при повороті екрана на Android 14', 'todo', 'bug', 'Highest', 'me', 22, { epic: 'MB-50' }],
-    ['MB-78', 'Сертифікати APNs для продакшну', 'done', 'task', 'High', 'sk', 60 * 24 * 3, { epic: 'MB-50' }],
-    ['MB-79', 'Обробка silent push', 'inprog', 'sub', 'Medium', 'me', 60 * 7, { parent: 'MB-77' }],
-    ['MB-95', 'Локалізація екранів оплати', 'inReview', 'task', 'Low', 'nb', 60 * 9, {}],
+    ['CMA-421', 'API фильтрации журнала по дате', 'closed', 'task', 'Medium', 'nb', 60 * 24, { epic: 'CMA-300', sprints: [7201], sp: 3 }],
+    ['CMA-422', 'UI-компонент выбора периода', 'inprog', 'task', 'Medium', 'mh', 60 * 2, { epic: 'CMA-300', sprints: [7201], sp: 5 }],
+    ['CMA-433', 'Падает сборка на CI после обновления Gradle', 'forReview', 'bug', 'High', 'do', 60 * 4, { sprints: [7201] }],
+    ['CMA-441', 'Регресс журнала операций перед релизом', 'forTesting', 'task', 'Medium', 'mh', 60 * 6, { epic: 'CMA-300', sprints: [7201], sp: 2 }],
+    ['CMA-442', 'Консультация: выгрузка выписки за 2023 год', 'solved', 'task', 'Low', 'me', 60 * 24 * 2, { sprints: [7201] }],
+    ['MB-81', 'Краш при повороті екрана на Android 14', 'todo', 'bug', 'Highest', 'me', 22, { epic: 'MB-50', sprints: [7101] }],
+    ['MB-78', 'Сертифікати APNs для продакшну', 'closed', 'task', 'High', 'sk', 60 * 24 * 3, { epic: 'MB-50', sprints: [7100], sp: 2 }],
+    ['MB-79', 'Обробка silent push', 'inprog', 'sub', 'Medium', 'me', 60 * 7, { parent: 'MB-77', sprints: [7101] }],
+    ['MB-95', 'Локалізація екранів оплати', 'inReview', 'task', 'Low', 'nb', 60 * 9, { sprints: [7101], sp: 1 }],
+    ['MB-96', 'Темна тема для екрана входу', 'reject', 'task', 'Low', 'sk', 60 * 24 * 3, { sprints: [7100] }],
+    ['MB-97', 'Оновити SDK аналітики', 'backlog', 'task', 'Low', null, 60 * 24 * 8, {}],
     ['EDS-233', 'Описать API загрузки вложений в Swagger', 'forReview', 'task', 'Low', 'me', 60 * 3, { epic: 'EDS-200' }],
     ['EDS-219', 'Таймаут при генерации PDF больше 50 страниц', 'todo', 'bug', 'Medium', 'me', 60 * 50, { epic: 'EDS-200' }],
     ['EDS-231', 'Подписание пакета: бэкенд и очередь', 'inprog', 'task', 'High', 'am', 60, { epic: 'EDS-200' }],
@@ -151,6 +173,8 @@
     ['SEC-31', 'Аудит прав сервисных учётных записей', 'todo', 'task', 'Medium', 'do', 60 * 24 * 5, {}],
     ['OPS-14', 'Обновить базовый образ CI-агентов', 'inprog', 'task', 'Medium', 'me', 60 * 9, {}],
     ['DWH-8', 'Выгрузка витрины платежей для отчётов', 'todo', 'task', 'Low', 'me', 60 * 24 * 2, { sp: 2 }],
+    ['RBI-1060', 'Пагинация в списке отчётов', 'backlog', 'task', 'Low', null, 60 * 24 * 7, { sp: 2 }],
+    ['RBI-1061', 'Аудит медленных запросов к отчётам', 'todo', 'task', 'Medium', 'me', 60 * 24, { sp: 3 }],
   ];
   // [from, link type, to]; type: [name, outward, inward]
   const LT = { rel: ['Relates', 'relates to', 'relates to'], blocks: ['Blocks', 'blocks', 'is blocked by'], dup: ['Duplicate', 'duplicates', 'is duplicated by'] };
@@ -166,7 +190,7 @@
     RAW.forEach(([key, summary, st, type, prio, who, ago, x], i) => {
       const created = minutesAgo(ago + 60 * 24 * (5 + (i % 9)));
       recs.set(key, {
-        id: String(20000 + i), key, summary, status: ST[st], type: TYPES[type], priority: { name: prio },
+        id: String(20000 + i), rank: i, key, summary, status: ST[st], type: TYPES[type], priority: { name: prio },
         assignee: who ? U[who] : null, updated: minutesAgo(ago), created,
         reporter: who === 'me' ? U.am : U.me, epic: x.epic || null, epicName: x.name, epicColor: x.color,
         storyPoints: x.sp, parent: x.parent || null, sprints: x.sprints || [], labels: x.labels || [], components: x.comps || [],
@@ -276,16 +300,37 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
   })).filter((l) => recs.has(l.other));
 
   /* ---------- sprints / boards ---------- */
+  // location = board.location.projectKey; projects = projects whose boards list contains it;
+  // columns = board configuration [name, status keys] (statuses not on the board go to the "other" column).
   const AGILE = [
-    { id: 12, name: 'RBI Scrum', type: 'scrum', projectKey: 'RBI' },
-    { id: 15, name: 'Кабинет клиента — Kanban', type: 'kanban', projectKey: 'CMA' },
+    { id: 12, name: 'RBI Scrum', type: 'scrum', location: 'RBI', projects: ['RBI'],
+      columns: [['To Do', ['backlog', 'todo']], ['In Progress', ['inprog']], ['Review', ['forReview', 'inReview']], ['Done', ['done']]] },
+    { id: 673, name: 'ETL board', type: 'kanban', location: 'MB', projects: ['MB'],
+      columns: [['Backlog', ['backlog']], ['To Do', ['todo']], ['In Progress', ['inprog']], ['Review', ['inReview']], ['Done', ['closed']], ['Rejected', ['reject']]] },
+    { id: 880, name: 'BI DEV Agile board', type: 'scrum', location: 'MB', projects: ['MB', 'CMA'],
+      columns: [['Open', ['backlog', 'todo']], ['Dev', ['inprog']], ['Review', ['forReview', 'inReview']], ['QA', ['forTesting']], ['Closed', ['closed', 'reject', 'solved']]] },
+    { id: 937, name: 'CMA dev board', type: 'kanban', location: 'CMA', projects: ['CMA'],
+      columns: [['Selected', ['todo']], ['In progress', ['inprog']], ['Review', ['forReview', 'inReview']], ['Testing', ['forTesting']], ['Done', ['solved', 'closed']]] },
+    { id: 951, name: 'CMA general', type: 'scrum', location: 'CMA', projects: ['CMA'],
+      columns: [['To Do', ['backlog', 'todo']], ['In Progress', ['inprog', 'forReview', 'inReview', 'forTesting']], ['Done', ['solved', 'closed']]] },
+    { id: 990, name: 'HR legacy board', type: 'kanban', location: 'HR', projects: ['HR'], // none of HR's statuses ⇒ workflow layout
+      columns: [['Review', ['forReview']], ['Testing', ['forTesting']], ['Solved', ['solved']]] },
+    { id: 991, name: 'HR team', type: 'kanban', location: 'HR', projects: ['HR'],
+      columns: [['Backlog', []], ['To Do', ['todo']], ['Doing', ['inprog']], ['Done', ['done']]] },
   ];
+  const agileShape = (b) => ({ id: b.id, name: b.name, type: b.type, projectKey: b.location });
   const SPRINTS = [
     { id: 6335, name: 'RBI Sprint 41', state: 'closed', startDate: daysFromNow(-48), endDate: daysFromNow(-34), completeDate: daysFromNow(-34, 17), boardId: 12 },
     { id: 6336, name: 'RBI Sprint 42', state: 'closed', startDate: daysFromNow(-34), endDate: daysFromNow(-20), completeDate: daysFromNow(-20, 17), boardId: 12 },
     { id: 6337, name: 'RBI Sprint 43', state: 'closed', startDate: daysFromNow(-20), endDate: daysFromNow(-6), completeDate: daysFromNow(-6, 17), goal: 'Кэш справочников и логирование', boardId: 12 },
     { id: 6338, name: 'RBI Sprint 44', state: 'active', startDate: daysFromNow(-6), endDate: daysFromNow(8, 18), goal: 'Выпустить экспорт без ограничений и подготовить переход на SSO', boardId: 12 },
     { id: 6339, name: 'RBI Sprint 45', state: 'future', startDate: daysFromNow(8), endDate: daysFromNow(22, 18), boardId: 12 },
+    { id: 7100, name: 'BI DEV Sprint 17', state: 'closed', startDate: daysFromNow(-30), endDate: daysFromNow(-16), completeDate: daysFromNow(-16, 17), boardId: 880 },
+    { id: 7101, name: 'BI DEV Sprint 18', state: 'active', startDate: daysFromNow(-9), endDate: daysFromNow(5, 18), goal: 'Push-сповіщення iOS у прод; фільтр журналу операцій за датою', boardId: 880 },
+    { id: 7102, name: 'BI DEV Sprint 19', state: 'future', startDate: daysFromNow(5), endDate: daysFromNow(19, 18), boardId: 880 },
+    { id: 7200, name: 'CMA Sprint 5', state: 'closed', startDate: daysFromNow(-24), endDate: daysFromNow(-10), completeDate: daysFromNow(-10, 17), goal: 'Выгрузка журнала в CSV', boardId: 951 },
+    { id: 7201, name: 'CMA Sprint 6', state: 'active', startDate: daysFromNow(-10), endDate: daysFromNow(-1, 18), goal: 'Стабилизировать журнал операций 2.0 и закрыть баги CI перед релизом 2.0. Регресс — до пятницы, потом заморозка веток и выкладка на прод.', boardId: 951 },
+    { id: 7202, name: 'CMA Sprint 7', state: 'future', boardId: 951 },
   ];
 
   function progressOf(list) {
@@ -293,10 +338,97 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     list.forEach((r) => { if (r.status.category === 'done') p.done++; else if (r.status.category === 'indeterminate') p.inProgress++; else p.todo++; });
     return p;
   }
-  function columnsOf(list, withDone) {
-    return ORDER.map((k) => ST[k]).filter((st) => withDone || st.category !== 'done')
-      .map((st) => ({ status: st, issues: list.filter((r) => r.status.id === st.id).sort((a, b) => b.updated.localeCompare(a.updated)).map(toIssue) }))
+  const byRank = (a, b) => a.rank - b.rank;
+  const statusColumn = (st, issues) => ({ id: st.id, name: st.name, category: st.category, statuses: [st], issues, status: st });
+  /** v0.2 status columns (All projects): statuses that have issues, ordered by category, newest first. */
+  function columnsOf(list) {
+    return ORDER.map((k) => ST[k]).filter((st) => st.category !== 'done')
+      .map((st) => statusColumn(st, list.filter((r) => r.status.id === st.id).sort((a, b) => b.updated.localeCompare(a.updated)).map(toIssue)))
       .filter((c) => c.issues.length);
+  }
+  /** Category of a column holding several statuses (SPEC v0.3): shared one; else done if last with any done status. */
+  function columnCategory(statuses, isLast) {
+    const cats = [...new Set(statuses.map((st) => st.category))];
+    if (cats.length === 1) return cats[0];
+    return isLast && statuses.some((st) => st.category === 'done') ? 'done' : 'indeterminate';
+  }
+  const boardsOf = (project) => (flags.has('noagile') ? [] : AGILE.filter((b) => b.projects.includes(project)).sort((a, b) => a.id - b.id));
+  const DAY = 86400000;
+  /** getBoard with a project: every column of its agile board (or workflow statuses), recent done issues, Rank order. */
+  function projectBoard(scope, project, boardId) {
+    if (!PROJECTS.some((x) => x.key === project)) throw new MockError('project_unavailable', `project ${project} is not accessible`);
+    let list = all().filter((r) => projOf(r) === project && r.type.kind !== 'epic' && (!isDone(r) || Date.now() - new Date(r.updated).getTime() <= 14 * DAY));
+    if (scope === 'mine') list = list.filter(mine);
+    list.sort(byRank);
+    const boards = boardsOf(project);
+    const chosen = boards.find((b) => String(b.id) === String(boardId)) || boards.find((b) => b.location === project) || boards[0] || null;
+    let cols = [];
+    if (chosen) {
+      // Only this project's statuses (shared boards carry other projects' too); empty columns are dropped,
+      // ids keep the position in the board configuration (gaps possible).
+      const own = statusesOf(project);
+      cols = chosen.columns.map(([name, keys], i, arr) => {
+        const statuses = keys.filter((k) => own.includes(k)).map((k) => ST[k]);
+        return { id: 'col-' + i, name, category: statuses.length ? columnCategory(statuses, i === arr.length - 1) : 'new', statuses, issues: [], status: statuses[0] };
+      }).filter((c) => c.statuses.length);
+    }
+    const agile = cols.length > 0;
+    if (!agile) {
+      cols = statusesOf(project).map((k) => ST[k]).sort((a, b) => CAT_RANK[a.category] - CAT_RANK[b.category]).map((st) => statusColumn(st, []));
+    }
+    const other = [];
+    list.forEach((r) => {
+      const col = cols.find((c) => c.statuses.some((st) => st.id === r.status.id));
+      if (col) col.issues.push(toIssue(r)); else other.push(r);
+    });
+    if (other.length) {
+      const sts = [...new Map(other.map((r) => [r.status.id, r.status])).values()];
+      cols.push({ id: 'other', name: '', category: new Set(sts.map((st) => st.category)).size === 1 ? sts[0].category : 'indeterminate', statuses: sts, issues: other.map(toIssue), status: sts[0] });
+    }
+    const layout = { source: agile ? 'agile' : 'workflow', project, boards: boards.map(agileShape) };
+    if (chosen) { layout.boardId = chosen.id; layout.boardName = chosen.name; }
+    return { columns: clone(cols), fetchedAt: rfc(now()), scope, truncated: false, layout };
+  }
+
+  /* ---------- sprint groups (SPEC v0.3) ---------- */
+  function sprintGroup(sprint, list) {
+    const pts = list.reduce((a, r) => { const v = Number(r.storyPoints) || 0; a.total += v; if (isDone(r)) a.done += v; return a; }, { done: 0, total: 0 });
+    const g = { issues: list.map(toIssue), progress: progressOf(list), storyPoints: pts, truncated: false };
+    if (sprint) g.sprint = sprint;
+    return g;
+  }
+  function sprintGroups(p) {
+    const fetchedAt = rfc(now());
+    if (flags.has('noagile')) return { groups: [], backlog: null, fetchedAt, truncated: false, available: false };
+    if (p.project && !PROJECTS.some((x) => x.key === p.project)) throw new MockError('project_unavailable', `project ${p.project} is not accessible`);
+    const projects = p.project ? [p.project] : PROJECTS.map((x) => x.key).filter((k) => isTracked(k + '-1'));
+    const scope = scopeOf(p, 'all');
+    const sel = (r) => projects.includes(projOf(r)) && r.type.kind !== 'epic' && (scope !== 'mine' || mine(r));
+    const open = SPRINTS.filter((sp) => sp.state !== 'closed');
+    const openIds = new Set(open.map((sp) => sp.id));
+    const inOpen = all().filter((r) => sel(r) && r.sprints.some((id) => openIds.has(id))).sort(byRank);
+    const ordered = [
+      ...open.filter((sp) => sp.state === 'active').sort((a, b) => a.startDate.localeCompare(b.startDate) || a.id - b.id),
+      ...open.filter((sp) => sp.state === 'future').sort((a, b) => a.id - b.id),
+    ];
+    const groups = ordered.map((sp) => sprintGroup(sp, inOpen.filter((r) => r.sprints.includes(sp.id)))).filter((g) => g.issues.length);
+    const closedUnavailable = !!p.includeClosed && flags.has('closedfail');
+    if (p.includeClosed && !closedUnavailable) {
+      const boardIds = new Set(projects.flatMap((k) => boardsOf(k).map((b) => b.id)));
+      const closed = SPRINTS.filter((sp) => sp.state === 'closed' && boardIds.has(sp.boardId)
+        && all().some((r) => projects.includes(projOf(r)) && r.sprints.includes(sp.id)))
+        .sort((a, b) => b.completeDate.localeCompare(a.completeDate)).slice(0, 3);
+      closed.forEach((sp) => {
+        const g = sprintGroup(sp, all().filter((r) => sel(r) && r.sprints.includes(sp.id)).sort(byRank));
+        if (g.issues.length) groups.push(g);
+      });
+    }
+    const back = all().filter((r) => sel(r) && !isDone(r) && !r.sprints.some((id) => openIds.has(id))).sort(byRank);
+    const truncated = flags.has('truncated');
+    const backlog = back.length ? Object.assign(sprintGroup(null, back), { truncated }) : null;
+    const out = { groups: clone(groups), backlog: clone(backlog), fetchedAt, truncated, available: true };
+    if (closedUnavailable) out.closedUnavailable = true;
+    return out;
   }
 
   /* ---------- epic tree (SPEC v0.2 rules) ---------- */
@@ -457,7 +589,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     return {
       configured: configured(),
       user: configured() ? clone(ME) : undefined,
-      version: '0.2.0-mock',
+      version: '0.3.0-mock',
       language: settings.language,
       unread: notifications.filter((n) => !n.read).length,
       nextWorklogAt: nextWorklogAt(),
@@ -519,6 +651,12 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
   const maybeFail = (rate, code, message) => { if (Math.random() < rate) throw new MockError(code, message); };
   const requireConfigured = () => { if (!configured()) throw new MockError('not_configured', 'Jira is not configured'); };
   const scopeOf = (p, def) => (p && (p.scope === 'mine' || p.scope === 'all') ? p.scope : def);
+  /** v0.3 `project` param of getEpics / getStories: that project instead of the tracked ones (children are not filtered). */
+  function projectFilter(p) {
+    if (!p || !p.project) return (r) => isTracked(r.key);
+    if (!PROJECTS.some((x) => x.key === p.project)) throw new MockError('project_unavailable', `project ${p.project} is not accessible`);
+    return (r) => projOf(r) === p.project;
+  }
 
   function board(scope) {
     const open = all().filter((r) => !isDone(r) && r.type.kind !== 'epic');
@@ -526,7 +664,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     if (scope === 'mine') list = list.filter(mine);
     const truncated = flags.has('truncated') && scope === 'all';
     if (truncated) list = list.slice(0, 20);
-    const out = { columns: clone(columnsOf(list, false)), fetchedAt: rfc(now()), scope, truncated };
+    const out = { columns: clone(columnsOf(list)), fetchedAt: rfc(now()), scope, truncated };
     if (scope === 'mine') { // my issues dropped by the tracked-projects filter (OPS-12/14, DWH-8 by default)
       const hidden = open.filter((r) => mine(r) && !isTracked(r.key));
       out.hidden = { count: hidden.length, projects: [...new Set(hidden.map((r) => r.key.split('-')[0]))].sort() };
@@ -607,20 +745,21 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       if (boardCalls++ > 0) maybeFail(ERROR_RATE, 'network', 'WinHTTP 12002: the operation timed out');
       const scope = scopeOf(p, 'mine');
       if (tracked === null && scope === 'mine') initTracked(); // "on first need", like the Go side
-      return board(scope);
+      if (p && p.boardId != null && !(Number(p.boardId) >= 0)) throw new MockError('bad_params', 'boardId must be ≥ 0');
+      return p && p.project ? projectBoard(scope, String(p.project), p.boardId) : board(scope);
     },
     getTransitions(p) {
       requireConfigured();
       const is = rec(p.key);
       if (!is) throw new MockError('not_found', `issue ${p.key} not found`);
       maybeFail(ERROR_RATE / 2, 'network', 'WinHTTP 12029: cannot connect');
-      return (FLOW[statusKey(is.status)] || []).map(([id, name, to]) => ({ id, name, to: clone(ST[to]) }));
+      return flowOf(is).map(([id, name, to]) => ({ id, name, to: clone(ST[to]) }));
     },
     transition(p) {
       requireConfigured();
       const is = rec(p.key);
       if (!is) throw new MockError('not_found', `issue ${p.key} not found`);
-      const tr = (FLOW[statusKey(is.status)] || []).find(([id]) => id === String(p.transitionId));
+      const tr = flowOf(is).find(([id]) => id === String(p.transitionId));
       if (!tr) throw new MockError('jira', `Jira 400: transition ${p.transitionId} is not valid for ${p.key}`);
       maybeFail(ERROR_RATE * 1.8, 'jira', 'Jira 400: Field "Resolution" is required by the workflow validator');
       is.changelog.unshift({ id: String(commentSeq++), author: ME, created: rfc(now()), items: [{ field: 'status', from: is.status.name, to: ST[tr[2]].name }] });
@@ -654,10 +793,10 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       setTimeout(() => emit('board', {}), 30);
       return clone(getProjectsList());
     },
-    getAgileBoards() {
+    getAgileBoards() { // not used by the v0.3 UI; kept as in the contract
       requireConfigured();
       if (flags.has('noagile')) return [];
-      return clone(AGILE.filter((b) => isTracked(b.projectKey + '-1')));
+      return clone(AGILE.filter((b) => b.projects.some((k) => isTracked(k + '-1'))).map(agileShape));
     },
     getSprints(p) { // p.force is accepted (the Go side caches sprints for 10 minutes)
       requireConfigured();
@@ -668,23 +807,20 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       const closed = list.filter((s) => s.state === 'closed').reverse().slice(0, 5);
       return clone([...list.filter((s) => s.state === 'active'), ...list.filter((s) => s.state === 'future'), ...closed]);
     },
-    getSprint(p) {
+    getSprintGroups(p) {
       requireConfigured();
-      const sp = SPRINTS.find((s) => String(s.id) === String(p && p.sprintId));
-      if (!sp) throw new MockError('not_found', 'sprint not found');
       maybeFail(ERROR_RATE / 2, 'network', 'WinHTTP 12002: the operation timed out');
-      let list = all().filter((r) => r.sprints.includes(sp.id));
-      if (scopeOf(p, 'all') === 'mine') list = list.filter(mine);
-      const pts = list.reduce((a, r) => { const v = Number(r.storyPoints) || 0; a.total += v; if (isDone(r)) a.done += v; return a; }, { done: 0, total: 0 });
-      return clone({ sprint: sp, columns: columnsOf(list, true), progress: progressOf(list), storyPoints: pts, truncated: false });
+      if (tracked === null) initTracked();
+      return sprintGroups(p || {});
     },
     getEpics(p) {
       requireConfigured();
       maybeFail(ERROR_RATE / 2, 'network', 'WinHTTP 12002: the operation timed out');
       const scope = scopeOf(p, 'all');
-      const epics = all().filter((r) => r.type.kind === 'epic' && isTracked(r.key) && (p.includeDone || !isDone(r))).sort(treeSort)
+      const inProject = projectFilter(p);
+      const epics = all().filter((r) => r.type.kind === 'epic' && inProject(r) && (p.includeDone || !isDone(r))).sort(treeSort)
         .map(epicNode).filter((n) => keepScope(n, scope)).map(strip);
-      const orphanStories = all().filter((r) => r.type.kind === 'story' && !r.epic && isTracked(r.key) && (p.includeDone || !isDone(r))).sort(treeSort)
+      const orphanStories = all().filter((r) => r.type.kind === 'story' && !r.epic && inProject(r) && (p.includeDone || !isDone(r))).sort(treeSort)
         .map(storyNode).filter((n) => keepScope(n, scope)).map(strip);
       return clone({ epics, orphanStories, fetchedAt: rfc(now()), truncated: flags.has('truncated') });
     },
@@ -692,7 +828,8 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       requireConfigured();
       maybeFail(ERROR_RATE / 2, 'network', 'WinHTTP 12002: the operation timed out');
       const scope = scopeOf(p, 'all');
-      const stories = all().filter((r) => r.type.kind === 'story' && isTracked(r.key) && (p.includeDone || !isDone(r))).sort(treeSort)
+      const inProject = projectFilter(p);
+      const stories = all().filter((r) => r.type.kind === 'story' && inProject(r) && (p.includeDone || !isDone(r))).sort(treeSort)
         .map(storyNode).filter((n) => keepScope(n, scope)).map(strip);
       return clone({ stories, fetchedAt: rfc(now()), truncated: flags.has('truncated') });
     },
@@ -787,5 +924,5 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     emit('state', state());
   }, flags.has('fast') ? 10000 : 45000);
 
-  console.info('[jiraffe mock] fake backend installed. Flags: ?mock=unconfigured,empty,errors,noerrors,slow,fast,warnings,noagile,truncated,untracked,limit,noprefs'); // eslint-disable-line no-console
+  console.info('[jiraffe mock] fake backend installed. Flags: ?mock=unconfigured,empty,errors,noerrors,slow,fast,warnings,noagile,truncated,untracked,limit,noprefs,closedfail'); // eslint-disable-line no-console
 })();

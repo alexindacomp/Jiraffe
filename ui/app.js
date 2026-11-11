@@ -183,30 +183,30 @@
 
     q: { board: '', sprints: '', epics: '', projects: '' }, // search box text per view
 
-    board: null,             // { columns: [{status, issues, synthetic?}], fetchedAt, scope, truncated, hidden }
+    project: '',             // shared project filter of Board / Sprints / Epics (uiPrefs.project; "" = all tracked)
+
+    board: null,             // { key, project, columns: [Column], layout, fetchedAt, scope, truncated, hidden }
+    boardReq: null,          // boardKey of the request in flight
     hiddenDismissed: null,   // projects signature of the "issues in untracked projects" banner closed this session
     boardScope: 'mine',      // preferences are applied in applyPrefs() once loaded
-    boardCache: {},          // the other scope's board, kept while switching "Only mine"
+    boardCache: {},          // boards of other scope / project / board choices (by boardKey), kept while switching
     boardLoading: false,
     boardError: null,
     boardSeq: 0,
     boardStale: false,
     boardAnimate: false,
     renderDeferred: new Set(), // kanbans whose re-render waits for the drag to end
-    filter: { projects: new Set() },
     pendingKeys: new Set(),  // issues with a transition in flight
     transCache: new Map(),   // key -> Promise<[Transition]>
     drag: null,              // { key, from, kb, blockedOver }
     drawer: null,            // { stack: [{key, seed}], detail, loading, error, tab, seq }
 
-    sp: { boards: null, boardsLoading: false, boardsError: null, boardsSeq: 0, boardsStale: false,
-          boardId: null,
-          sprints: null, sprintsLoading: false, sprintsError: null, sprintsSeq: 0,
-          sprintId: null, data: null, dataLoading: false, dataError: null, dataSeq: 0, dataStale: false,
-          mine: false, animate: false },
+    // data = { key, available, groups: [Group], backlog: Group|null, truncated }; Group = SprintGroup + { id }
+    sp: { data: null, loading: false, error: null, seq: 0, reqKey: null, stale: false, cache: new Map(), cacheGen: 0,
+          mine: false, closed: false, expanded: {}, overrides: new Map(), opening: null, animate: false },
 
     ep: { mode: 'epics', includeDone: false, mine: false,
-          cache: new Map(), cacheGen: 0, data: null, loading: false, error: null, seq: 0, stale: false,
+          cache: new Map(), cacheGen: 0, data: null, loading: false, error: null, seq: 0, reqKey: null, stale: false,
           expanded: new Set(), overrides: new Map(), opening: null, focusNode: null },
 
     pj: { list: null, loading: false, error: null, seq: 0, busy: new Set(), bulk: false, restoreFocus: null },
@@ -228,8 +228,12 @@
   /** Remembered UI choices. Defaults: "Only mine" on for the board, off for sprints and epics. */
   function applyPrefs() {
     S.boardScope = prefs.get('board.mine', true) === false ? 'all' : 'mine';
-    S.sp.boardId = prefs.get('sprint.board', null);
+    const project = prefs.get('project', '');
+    S.project = typeof project === 'string' ? project : '';
     S.sp.mine = prefs.get('sprint.mine', false) === true;
+    S.sp.closed = prefs.get('sprints.closed', false) === true;
+    const spExp = prefs.get('sprints.expanded', {});
+    S.sp.expanded = spExp && typeof spExp === 'object' && !Array.isArray(spExp) ? Object.assign({}, spExp) : {};
     S.ep.mode = prefs.get('epics.mode', 'epics') === 'stories' ? 'stories' : 'epics';
     S.ep.includeDone = prefs.get('epics.done', false) === true;
     S.ep.mine = prefs.get('epics.mine', false) === true;
@@ -365,7 +369,7 @@
   function statusButton(issue) {
     const pend = S.pendingKeys.has(issue.key);
     const name = nameOf(issue.status);
-    return html`<button type="button" class="status-btn" data-cat="${catOf(issue.status)}" data-status-menu="${issue.key}" data-role="status" aria-haspopup="menu" aria-expanded="false" aria-label="${t('status.change', { status: name })}" title="${t('status.changeTitle')}" ${pend ? html`disabled` : ''}><span class="status-btn-text">${name}</span>${pend ? html`<span class="spinner spinner-xs" aria-hidden="true"></span>` : icon('chevron-down', 'icon-xs')}</button>`;
+    return html`<button type="button" class="status-btn" data-cat="${catOf(issue.status)}" data-status-menu="${issue.key}" data-role="status" aria-haspopup="menu" aria-expanded="false" aria-label="${t('status.change', { status: name })}" title="${name} — ${t('status.changeTitle')}" ${pend ? html`disabled` : ''}><span class="status-btn-text">${name}</span>${pend ? html`<span class="spinner spinner-xs" aria-hidden="true"></span>` : icon('chevron-down', 'icon-xs')}</button>`;
   }
 
   /* Issue kinds (SPEC v0.2: type.kind; names are localized, so fall back to a name match). */
@@ -466,6 +470,8 @@
   // Views with the top-bar search (placeholder / label keys) and with the "Only mine" switch.
   const SEARCH_VIEWS = { board: 'board', sprints: 'board', epics: 'epics', projects: 'projects' };
   const MINE_VIEWS = ['board', 'sprints', 'epics'];
+  // Views sharing the single-select project filter (SPEC v0.3).
+  const PROJECT_VIEWS = MINE_VIEWS;
 
   function showView(name) {
     if (!VIEWS.includes(name)) name = 'board';
@@ -476,7 +482,7 @@
 
   const mineFor = (view) => (view === 'board' ? S.boardScope === 'mine' : view === 'sprints' ? S.sp.mine : view === 'epics' ? S.ep.mine : false);
 
-  /** Top-bar tools of the current view: search (text kept per view), "Only mine", project chips (board). */
+  /** Top-bar tools of the current view: search (text kept per view), "Only mine", project chips, board picker. */
   function renderTools(sectionId) {
     const v = sectionId === 'view-' + S.view ? S.view : null;
     const tools = $('#view-tools');
@@ -489,7 +495,8 @@
     if (search.value !== S.q[v]) search.value = S.q[v];
     $('#mine-wrap').hidden = !MINE_VIEWS.includes(v);
     $('#mine-toggle').checked = mineFor(v);
-    if (v !== 'board') $('#project-chips').hidden = true;
+    renderChips();
+    renderBoardBar();
   }
 
   function setMine(view, on) {
@@ -497,7 +504,7 @@
     else if (view === 'sprints') {
       S.sp.mine = on;
       prefs.set('sprint.mine', on);
-      if (S.sp.sprintId != null) loadSprint();
+      enterSprints();
     } else if (view === 'epics') setEpicsOption({ mine: on });
   }
 
@@ -506,7 +513,7 @@
     if (!SEARCH_VIEWS[v]) return;
     S.q[v] = value;
     if (v === 'board') renderBoard();
-    else if (v === 'sprints') renderSprintBoard();
+    else if (v === 'sprints') { S.sp.overrides.clear(); renderSprints(); }
     else if (v === 'epics') { S.ep.overrides.clear(); renderEpics(); }
     else if (v === 'projects') renderProjects();
   }
@@ -545,11 +552,13 @@
     renderNav(id);
     updateToastOffset();
     renderRefreshState();
+    // The project chips need the tracked projects; views load with the remembered choice meanwhile.
+    if (enter && id === 'view-' + S.view && PROJECT_VIEWS.includes(S.view) && !S.pj.list && !S.pj.loading) loadProjects(false);
     switch (id) {
       case 'view-status': renderStatus(); break;
       case 'view-onboarding': if (enter) enterOnboarding(); break;
-      case 'view-board': if (enter && (!S.board || S.boardStale)) loadBoard(false); else renderBoard(); break;
-      case 'view-sprints': if (enter) enterSprints(false); else renderSprints(); break;
+      case 'view-board': if (enter) enterBoard(); else renderBoard(); break;
+      case 'view-sprints': if (enter) enterSprints(); else renderSprints(); break;
       case 'view-epics': if (enter) enterEpics(); else renderEpics(); break;
       case 'view-projects': if (enter) loadProjects(false); else renderProjects(); break;
       case 'view-worklog': if (enter) enterWorklog(); else renderWorklog(); break;
@@ -616,7 +625,7 @@
   function viewIsLoading() {
     switch (S.view) {
       case 'board': return S.boardLoading;
-      case 'sprints': return S.sp.boardsLoading || S.sp.sprintsLoading || S.sp.dataLoading;
+      case 'sprints': return S.sp.loading;
       case 'epics': return S.ep.loading;
       case 'projects': return S.pj.loading || S.pj.bulk;
       case 'worklog': return S.wl.previewLoading || S.wl.historyLoading;
@@ -636,8 +645,9 @@
     if (!S.appState) { loadState(); return; }
     if (S.view === 'settings') { if (!formDirty()) enterSettings(true); return; }
     if (!S.appState.configured) { loadState(); return; }
+    if (PROJECT_VIEWS.includes(S.view) && !S.pj.list && !S.pj.loading) loadProjects(false); // chips failed to load earlier
     if (S.view === 'board') loadBoard(true);
-    else if (S.view === 'sprints') loadAgileBoards(true);
+    else if (S.view === 'sprints') enterSprints(true);
     else if (S.view === 'epics') loadEpics({ force: true, silent: !!S.ep.data });
     else if (S.view === 'projects') { if (!S.pj.bulk) loadProjects(true); }
     else if (S.view === 'worklog') {
@@ -678,12 +688,23 @@
   }
 
   /* ================================================================
-   * KANBAN (shared by Board and Sprints): model = { columns: [{ status, issues, synthetic? }] }
+   * KANBAN (Board): model = { project, columns: [Column] }
+   * Column = { id, name, category, statuses: [Status], issues, status, synthetic? } (SPEC v0.3).
+   * Status-mode columns (All projects / workflow fallback) hold one status; agile columns may hold several.
    * ================================================================ */
   function normalizeColumns(data) {
-    return (data && Array.isArray(data.columns) ? data.columns : [])
-      .filter((c) => c && c.status)
-      .map((c) => ({ status: c.status, issues: Array.isArray(c.issues) ? c.issues.slice() : [] }));
+    return (data && Array.isArray(data.columns) ? data.columns : []).filter(Boolean).map((c, i) => {
+      const statuses = (Array.isArray(c.statuses) && c.statuses.length ? c.statuses : [c.status]).filter((s) => s && typeof s === 'object');
+      const status = c.status || statuses[0] || null;
+      return {
+        id: String(c.id != null && c.id !== '' ? c.id : status ? status.id ?? status.name : 'col-' + i),
+        name: c.name != null ? String(c.name) : nameOf(status),
+        category: CAT_ORDER[c.category] != null ? c.category : catOf(status),
+        statuses,
+        status,
+        issues: Array.isArray(c.issues) ? c.issues.slice() : [],
+      };
+    }).filter((c) => c.statuses.length);
   }
   const kbIssues = (model) => (model ? model.columns.flatMap((c) => c.issues) : []);
   function kbFind(model, key) {
@@ -694,16 +715,32 @@
     }
     return null;
   }
-  const kbColumn = (model, status) => model && model.columns.find((c) => sameStatus(c.status, status));
+  const colHas = (col, status) => col.statuses.some((st) => sameStatus(st, status));
+  const kbColumn = (model, status) => model && model.columns.find((c) => colHas(c, status));
+  const colLabel = (col) => col.name || (col.id === 'other' ? t('board.otherStatuses') : nameOf(col.status));
+  /** Category of the "other" column: the statuses' shared category, else "indeterminate" (SPEC v0.3). */
+  function sharedCategory(statuses) {
+    const cats = new Set(statuses.map(catOf));
+    return cats.size === 1 ? [...cats][0] : 'indeterminate';
+  }
+  /** Column holding `status`, created when missing: a project board collects unknown statuses in the trailing
+      "other" column (as the backend does); a status board gets a synthetic column in category order (v0.2). */
   function kbEnsure(model, status) {
     let col = kbColumn(model, status);
     if (col) return col;
-    col = { status, issues: [], synthetic: true };
-    const rank = CAT_ORDER[status.category] ?? 1;
+    if (model.project && !(model.layout && model.layout.source === 'issues')) {
+      col = model.columns.find((c) => c.id === 'other');
+      if (col) { col.statuses.push(status); col.category = sharedCategory(col.statuses); return col; }
+      col = { id: 'other', name: '', category: catOf(status), statuses: [status], status, issues: [], synthetic: true };
+      model.columns.push(col);
+      return col;
+    }
+    col = { id: String(status.id ?? status.name), name: status.name, category: catOf(status), statuses: [status], status, issues: [], synthetic: true };
+    const rank = CAT_ORDER[col.category];
     const cols = model.columns;
     let at = cols.length;
     for (let i = 0; i < cols.length; i++) {
-      if ((CAT_ORDER[cols[i].status.category] ?? 1) > rank) { at = i; break; }
+      if ((CAT_ORDER[cols[i].category] ?? 1) > rank) { at = i; break; }
     }
     cols.splice(at, 0, col);
     return col;
@@ -722,21 +759,17 @@
 
   const KANBAN = {
     board: { model: () => S.board, render: () => renderBoard() },
-    sprint: { model: () => (S.sp.data ? S.sp.data.model : null), render: () => renderSprintBoard() },
   };
   const kanbanOf = (el) => { const root = el && el.closest && el.closest('[data-kanban]'); return root ? root.dataset.kanban : null; };
 
-  /** Text filter for cards: key, summary, epic name, assignee (+ project chips on the board). */
-  function issueMatcher(query, projects) {
+  /** Text filter for cards and sprint rows: key, summary, epic name, assignee. */
+  function issueMatcher(query) {
     const q = String(query || '').trim().toLowerCase();
     return (issue) => {
-      if (q) {
-        const hay = [issue.key, issue.summary, issue.epic && issue.epic.name, issue.assignee && issue.assignee.displayName]
-          .map((x) => String(x || '').toLowerCase());
-        if (!hay.some((h) => h.includes(q))) return false;
-      }
-      if (projects && projects.size && !projects.has(projectOf(issue))) return false;
-      return true;
+      if (!q) return true;
+      const hay = [issue.key, issue.summary, issue.epic && issue.epic.name, issue.assignee && issue.assignee.displayName]
+        .map((x) => String(x || '').toLowerCase());
+      return hay.some((h) => h.includes(q));
     };
   }
 
@@ -763,10 +796,18 @@
     const cols = model.columns.map((col) => {
       const issues = col.issues.filter(filter);
       visible += issues.length;
-      const sid = String(col.status.id ?? col.status.name);
-      const hid = opts.prefix + '-h-' + sid.replace(/[^\w-]/g, '_');
-      return html`<section class="col" data-cat="${catOf(col.status)}" data-status="${sid}" aria-labelledby="${hid}">
-        <header class="col-head"><h2 class="col-title" id="${hid}">${col.status.name}</h2><span class="col-count" aria-label="${t('board.count', { n: issues.length })}">${issues.length}</span></header>
+      const hid = opts.prefix + '-h-' + col.id.replace(/[^\w-]/g, '_');
+      const label = colLabel(col);
+      // Project boards: one muted line under every header (empty when there is nothing to say, so cards line up):
+      // done columns say how far back they go, multi-status and "other" columns list their statuses (also as tooltip).
+      const statuses = col.statuses.length > 1 || col.id === 'other' ? t('board.colStatuses', { list: col.statuses.map(nameOf).join(', ') }) : '';
+      const doneHint = model.project && col.category === 'done' ? t('board.doneRecent') : '';
+      const sub = model.project
+        ? html`<p class="col-sub"${statuses ? html` title="${[doneHint, statuses].filter(Boolean).join(' · ')}"` : ''}>${doneHint || statuses}${doneHint && statuses ? html`<span class="sr-only"> · ${statuses}</span>` : ''}</p>`
+        : '';
+      return html`<section class="col${col.id === 'other' ? ' col-other' : ''}" data-cat="${col.category}" data-col="${col.id}" aria-labelledby="${hid}">
+        <header class="col-head"><h2 class="col-title" id="${hid}" title="${label}">${label}</h2><span class="col-count" aria-label="${t('board.count', { n: issues.length })}">${issues.length}</span></header>
+        ${sub}
         <p class="col-hint">${t('board.noTransitionHint')}</p>
         <div class="col-list">${issues.length ? issues.map((is, i) => cardHTML(is, i, opts)) : html`<p class="col-empty">${t('board.columnEmpty')}</p>`}</div>
       </section>`;
@@ -783,14 +824,14 @@
   function preserveKanban(root, fn) {
     const prevCols = $('.columns', root);
     const scrollX = prevCols ? prevCols.scrollLeft : 0;
-    const scrollY = new Map($$('.col', root).map((c) => [c.dataset.status, $('.col-list', c).scrollTop]));
+    const scrollY = new Map($$('.col', root).map((c) => [c.dataset.col, $('.col-list', c).scrollTop]));
     const a = document.activeElement;
     const card = a && root.contains(a) && a.closest('.card');
     const focus = card ? { key: card.dataset.key, role: a.dataset.role } : null;
     fn();
     const cols = $('.columns', root);
     if (cols) cols.scrollLeft = scrollX;
-    $$('.col', root).forEach((c) => { const y = scrollY.get(c.dataset.status); if (y) $('.col-list', c).scrollTop = y; });
+    $$('.col', root).forEach((c) => { const y = scrollY.get(c.dataset.col); if (y) $('.col-list', c).scrollTop = y; });
     if (focus) {
       const el = root.querySelector(`.card[data-key="${CSS.escape(focus.key)}"]`);
       const target = el && ((focus.role && el.querySelector(`[data-role="${focus.role}"]:not(:disabled)`)) || el.querySelector('[data-role="open"]'));
@@ -804,12 +845,147 @@
   }
 
   /* ================================================================
-   * BOARD
+   * PROJECT FILTER (Board, Sprints, Epics & stories; SPEC v0.3): one shared single-select chip row,
+   * "All projects" + the tracked projects. Persisted as uiPrefs.project ("" = all tracked projects).
    * ================================================================ */
-  function normalizeBoard(data, scope) {
+  /** Tracked, available project keys (sorted) once getProjects has answered; null before that. */
+  function trackedKeys() {
+    if (!S.pj.list) return null;
+    return S.pj.list.filter((p) => p.tracked && p.available !== false).map((p) => String(p.key)).sort((a, b) => a.localeCompare(b));
+  }
+  /** The project the views show: the chosen chip, or the only tracked project; "" = all tracked projects. */
+  function effProject() {
+    const keys = trackedKeys();
+    if (!keys) return S.project; // not loaded (yet, or failed): the remembered choice
+    if (keys.length === 1) return keys[0];
+    return keys.includes(S.project) ? S.project : '';
+  }
+  const projectName = (key) => { const p = (S.pj.list || []).find((x) => x.key === key); return p && p.name && p.name !== key ? p.name : ''; };
+
+  /** Chip row (role=radiogroup, roving tabindex); hidden with fewer than two tracked projects. When the chips
+      (plus the board picker) do not fit, they are swapped for a compact "Project: KEY ▾" menu (DR-20). */
+  function renderChips() {
+    const box = $('#project-chips');
+    const v = S.view;
+    const keys = PROJECT_VIEWS.includes(v) && activeSectionId() === 'view-' + v ? trackedKeys() || [] : [];
+    const hadFocus = box.contains(document.activeElement);
+    box.hidden = keys.length < 2;
+    if (box.hidden) box.textContent = '';
+    else {
+      const cur = effProject();
+      setHTML(box, html`${['', ...keys].map((k) => {
+        const on = k === cur;
+        const name = k ? projectName(k) : '';
+        return html`<button type="button" role="radio" class="chip-btn" data-project="${k}" aria-checked="${on ? 'true' : 'false'}" tabindex="${on ? '0' : '-1'}"${name ? html` title="${name}"` : ''}>${k || t('projectFilter.all')}</button>`;
+      })}`);
+      setHTML($('#project-menu-btn'), html`<span class="picker-label">${t('projectFilter.label')}</span><span class="picker-value">${cur || t('projectFilter.all')}</span>${icon('chevron-down', 'icon-xs')}`);
+    }
+    syncProjectFilter();
+    if (hadFocus) {
+      const target = $('#project-filter').classList.contains('is-compact') ? $('#project-menu-btn') : box.querySelector('[aria-checked="true"]');
+      if (target) target.focus({ preventScroll: true });
+    }
+  }
+
+  /** Chips, or the compact menu when they do not fit. The container's width does not depend on its content
+      (flex: 1 1 0), so this cannot oscillate; re-run on resize (ResizeObserver). */
+  function syncProjectFilter() {
+    const wrap = $('#project-filter');
+    const box = $('#project-chips');
+    const btn = $('#project-menu-btn');
+    if (box.hidden) { wrap.classList.remove('is-compact'); btn.hidden = true; return; }
+    const compact = box.scrollWidth > wrap.clientWidth + 1;
+    const focusChip = compact && box.contains(document.activeElement); // the chips are about to disappear
+    const focusBtn = !compact && btn === document.activeElement;
+    if (!compact && btn.getAttribute('aria-expanded') === 'true') menu.close(false);
+    wrap.classList.toggle('is-compact', compact);
+    btn.hidden = !compact;
+    if (focusChip) btn.focus({ preventScroll: true });
+    if (focusBtn) { const c = box.querySelector('[aria-checked="true"]'); if (c) c.focus({ preventScroll: true }); }
+  }
+
+  function openProjectMenu(btn) {
+    const keys = trackedKeys() || [];
+    const cur = effProject();
+    menu.open(btn, {
+      label: t('projectFilter.label'),
+      radio: true,
+      items: ['', ...keys],
+      isSelected: (k) => k === cur,
+      item: (k) => html`<span class="mi-main"><span class="mi-title">${k || t('projectFilter.all')}</span>${k && projectName(k) ? html`<span class="mi-sub">${projectName(k)}</span>` : ''}</span>`,
+      onPick: (k) => setProject(k),
+      anchorSel: '#project-menu-btn',
+    });
+  }
+
+  function setProject(key) {
+    key = String(key || '');
+    if (key === S.project && key === effProject()) return;
+    S.project = key;
+    prefs.set('project', key);
+    menu.close(false);
+    renderChips();
+    if (S.view === 'board') switchBoard();
+    else if (S.view === 'sprints') { S.sp.overrides.clear(); enterSprints(); }
+    else if (S.view === 'epics') { S.ep.overrides.clear(); enterEpics(); }
+  }
+
+  /** `project_unavailable` for the explicitly selected project (deleted, access lost): fall back to "All projects".
+      Returns true when the caller should reload its view. */
+  function dropBadProject(e, project) {
+    if (!e || e.code !== 'project_unavailable' || !project || S.project !== project) return false;
+    S.project = '';
+    prefs.set('project', '');
+    toast(t('projectFilter.unavailable', { key: project }), { tone: 'warn' });
+    renderChips();
+    return true;
+  }
+
+  function onChipsKey(e) {
+    const b = e.target.closest && e.target.closest('[data-project]');
+    if (!b || e.ctrlKey || e.metaKey || e.altKey || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    const chips = $$('#project-chips [data-project]');
+    const n = chips.length;
+    const i = chips.indexOf(b);
+    const next = e.key === 'Home' ? 0 : e.key === 'End' ? n - 1 : (i + (e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1) + n) % n;
+    setProject(chips[next].dataset.project); // re-renders the chips and focuses the checked one
+  }
+
+  /** Tracked projects arrived or changed: drop a choice that is no longer tracked, re-render the chips and
+      reload the current view if what it shows (or is loading) belongs to another project. */
+  function onProjectsChanged() {
+    const keys = trackedKeys();
+    if (keys && S.project && keys.length > 1 && !keys.includes(S.project)) { S.project = ''; prefs.set('project', ''); }
+    if (!PROJECT_VIEWS.includes(S.view) || activeSectionId() !== 'view-' + S.view) return;
+    renderChips();
+    if (S.view === 'board') {
+      const shown = S.boardLoading ? S.boardReq : S.board && S.board.key;
+      if (shown !== boardKey()) switchBoard(); else renderBoard();
+    } else if (S.view === 'sprints') {
+      const shown = S.sp.loading ? S.sp.reqKey : S.sp.data && S.sp.data.key;
+      if (shown !== spKey()) enterSprints(); else renderSprints();
+    } else if (S.view === 'epics') {
+      const shown = S.ep.loading ? S.ep.reqKey : S.ep.data && S.ep.data.key;
+      if (shown !== epCacheKey()) enterEpics(); else renderEpics();
+    }
+  }
+
+  /* ================================================================
+   * BOARD: "All projects" = v0.2 status columns; a project = all columns of its agile board (or workflow)
+   * ================================================================ */
+  const boardChoices = () => { const v = prefs.get('boardByProject', {}); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; };
+  const boardIdFor = (project) => (project && boardChoices()[project] != null ? boardChoices()[project] : null);
+  /** Identifies what the board shows: scope, project and the board chosen for it. */
+  const boardKey = () => { const p = effProject(); const b = boardIdFor(p); return `${S.boardScope}|${p}|${b == null ? '' : b}`; };
+  const boardLayouts = {}; // project -> last layout, so the board picker stays put while another board loads
+
+  function normalizeBoard(data, scope, key, project) {
     const h = data && data.hidden;
     const hidden = h && Number(h.count) > 0 ? { count: Number(h.count), projects: Array.isArray(h.projects) ? h.projects.map(String) : [] } : null;
-    return { columns: normalizeColumns(data), fetchedAt: data && data.fetchedAt, scope: (data && data.scope) || scope, truncated: !!(data && data.truncated), hidden };
+    const l = project && data && data.layout && typeof data.layout === 'object' ? data.layout : null;
+    const layout = l ? { source: l.source || 'agile', boardId: l.boardId, boardName: l.boardName || '', boards: Array.isArray(l.boards) ? l.boards.filter((b) => b && b.id != null) : [] } : null;
+    return { key, project, layout, columns: normalizeColumns(data), fetchedAt: data && data.fetchedAt, scope: (data && data.scope) || scope, truncated: !!(data && data.truncated), hidden };
   }
 
   /** ORCH-1: "my" issues filtered out because their project is not tracked (mine scope only); closable for the session. */
@@ -825,11 +1001,40 @@
     // DR-19: text and link share one inline box so the link flows after the text when it wraps.
     return html`<div class="notice notice-hidden" role="note">${icon('info')}<span class="notice-text">${t('board.hiddenIssues', { n: h.count })} ${where} <button type="button" class="link-btn" data-action="go-projects">${t('board.hiddenConfigure')}</button></span><button type="button" class="icon-btn icon-btn-sm" data-action="hidden-dismiss" aria-label="${t('board.hiddenDismiss')}" title="${t('board.hiddenDismiss')}">${icon('x')}</button></div>`;
   }
+  /** "All projects": tell once (dismissible, remembered) that a project shows all its columns. */
+  function projectHint() {
+    const keys = trackedKeys();
+    if (!S.board || S.board.project || !keys || keys.length < 2 || prefs.get('board.projectHintOff', false) === true) return '';
+    return html`<div class="notice notice-hidden notice-tip" role="note">${icon('info')}<span class="notice-text">${t('board.projectHint')}</span><button type="button" class="icon-btn icon-btn-sm" data-action="project-hint-dismiss" aria-label="${t('board.hiddenDismiss')}" title="${t('board.hiddenDismiss')}">${icon('x')}</button></div>`;
+  }
+
+  function enterBoard() {
+    if (S.board && S.board.key !== boardKey()) { switchBoard(); return; }
+    if (!S.board || S.boardStale) loadBoard(false); else renderBoard();
+  }
+
+  /** Scope, project or board choice changed: show the cached board for the new choice (if any) and refetch. */
+  function switchBoard() {
+    if (S.drag) return;
+    const key = boardKey();
+    if (!S.board || S.board.key !== key) {
+      if (S.board) S.boardCache[S.board.key] = S.board;
+      S.board = S.boardCache[key] || null;
+      delete S.boardCache[key];
+      S.boardError = null;
+    }
+    renderView(false);
+    loadBoard(false);
+  }
 
   async function loadBoard(force) {
     if (S.drag || S.pendingKeys.size) { S.boardStale = true; return; }
     const seq = ++S.boardSeq;
     const scope = S.boardScope;
+    const project = effProject();
+    const boardId = boardIdFor(project);
+    const key = boardKey();
+    S.boardReq = key;
     S.boardLoading = true;
     S.boardStale = false;
     if (!S.board) S.boardError = null;
@@ -837,16 +1042,29 @@
     renderRefreshState();
     try {
       const params = { scope };
+      if (project) params.project = project;
+      if (project && boardId != null) params.boardId = boardId;
       if (force) params.force = true;
       const data = await api('getBoard', params);
       if (seq !== S.boardSeq) return;
       if (S.pendingKeys.size || S.drag) { S.boardStale = true; return; } // a move started meanwhile; refetch after it
-      S.board = normalizeBoard(data, scope);
+      S.board = normalizeBoard(data, scope, key, project);
+      const l = S.board.layout;
+      // FE-CR-6: an empty list may be a temporary Agile API outage, so only a non-empty list proves the board is gone.
+      if (l && boardId != null && l.boards.length > 0 && !l.boards.some((b) => String(b.id) === String(boardId))) {
+        // FE-CR-4: the remembered board is gone; the backend chose the default. Forget it and keep the key in step.
+        const choices = Object.assign({}, boardChoices());
+        delete choices[project];
+        prefs.set('boardByProject', choices);
+        S.board.key = boardKey();
+      }
+      if (project && S.board.layout) boardLayouts[project] = S.board.layout;
       S.boardError = null;
       S.boardAnimate = true;
       S.transCache.clear();
     } catch (e) {
       if (seq !== S.boardSeq) return;
+      if (dropBadProject(e, project)) { S.boardLoading = false; if (S.view === 'board') switchBoard(); return; }
       S.boardError = e;
       if (S.board) toastError(t('board.refreshFailed'), e);
     } finally {
@@ -861,49 +1079,70 @@
 
   function setBoardScope(scope) {
     if (scope === S.boardScope || S.drag) return;
-    if (S.board) S.boardCache[S.boardScope] = S.board;
     S.boardScope = scope;
     prefs.set('board.mine', scope === 'mine');
-    S.board = S.boardCache[scope] || null;
-    delete S.boardCache[scope];
-    S.boardError = null;
-    renderView(false);
-    loadBoard(false);
+    switchBoard();
   }
 
   function afterBoardMutation() {
     if (S.boardStale && !S.drag && !S.pendingKeys.size && S.view === 'board') loadBoard(false);
   }
 
-  function renderChips() {
-    const box = $('#project-chips');
-    if (S.view !== 'board') { box.hidden = true; return; }
-    const counts = new Map();
-    kbIssues(S.board).forEach((i) => { const p = projectOf(i); if (p) counts.set(p, (counts.get(p) || 0) + 1); });
-    for (const p of [...S.filter.projects]) if (!counts.has(p)) S.filter.projects.delete(p);
-    const projects = [...counts.keys()].sort((a, b) => a.localeCompare(b));
-    box.hidden = projects.length < 2;
-    if (box.hidden) { box.textContent = ''; return; }
-    const focused = document.activeElement && box.contains(document.activeElement) ? document.activeElement.dataset.project : null;
-    const none = S.filter.projects.size === 0;
-    setHTML(box, html`<button type="button" class="chip-btn" data-project="" aria-pressed="${none ? 'true' : 'false'}">${t('board.allProjects')}</button>${projects.map((p) => html`<button type="button" class="chip-btn" data-project="${p}" aria-pressed="${S.filter.projects.has(p) ? 'true' : 'false'}">${p}<span class="chip-count">${counts.get(p)}</span></button>`)}`);
-    if (focused != null) { const b = box.querySelector(`[data-project="${CSS.escape(focused)}"]`); if (b) b.focus(); }
-    updateChipsFade();
+  /* Board bar under the top bar (static, so focus survives board re-renders): the board picker ("Board: CMA dev
+     board ▾") whenever the project has several agile boards, and the note on workflow / issue-status columns. */
+  const boardLayout = (project) => (S.board && S.board.project === project && S.board.layout) || boardLayouts[project] || null;
+  function currentBoardId(project, l) {
+    const b = boardIdFor(project);
+    return b != null && l && l.boards.some((x) => String(x.id) === String(b)) ? b : l && l.boardId;
   }
-
-  /** DR-7/DR-15: fade the chip row's right / left edge while chips are scrolled out of view on that side. */
-  function updateChipsFade() {
-    const box = $('#project-chips');
-    const more = !box.hidden && box.scrollLeft + box.clientWidth < box.scrollWidth - 1;
-    box.classList.toggle('is-overflowing', more);
-    box.classList.toggle('is-scrolled-start', !box.hidden && box.scrollLeft > 1);
+  function renderBoardBar() {
+    const bar = $('#board-bar');
+    const btn = $('#board-picker');
+    const note = $('#board-note');
+    const project = S.view === 'board' && activeSectionId() === 'view-board' ? effProject() : '';
+    const l = project ? boardLayout(project) : null;
+    const boards = l ? l.boards : []; // also when the chosen board fell back to workflow columns
+    btn.hidden = boards.length < 2;
+    if (btn.hidden) btn.textContent = '';
+    else {
+      const id = currentBoardId(project, l);
+      const cur = boards.find((b) => String(b.id) === String(id));
+      const name = cur ? cur.name : l.boardName || '—';
+      setHTML(btn, html`<span class="picker-label">${t('board.pickerLabel')}</span><span class="picker-value">${name}</span>${icon('chevron-down', 'icon-xs')}`);
+      btn.title = name;
+    }
+    const source = l && l.source;
+    note.hidden = source !== 'workflow' && source !== 'issues';
+    if (note.hidden) note.textContent = '';
+    else setHTML(note, html`${icon('info', 'icon-sm')}<span>${t(source === 'workflow' ? 'board.layoutWorkflow' : 'board.layoutIssues')}</span>`);
+    bar.hidden = btn.hidden && note.hidden;
+    menu.sync();
+  }
+  function openBoardPicker(btn) {
+    const project = effProject();
+    const l = boardLayout(project);
+    if (!project || !l) return;
+    const id = currentBoardId(project, l);
+    menu.open(btn, {
+      label: t('board.pickerLabel'),
+      radio: true,
+      items: l.boards,
+      isSelected: (b) => String(b.id) === String(id),
+      item: (b) => html`<span class="mi-main"><span class="mi-title">${b.name}</span>${b.projectKey && b.projectKey !== project ? html`<span class="mi-sub">${t('board.ownerProject', { key: b.projectKey })}</span>` : ''}</span><span class="state-badge" data-state="${b.type}">${t('board.type.' + (b.type === 'kanban' ? 'kanban' : 'scrum'))}</span>`,
+      onPick: (b) => {
+        if (String(b.id) === String(id) || S.drag) return;
+        prefs.set('boardByProject', Object.assign({}, boardChoices(), { [project]: b.id }));
+        switchBoard();
+      },
+      anchorSel: '#board-picker',
+    });
   }
 
   function renderBoard() {
     if (S.view !== 'board' || activeSectionId() !== 'view-board') return;
     if (S.drag) { S.renderDeferred.add('board'); return; }
     const root = $('#board');
-    renderChips();
+    renderBoardBar();
     if (!S.board) {
       if (S.boardError && !S.boardLoading) {
         setHTML(root, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('board.errorTitle'),
@@ -914,134 +1153,103 @@
     }
     const all = S.boardScope === 'all';
     const total = kbIssues(S.board).length;
-    if (!total) {
-      setHTML(root, all
-        ? stateBlock({ iconName: 'folder', fill: true, title: t('board.emptyAllTitle'), text: t('board.emptyAllText'), action: { id: 'go-projects', label: t('board.goProjects') } })
-        : S.board.hidden // DR-18: not "all done" — my issues exist but are filtered out by the tracked projects
-          ? html`${hiddenBanner()}${stateBlock({ iconName: 'folder', fill: true, title: t('board.emptyHiddenTitle'), text: t('board.emptyTextHidden'), action: { id: 'go-projects', label: t('board.hiddenConfigure') } })}`
-          : stateBlock({ iconName: 'check-circle', tone: 'good', fill: true, title: t('board.emptyTitle'), text: t('board.emptyText') }));
+    // A project board shows its columns even when they are all empty.
+    if (!total && !(S.board.project && S.board.columns.length)) {
+      setHTML(root, S.board.project
+        ? stateBlock({ iconName: 'board', fill: true, title: all ? t('board.emptyAllTitle') : t('board.emptyTitle') })
+        : all
+          ? html`${projectHint()}${stateBlock({ iconName: 'folder', fill: true, title: t('board.emptyAllTitle'), text: t('board.emptyAllText'), action: { id: 'go-projects', label: t('board.goProjects') } })}`
+          : S.board.hidden // DR-18: not "all done" — my issues exist but are filtered out by the tracked projects
+            ? html`${hiddenBanner()}${stateBlock({ iconName: 'folder', fill: true, title: t('board.emptyHiddenTitle'), text: t('board.emptyTextHidden'), action: { id: 'go-projects', label: t('board.hiddenConfigure') } })}`
+            : html`${projectHint()}${stateBlock({ iconName: 'check-circle', tone: 'good', fill: true, title: t('board.emptyTitle'), text: t('board.emptyText') })}`);
       menu.sync();
       return;
     }
     preserveKanban(root, () => {
       const animate = S.boardAnimate;
       S.boardAnimate = false;
-      const { cols, visible } = columnsHTML(S.board, issueMatcher(S.q.board, S.filter.projects), { prefix: 'b', showAssignee: all, highlightMine: all, animate });
+      const { cols, visible } = columnsHTML(S.board, issueMatcher(S.q.board), { prefix: 'b', showAssignee: all, highlightMine: all, animate });
       const trunc = S.board.truncated ? html`<div class="notice" role="note">${icon('info')}<span>${t('board.truncated', { n: total })}</span></div>` : '';
-      setHTML(root, html`${hiddenBanner()}${trunc}${visible === 0 ? filterBanner() : ''}<div class="columns${animate ? ' is-entering' : ''}">${cols}</div>`);
+      setHTML(root, html`${hiddenBanner()}${projectHint()}${trunc}${visible === 0 && total ? filterBanner() : ''}<div class="columns${S.board.project ? ' is-project' : ''}${animate ? ' is-entering' : ''}">${cols}</div>`);
     });
   }
 
   /* ================================================================
-   * SPRINTS
+   * SPRINTS (SPEC v0.3): Jira-backlog-like list. One collapsible section per sprint (active, future and,
+   * optionally, the last closed ones), then the Backlog. Rows: dense issue lines with the status dropdown.
+   * getSprintGroups { project, scope, includeClosed, force } → { groups, backlog, truncated, available }.
    * ================================================================ */
-  const sprintById = (id) => (S.sp.sprints || []).find((s) => String(s.id) === String(id)) || null;
-  const boardById = (id) => (S.sp.boards || []).find((b) => String(b.id) === String(id)) || null;
-
-  async function enterSprints(force) {
-    renderSprints();
-    if (force || !S.sp.boards || S.sp.boardsStale) await loadAgileBoards(force);
-    else if (S.sp.dataStale && S.sp.sprintId != null) loadSprint({ silent: true });
+  const spKey = () => `${effProject()}|${S.sp.mine ? 'mine' : 'all'}|${S.sp.closed ? 1 : 0}`;
+  /** Drops cached sprint lists; answers already in flight are not cached afterwards (as invalidateEpics). */
+  function invalidateSprints() {
+    S.sp.cache.clear();
+    S.sp.cacheGen++;
   }
 
-  async function loadAgileBoards(force) {
-    const seq = ++S.sp.boardsSeq;
-    S.sp.boardsLoading = true;
-    S.sp.boardsStale = false;
-    renderSprints(); renderRefreshState();
-    try {
-      const list = await api('getAgileBoards', force ? { force: true } : {});
-      if (seq !== S.sp.boardsSeq) return;
-      S.sp.boards = Array.isArray(list) ? list : [];
-      S.sp.boardsError = null;
-    } catch (e) {
-      if (seq !== S.sp.boardsSeq) return;
-      S.sp.boardsError = e;
-      if (S.sp.boards) toastError(t('sprints.boardsFailed'), e);
-    } finally {
-      if (seq === S.sp.boardsSeq) { S.sp.boardsLoading = false; renderRefreshState(); }
-    }
-    if (seq !== S.sp.boardsSeq || !S.sp.boards) { renderSprints(); return; }
-    const remembered = boardById(S.sp.boardId);
-    const pick = remembered || S.sp.boards.find((b) => b.type !== 'kanban') || S.sp.boards[0] || null;
-    await selectBoard(pick ? pick.id : null, { keepSprint: !!remembered, force });
+  function normalizeGroup(g, id) {
+    return { id, sprint: id === 'backlog' ? null : g.sprint, issues: Array.isArray(g.issues) ? g.issues.slice() : [],
+      progress: g.progress || null, storyPoints: g.storyPoints || null, truncated: !!g.truncated };
   }
+  function normalizeSprints(res, key) {
+    const r = res && typeof res === 'object' ? res : {};
+    const groups = (Array.isArray(r.groups) ? r.groups : []).filter((g) => g && g.sprint && g.sprint.id != null).map((g) => normalizeGroup(g, String(g.sprint.id)));
+    const b = r.backlog && Array.isArray(r.backlog.issues) && r.backlog.issues.length ? normalizeGroup(r.backlog, 'backlog') : null;
+    return { key, available: r.available !== false, groups, backlog: b, truncated: !!r.truncated, closedUnavailable: !!r.closedUnavailable, fetchedAt: r.fetchedAt };
+  }
+  const spGroups = (d) => (d ? (d.backlog ? [...d.groups, d.backlog] : d.groups) : []);
+  const spGroup = (id) => spGroups(S.sp.data).find((g) => g.id === id) || null;
 
-  async function selectBoard(id, { keepSprint, force } = {}) {
-    const changed = String(id) !== String(S.sp.boardId);
-    S.sp.boardId = id;
-    if (id != null) prefs.set('sprint.board', id);
-    if (changed || !keepSprint) { S.sp.sprints = null; S.sp.sprintId = null; S.sp.data = null; }
-    const b = boardById(id);
-    if (!b || b.type === 'kanban') {
-      // CR-9: drop answers still in flight for the previous board.
-      ++S.sp.sprintsSeq; ++S.sp.dataSeq;
-      S.sp.sprintsLoading = false; S.sp.dataLoading = false;
-      S.sp.sprints = b ? [] : null; S.sp.data = null;
+  function enterSprints(force) {
+    const key = spKey();
+    const cached = (S.sp.data && S.sp.data.key === key ? S.sp.data : S.sp.cache.get(key)) || null;
+    if (cached && !S.sp.stale && !force) {
+      ++S.sp.seq; // a request still in flight for other options must not overwrite this view
+      S.sp.loading = false;
+      S.sp.data = cached;
+      S.sp.error = null;
       renderSprints(); renderRefreshState();
       return;
     }
-    const seq = ++S.sp.sprintsSeq;
-    S.sp.sprintsLoading = true;
-    S.sp.sprintsError = null;
-    renderSprints(); renderRefreshState();
-    try {
-      const list = await api('getSprints', force ? { boardId: b.id, force: true } : { boardId: b.id });
-      if (seq !== S.sp.sprintsSeq) return;
-      S.sp.sprints = Array.isArray(list) ? list : [];
-    } catch (e) {
-      if (seq !== S.sp.sprintsSeq) return;
-      S.sp.sprintsError = e;
-    } finally {
-      if (seq === S.sp.sprintsSeq) { S.sp.sprintsLoading = false; renderRefreshState(); }
-    }
-    if (seq !== S.sp.sprintsSeq) return;
-    const list = S.sp.sprints || [];
-    const keep = keepSprint && sprintById(S.sp.sprintId);
-    const next = keep || list.find((s) => s.state === 'active') || list.find((s) => s.state === 'future') || list[0] || null;
-    S.sp.sprintId = next ? next.id : null;
-    renderSprints();
-    if (next) loadSprint({ silent: !!keep && !!S.sp.data, force });
+    S.sp.data = cached;
+    loadSprints({ force, silent: !!cached });
   }
 
-  function selectSprint(id) {
-    if (String(id) === String(S.sp.sprintId)) return;
-    S.sp.sprintId = id;
-    S.sp.data = null;
-    renderSprints();
-    loadSprint();
-  }
-
-  async function loadSprint({ silent, force } = {}) {
-    if (S.sp.sprintId == null) return;
-    if (S.drag || S.pendingKeys.size) { S.sp.dataStale = true; return; }
-    const seq = ++S.sp.dataSeq;
-    S.sp.dataLoading = true;
-    S.sp.dataStale = false;
-    if (!silent) { S.sp.data = null; S.sp.dataError = null; }
+  async function loadSprints({ force, silent } = {}) {
+    if (S.pendingKeys.size) { S.sp.stale = true; renderSprints(); renderRefreshState(); return; } // reloaded when the transition settles
+    const key = spKey();
+    const gen = S.sp.cacheGen;
+    const params = { scope: S.sp.mine ? 'mine' : 'all', includeClosed: S.sp.closed };
+    const project = effProject();
+    if (project) params.project = project;
+    if (force) params.force = true;
+    const seq = ++S.sp.seq;
+    S.sp.reqKey = key;
+    S.sp.loading = true;
+    S.sp.stale = false;
+    if (!silent) { S.sp.data = null; S.sp.error = null; }
     renderSprints(); renderRefreshState();
     try {
-      const params = { sprintId: S.sp.sprintId, scope: S.sp.mine ? 'mine' : 'all' };
-      if (force) params.force = true;
-      const res = await api('getSprint', params);
-      if (seq !== S.sp.dataSeq) return;
-      if (S.pendingKeys.size || S.drag) { S.sp.dataStale = true; return; }
-      S.sp.data = {
-        sprint: (res && res.sprint) || sprintById(S.sp.sprintId),
-        model: { columns: normalizeColumns(res) },
-        progress: (res && res.progress) || null,
-        storyPoints: (res && res.storyPoints) || null,
-        truncated: !!(res && res.truncated),
-      };
-      S.sp.dataError = null;
-      S.sp.animate = !silent;
+      const data = normalizeSprints(await api('getSprintGroups', params), key);
+      if (gen === S.sp.cacheGen) S.sp.cache.set(key, data);
+      if (seq !== S.sp.seq) return;
+      if (S.pendingKeys.size) { S.sp.stale = true; return; } // a transition started meanwhile; refetch after it
+      S.sp.animate = !S.sp.data;
+      S.sp.data = data;
+      S.sp.error = null;
     } catch (e) {
-      if (seq !== S.sp.dataSeq) return;
-      S.sp.dataError = e;
+      if (seq !== S.sp.seq) return;
+      if (dropBadProject(e, project)) { S.sp.loading = false; if (S.view === 'sprints') enterSprints(); return; }
+      S.sp.error = e;
       if (S.sp.data) toastError(t('sprints.loadFailed'), e);
     } finally {
-      if (seq === S.sp.dataSeq) { S.sp.dataLoading = false; renderSprints(); renderRefreshState(); }
+      if (seq === S.sp.seq) { S.sp.loading = false; renderSprints(); renderRefreshState(); }
     }
+  }
+
+  function setSprintsClosed(on) {
+    S.sp.closed = on;
+    prefs.set('sprints.closed', on);
+    enterSprints();
   }
 
   function sprintStateBadge(state) {
@@ -1054,152 +1262,187 @@
   function sprintDates(sp) {
     const range = sp.startDate || sp.endDate ? `${shortDate(sp.startDate) || '…'} – ${shortDate(sp.endDate) || '…'}` : '';
     let rel = '';
+    let tone = '';
     if (sp.state === 'active' && sp.endDate) {
       const n = dayDiff(sp.endDate);
       rel = n > 0 ? t('sprints.daysLeft', { n }) : n === 0 ? t('sprints.endsToday') : t('sprints.overdue', { n: -n });
+      tone = n < 0 ? 'chip-bad' : 'chip-accent';
     } else if (sp.state === 'future' && sp.startDate) {
       const n = dayDiff(sp.startDate);
       rel = n > 0 ? t('sprints.startsIn', { n }) : t('sprints.notStarted');
-    } else if (sp.state === 'closed') {
-      rel = sp.completeDate || sp.endDate ? t('sprints.closedOn', { date: shortDate(sp.completeDate || sp.endDate) }) : '';
-    }
-    return { range, rel };
+    } // closed: the badge and the date range say it all (DR-27)
+    return { range, rel, tone };
   }
 
-  function sprintMenuItem(sp) {
-    const { range } = sprintDates(sp);
-    return html`<span class="mi-main"><span class="mi-title">${sp.name}</span>${range ? html`<span class="mi-sub">${range}</span>` : ''}</span>${sprintStateBadge(sp.state)}`;
+  /** Expanded? Search hits force sections open (toggles then override for this query); otherwise the
+      remembered choice per sprint id; by default active sprints are open (and the Backlog when nothing is open). */
+  function spIsOpen(g, forced) {
+    if (S.sp.overrides.has(g.id)) return S.sp.overrides.get(g.id);
+    if (forced) return true;
+    const v = S.sp.expanded[g.id];
+    if (typeof v === 'boolean') return v;
+    // DR-22: with no active / planned sprint the Backlog is the content, so it starts open.
+    if (!g.sprint) return !(S.sp.data && S.sp.data.groups.some((x) => x.sprint.state !== 'closed'));
+    return g.sprint.state === 'active';
   }
+  function saveSpExpanded() {
+    // Integer-like keys enumerate in ascending order, so the oldest sprints are dropped first.
+    const keys = Object.keys(S.sp.expanded);
+    if (keys.length > 100) keys.slice(0, keys.length - 100).forEach((k) => { delete S.sp.expanded[k]; });
+    prefs.set('sprints.expanded', Object.assign({}, S.sp.expanded));
+  }
+  function toggleSprint(id) {
+    const g = spGroup(id);
+    if (!g) return;
+    const open = !spIsOpen(g, !!String(S.q.sprints || '').trim());
+    if (String(S.q.sprints || '').trim()) S.sp.overrides.set(id, open);
+    else { S.sp.expanded[id] = open; saveSpExpanded(); }
+    S.sp.opening = open ? id : null;
+    renderSprints();
+  }
+
+  const domId = (s) => String(s).replace(/[^\w-]/g, '_');
+  function sprintRow(issue, gid) {
+    const pend = S.pendingKeys.has(issue.key);
+    const mine = !S.sp.mine && issue.mine;
+    return html`<li class="sp-row${catOf(issue.status) === 'done' ? ' is-done' : ''}${mine ? ' is-mine' : ''}${pend ? ' is-pending' : ''}" data-row="${gid}:${issue.key}" data-key="${issue.key}">
+      ${typeIcon(issue.type)}<span class="sp-key" aria-hidden="true">${issue.key}</span>
+      <span class="sp-main"><button type="button" class="sp-open" data-role="open" data-focus-key="${issue.key}" aria-haspopup="dialog"><span class="sr-only">${issue.key}${mine ? ' · ' + t('issue.mineMark') : ''}: </span><span class="sp-sum" title="${issue.summary}">${issue.summary}</span></button>${epicChip(issue.epic)}</span>
+      <span class="sp-st">${statusButton(issue)}</span><span class="sp-prio">${priorityIcon(issue.priority)}</span><span class="sp-pts">${spBadge(issue.storyPoints)}</span><span class="sp-av">${assigneeAvatar(issue.assignee)}</span>
+    </li>`;
+  }
+
+  function sprintSection(g, rows, { forced, allProjects, i }) {
+    const s = g.sprint;
+    const open = spIsOpen(g, forced);
+    const id = domId(g.id);
+    const d = s ? sprintDates(s) : null;
+    const keys = allProjects ? [...new Set(g.issues.map(projectOf).filter(Boolean))].sort((a, b) => a.localeCompare(b)) : [];
+    const pts = s && g.storyPoints && Number(g.storyPoints.total) > 0 ? { done: fmtNum(g.storyPoints.done), total: fmtNum(g.storyPoints.total) } : null;
+    const described = [keys.length ? 'sp-p-' + id : '', 'sp-m-' + id].filter(Boolean).join(' ');
+    const head = html`<div class="sp-head" data-sec="${g.id}">
+      <h2 class="sp-title"><button type="button" class="sp-toggle" id="sp-t-${id}" data-role="toggle" aria-expanded="${open ? 'true' : 'false'}" aria-controls="sp-b-${id}" aria-describedby="${described}">${icon('chevron-right', 'sp-chev')}<span class="sp-name">${s ? s.name : t('sprints.backlog')}</span>${s ? sprintStateBadge(s.state) : ''}</button></h2>
+      ${keys.length ? html`<span class="sp-pkeys" id="sp-p-${id}"><span class="sr-only">${t('sprints.projects', { list: keys.join(', ') })}</span>${keys.map((k) => html`<span class="sp-pkey" aria-hidden="true">${k}</span>`)}</span>` : ''}
+      <span class="sp-meta" id="sp-m-${id}">
+        ${d && d.range ? html`<span class="sp-dates">${icon('calendar', 'icon-sm')}<span>${d.range}</span></span>` : ''}${d && d.rel ? html`<span class="chip${d.tone ? ' ' + d.tone : ''}">${d.rel}</span>` : ''}
+        <span class="sp-count">${t('board.count', { n: g.issues.length })}</span>
+        ${pts ? html`<span class="sp-points" title="${t('sprints.points', pts)}"><span aria-hidden="true">${t('sprints.pointsShort', pts)}</span><span class="sr-only">${t('sprints.points', pts)}</span></span>` : ''}
+        ${s && g.progress ? html`<span class="sp-progress">${progressBar(g.progress, { size: 'md' })}</span>` : ''}
+      </span>
+    </div>`;
+    const goal = s && s.goal ? html`<p class="sp-goal${open ? ' is-open' : ''}"${open ? '' : html` title="${s.goal}"`}>${icon('target', 'icon-sm')}<span><span class="sr-only">${t('sprints.goal')}: </span>${s.goal}</span></p>` : '';
+    const body = open
+      ? html`<div class="sp-body${S.sp.opening === g.id ? ' is-opening' : ''}" id="sp-b-${id}"><ul class="sp-rows" role="list">${rows.map((is) => sprintRow(is, g.id))}</ul>${g.truncated ? html`<p class="sp-foot">${t('sprints.groupTruncated', { n: g.issues.length })}</p>` : ''}</div>`
+      : html`<div id="sp-b-${id}" hidden></div>`;
+    return html`<section class="sp-sec${open ? ' is-open' : ''}" data-state="${s ? s.state : 'backlog'}" style="--i:${Math.min(i, 8)}">${head}${goal}${body}</section>`;
+  }
+
+  const closedNote = () => html`<p class="sp-empty sp-closed-note" role="note">${icon('alert')}<span>${t('sprints.closedUnavailable')}</span></p>`;
 
   function renderSprints() {
     if (S.view !== 'sprints' || activeSectionId() !== 'view-sprints') return;
     const sp = S.sp;
-    const bar = $('#sp-toolbar');
-    const head = $('#sp-head');
-    const root = $('#sprint-board');
-    $('#view-tools').hidden = !!(sp.boards && !sp.boards.length); // DR-12: nothing to search or filter
-    if (!sp.boards) {
-      bar.textContent = ''; head.textContent = '';
-      if (sp.boardsError && !sp.boardsLoading) setHTML(root, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('sprints.boardsFailed'), text: errorText(sp.boardsError), action: { id: 'sp-retry', label: t('common.retry') } }));
-      else setHTML(root, kanbanSkeleton());
+    const el = $('#sp-list');
+    const summary = $('#sp-summary');
+    const d = sp.data;
+    $('#sp-closed').checked = sp.closed;
+    $('#sp-closed-wrap').hidden = !!(d && !d.available);
+    if (!d) {
+      summary.textContent = '';
+      setHTML(el, sp.error && !sp.loading
+        ? stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('sprints.loadFailed'), text: errorText(sp.error), action: { id: 'sp-retry', label: t('common.retry') } })
+        : treeSkeleton());
       menu.sync();
       return;
     }
-    if (!sp.boards.length) {
-      bar.textContent = ''; head.textContent = '';
-      setHTML(root, stateBlock({ iconName: 'sprint', fill: true, title: t('sprints.noBoardsTitle'), text: t('sprints.noBoardsText'), action: { id: 'go-projects', label: t('board.goProjects') } }));
+    if (!d.available) {
+      $('#view-tools').hidden = true; // DR-12: nothing to search or filter
+      summary.textContent = '';
+      setHTML(el, stateBlock({ iconName: 'sprint', fill: true, title: t('sprints.unavailableTitle'), text: t('sprints.unavailableText') }));
       menu.sync();
       return;
     }
-    const board = boardById(sp.boardId);
-    const sprint = sprintById(sp.sprintId) || (sp.data && sp.data.sprint);
-    setHTML(bar, html`
-      <button type="button" class="picker-btn" id="sp-board-btn" data-picker="board" aria-haspopup="menu" aria-expanded="false">
-        <span class="picker-label">${t('sprints.board')}</span><span class="picker-value">${board ? board.name : t('sprints.chooseBoard')}</span>${board ? html`<span class="state-badge" data-state="${board.type}">${t('sprints.boardType.' + (board.type === 'kanban' ? 'kanban' : 'scrum'))}</span>` : ''}${icon('chevron-down', 'icon-xs')}
-      </button>
-      ${board && board.type !== 'kanban' ? html`<button type="button" class="picker-btn" id="sp-sprint-btn" data-picker="sprint" aria-haspopup="menu" aria-expanded="false" ${sp.sprints && sp.sprints.length ? '' : html`disabled`}>
-        <span class="picker-label">${t('sprints.sprint')}</span><span class="picker-value">${sprint ? sprint.name : sp.sprintsLoading ? t('common.loading') : '—'}</span>${sprint ? sprintStateBadge(sprint.state) : ''}${icon('chevron-down', 'icon-xs')}
-      </button>` : ''}`);
-
-    if (board && board.type === 'kanban') {
-      head.textContent = '';
-      setHTML(root, stateBlock({ iconName: 'board', fill: true, title: t('sprints.kanbanTitle'), text: t('sprints.kanbanText', { name: board.name }) }));
+    const groups = spGroups(d);
+    const total = groups.reduce((n, g) => n + g.issues.length, 0);
+    const nSprints = d.groups.length;
+    summary.textContent = groups.length ? [nSprints ? t('sprints.sprintsCount', { n: nSprints }) : '', t('board.count', { n: total })].filter(Boolean).join(' · ') : '';
+    if (!groups.length) {
+      setHTML(el, html`${d.closedUnavailable && sp.closed ? closedNote() : ''}${stateBlock({ iconName: 'sprint', fill: true, title: t(sp.mine ? 'sprints.emptyMineTitle' : 'sprints.emptyTitle'), text: t(sp.mine ? 'sprints.emptyMineText' : 'sprints.emptyText') })}`);
       menu.sync();
       return;
     }
-    if (!sp.sprints) {
-      head.textContent = '';
-      if (sp.sprintsError && !sp.sprintsLoading) setHTML(root, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('sprints.sprintsFailed'), text: errorText(sp.sprintsError), action: { id: 'sp-sprints-retry', label: t('common.retry') } }));
-      else setHTML(root, kanbanSkeleton());
-      menu.sync();
-      return;
-    }
-    if (!sp.sprints.length) {
-      head.textContent = '';
-      setHTML(root, stateBlock({ iconName: 'sprint', fill: true, title: t('sprints.noSprintsTitle'), text: t('sprints.noSprintsText') }));
-      menu.sync();
-      return;
-    }
-    renderSprintHead(sprint);
-    renderSprintBoard();
-  }
-
-  function renderSprintHead(sprint) {
-    const head = $('#sp-head');
-    if (!sprint) { head.textContent = ''; return; }
-    const d = S.sp.data;
-    const { range, rel } = sprintDates(sprint);
-    const p = d && d.progress;
-    const pts = d && d.storyPoints;
-    const stats = p
-      ? html`${progressBar(p, { size: 'lg', counts: false })}
-        <ul class="legend" role="list">
-          <li class="lg-done">${t('progress.done', { n: p.done || 0 })}</li>
-          <li class="lg-ind">${t('progress.inProgress', { n: p.inProgress || 0 })}</li>
-          <li class="lg-todo">${t('progress.todo', { n: p.todo || 0 })}</li>
-          ${pts && pts.total ? html`<li class="lg-sp">${t('sprints.points', { done: fmtNum(pts.done), total: fmtNum(pts.total) })}</li>` : ''}
-        </ul>`
-      : html`<span class="skeleton sk-line" style="height:10px"></span>`;
-    setHTML(head, html`<section class="sprint-card" aria-labelledby="sp-name">
-      <div class="sprint-main">
-        <div class="sprint-title-row"><h2 class="sprint-name" id="sp-name">${sprint.name}</h2>${sprintStateBadge(sprint.state)}</div>
-        ${sprint.goal ? html`<p class="sprint-goal">${icon('target')}<span>${sprint.goal}</span></p>` : ''}
-        <p class="sprint-dates">${icon('calendar')}<span>${range || '—'}</span>${rel ? html`<span class="chip${sprint.state === 'active' && dayDiff(sprint.endDate) < 0 ? ' chip-bad' : sprint.state === 'active' ? ' chip-accent' : ''}">${rel}</span>` : ''}</p>
-      </div>
-      <div class="sprint-stats">${stats}</div>
-    </section>`);
-  }
-
-  function renderSprintBoard() {
-    if (S.view !== 'sprints' || activeSectionId() !== 'view-sprints') return;
-    if (S.drag) { S.renderDeferred.add('sprint'); return; }
-    const sp = S.sp;
-    const root = $('#sprint-board');
-    if (!sp.sprints || !sp.sprints.length || !sprintById(sp.sprintId)) return;
-    renderSprintHead(sprintById(sp.sprintId));
-    if (!sp.data) {
-      if (sp.dataError && !sp.dataLoading) setHTML(root, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('sprints.loadFailed'), text: errorText(sp.dataError), action: { id: 'sp-data-retry', label: t('common.retry') } }));
-      else setHTML(root, kanbanSkeleton());
-      menu.sync();
-      return;
-    }
-    const total = kbIssues(sp.data.model).length;
-    if (!total) {
-      setHTML(root, stateBlock({ iconName: 'inbox', fill: true, title: sp.mine ? t('sprints.emptyMineTitle') : t('sprints.emptyTitle'), text: sp.mine ? t('sprints.emptyMineText') : t('sprints.emptyText') }));
-      menu.sync();
-      return;
-    }
-    preserveKanban(root, () => {
-      const animate = sp.animate;
-      sp.animate = false;
-      const all = !sp.mine;
-      const { cols, visible } = columnsHTML(sp.data.model, issueMatcher(S.q.sprints), { prefix: 's', showAssignee: all, highlightMine: all, animate });
-      const trunc = sp.data.truncated ? html`<div class="notice" role="note">${icon('info')}<span>${t('board.truncated', { n: total })}</span></div>` : '';
-      setHTML(root, html`${trunc}${visible === 0 ? filterBanner() : ''}<div class="columns${animate ? ' is-entering' : ''}">${cols}</div>`);
+    const q = String(S.q.sprints || '').trim();
+    const match = issueMatcher(q);
+    const a = document.activeElement;
+    const holder = a && el.contains(a) && a.closest('[data-row], [data-sec]');
+    const focus = holder ? { sel: holder.dataset.row != null ? `[data-row="${CSS.escape(holder.dataset.row)}"]` : `[data-sec="${CSS.escape(holder.dataset.sec)}"]`, role: a.dataset.role } : null;
+    const scroller = $('#sp-scroll');
+    const scrollTop = scroller.scrollTop;
+    const animate = sp.animate;
+    sp.animate = false;
+    let shown = 0;
+    const sections = groups.map((g, i) => {
+      const rows = q ? g.issues.filter(match) : g.issues;
+      if (q && !rows.length) return '';
+      shown += rows.length;
+      return sprintSection(g, rows, { forced: !!q, allProjects: !effProject(), i });
     });
+    // The closed-sprint part failed: say so where the closed sections would be (after the open ones, before the backlog).
+    if (d.closedUnavailable && sp.closed) sections.splice(d.groups.length, 0, closedNote());
+    sp.opening = null;
+    const noOpen = !d.groups.some((g) => g.sprint.state !== 'closed')
+      ? html`<div class="sp-empty" role="note">${icon('sprint')}<span><strong>${t('sprints.noOpenTitle')}</strong> ${d.backlog ? t('sprints.noOpenText') : ''}</span></div>` : '';
+    const trunc = d.truncated ? html`<div class="notice" role="note">${icon('info')}<span>${t('sprints.truncated')}</span></div>` : '';
+    setHTML(el, html`${trunc}${q && !shown ? filterBanner() : noOpen}<div class="sp-sections${animate ? ' is-entering' : ''}">${sections}</div>${shown ? html`<p class="tree-hint" aria-hidden="true">${t('sprints.keyboardHint')}</p>` : ''}`);
+    scroller.scrollTop = scrollTop;
+    if (focus) {
+      const box = el.querySelector(focus.sel);
+      const target = box && ((focus.role && box.querySelector(`[data-role="${focus.role}"]:not(:disabled)`)) || box.querySelector('[data-role="open"], [data-role="toggle"]'));
+      if (target) target.focus({ preventScroll: true });
+    }
+    menu.sync();
   }
 
-  function openBoardPicker(btn) {
-    menu.open(btn, {
-      label: t('sprints.board'),
-      radio: true,
-      items: S.sp.boards || [],
-      isSelected: (b) => String(b.id) === String(S.sp.boardId),
-      item: (b) => html`<span class="mi-main"><span class="mi-title">${b.name}</span><span class="mi-sub">${b.projectKey || ''}</span></span><span class="state-badge" data-state="${b.type}">${t('sprints.boardType.' + (b.type === 'kanban' ? 'kanban' : 'scrum'))}</span>`,
-      onPick: (b) => { if (String(b.id) !== String(S.sp.boardId)) selectBoard(b.id); },
-      anchorSel: '#sp-board-btn',
-    });
+  function onSprintsClick(e) {
+    const statusBtn = e.target.closest('[data-status-menu]');
+    if (statusBtn) { openStatusMenu(statusBtn); return; }
+    const toggle = e.target.closest('.sp-toggle');
+    if (toggle) { toggleSprint(toggle.closest('[data-sec]').dataset.sec); return; }
+    const open = e.target.closest('.sp-open');
+    if (open) {
+      const row = open.closest('[data-row]');
+      const g = spGroup(row.dataset.row.slice(0, row.dataset.row.indexOf(':')));
+      openIssue(row.dataset.key, g && g.issues.find((is) => is.key === row.dataset.key));
+      return;
+    }
+    const a = e.target.closest('[data-action]');
+    if (!a) return;
+    if (a.dataset.action === 'sp-retry') enterSprints(true);
+    else if (a.dataset.action === 'clear-filters') { S.q.sprints = ''; $('#search').value = ''; S.sp.overrides.clear(); renderSprints(); }
   }
-  function openSprintPicker(btn) {
-    menu.open(btn, {
-      label: t('sprints.sprint'),
-      radio: true,
-      items: S.sp.sprints || [],
-      isSelected: (s) => String(s.id) === String(S.sp.sprintId),
-      item: sprintMenuItem,
-      onPick: (s) => selectSprint(s.id),
-      anchorSel: '#sp-sprint-btn',
-    });
+
+  /** ↑/↓/Home/End move between section headers and rows; → opens / ← closes a section, ← on a row goes to its header. */
+  function onSprintsKey(e) {
+    const el = e.target;
+    if (e.ctrlKey || e.metaKey || e.altKey || !el.matches || !el.matches('.sp-toggle, .sp-open')) return;
+    const items = $$('#sp-list .sp-toggle, #sp-list .sp-open');
+    const i = items.indexOf(el);
+    const isHead = el.classList.contains('sp-toggle');
+    const expanded = isHead && el.getAttribute('aria-expanded') === 'true';
+    const go = (x) => { if (x) x.focus(); };
+    switch (e.key) {
+      case 'ArrowDown': go(items[i + 1]); break;
+      case 'ArrowUp': go(items[i - 1]); break;
+      case 'Home': go(items[0]); break;
+      case 'End': go(items[items.length - 1]); break;
+      case 'ArrowRight': if (isHead && !expanded) toggleSprint(el.closest('[data-sec]').dataset.sec); else if (isHead) go(items[i + 1]); break;
+      case 'ArrowLeft':
+        if (isHead && expanded) toggleSprint(el.closest('[data-sec]').dataset.sec);
+        else if (!isHead) go($('.sp-toggle', el.closest('.sp-sec')));
+        break;
+      default: return;
+    }
+    e.preventDefault();
   }
 
   /* ================================================================
@@ -1220,6 +1463,7 @@
     const key = btn.dataset.statusMenu;
     if (!key || S.pendingKeys.has(key)) return;
     const inDrawer = !!btn.closest('#drawer');
+    const row = btn.closest('[data-row]'); // sprint rows: an issue may be listed in two sprints
     menu.open(btn, {
       label: t('status.menuLabel', { key }),
       load: () => getTransitions(key, true),
@@ -1231,11 +1475,11 @@
         return html`<span class="mi-dot" data-cat="${catOf(to)}" aria-hidden="true"></span><span class="mi-main"><span class="mi-title">${tr.name || to.name}</span>${differs && to.name ? html`<span class="mi-sub">${icon('arrow-right', 'icon-xs')}${to.name}</span>` : ''}</span>`;
       },
       onPick: (tr) => runTransition(key, tr, null),
-      anchorSel: inDrawer ? `#drawer [data-status-menu="${CSS.escape(key)}"]` : `#${activeSectionId()} .card[data-key="${CSS.escape(key)}"] [data-status-menu]`,
+      anchorSel: inDrawer ? `#drawer [data-status-menu="${CSS.escape(key)}"]` : `#${activeSectionId()} ${row ? `[data-row="${CSS.escape(row.dataset.row)}"]` : `.card[data-key="${CSS.escape(key)}"]`} [data-status-menu]`,
     });
   }
 
-  /** Every loaded IssueRef-like copy of `key` outside the kanban models (epic trees, drawer details). */
+  /** Every loaded IssueRef-like copy of `key` outside the board model and sprint rows (epic trees, drawer details). */
   function forEachRef(key, fn) {
     const visit = (r) => { if (r && r.key === key) fn(r); };
     const visitStory = (s) => { if (!s) return; visit(s.story); (s.tasks || []).forEach(visit); };
@@ -1255,20 +1499,26 @@
   /** Puts `status` on every loaded copy of `key`; returns an undo function. */
   function applyStatus(key, status, patch) {
     const undo = [];
-    [S.board, S.sp.data && S.sp.data.model].forEach((model) => {
-      const f = kbFind(model, key);
-      if (!f) return;
-      const prev = { issue: f.issue, status: f.col.status, idx: f.idx };
-      kbPlace(model, key, Object.assign({}, f.issue, patch || {}), (kbColumn(model, status) || {}).status || status, 0);
-      undo.push(() => kbPlace(model, key, prev.issue, prev.status, prev.idx));
-    });
+    const model = S.board;
+    const f = kbFind(model, key);
+    if (f) {
+      const prev = { issue: f.issue, idx: f.idx };
+      const col = kbColumn(model, status);
+      kbPlace(model, key, Object.assign({}, f.issue, patch || {}), (col && col.statuses.find((st) => sameStatus(st, status))) || status, 0);
+      undo.push(() => kbPlace(model, key, prev.issue, prev.issue.status, prev.idx));
+    }
+    spGroups(S.sp.data).forEach((g) => g.issues.forEach((is, i) => {
+      if (is.key !== key) return;
+      g.issues[i] = Object.assign({}, is, patch || {}, { status });
+      undo.push(() => { g.issues[i] = is; });
+    }));
     forEachRef(key, (ref) => { const old = ref.status; ref.status = status; undo.push(() => { ref.status = old; }); });
     return () => undo.reverse().forEach((fn) => fn());
   }
 
   function renderIssueViews() {
     renderBoard();
-    renderSprintBoard();
+    renderSprints();
     renderEpics();
     if (S.drawer) renderDrawer();
   }
@@ -1276,9 +1526,8 @@
   /** After a successful status change: other caches are outdated (other board scope, progress, changelog). */
   function afterIssueChanged(key) {
     S.boardCache = {};
-    if (S.sp.sprintId != null) {
-      if (S.view === 'sprints') loadSprint({ silent: true }); else S.sp.dataStale = true;
-    }
+    invalidateSprints();
+    if (S.view === 'sprints') loadSprints({ silent: !!S.sp.data }); else S.sp.stale = true;
     invalidateEpics();
     if (S.view === 'epics' && S.ep.data) loadEpics({ silent: true }); else S.ep.stale = true;
     detailCache.delete(key);
@@ -1310,19 +1559,18 @@
       S.pendingKeys.delete(key);
       renderIssueViews();
       afterBoardMutation();
-      if (S.sp.dataStale && S.view === 'sprints' && !S.pendingKeys.size) loadSprint({ silent: true });
+      // FE-CR-1: also when there is nothing shown yet (filters changed while the transition was pending).
+      if (S.sp.stale && S.view === 'sprints' && !S.pendingKeys.size) loadSprints({ silent: !!S.sp.data });
     }
   }
 
-  /* --- drag & drop (board and sprint kanbans) --- */
-  function colStatus(colEl) {
+  /* --- drag & drop (board). A column accepts transitions into any of its statuses (SPEC v0.3). --- */
+  function colOf(colEl) {
     const name = kanbanOf(colEl);
     const model = name && KANBAN[name].model();
-    if (!model) return null;
-    const sid = colEl.dataset.status;
-    const col = model.columns.find((c) => String(c.status.id ?? c.status.name) === sid);
-    return col ? col.status : null;
+    return model ? model.columns.find((c) => c.id === colEl.dataset.col) || null : null;
   }
+  const transitionsInto = (list, col) => list.filter((tr) => tr.to && colHas(col, tr.to));
 
   function onDragStart(e) {
     const card = e.target.closest && e.target.closest('.card');
@@ -1333,7 +1581,7 @@
     const found = kbFind(model, key);
     if (!found || S.pendingKeys.has(key)) { e.preventDefault(); return; }
     menu.close(false);
-    S.drag = { key, from: found.col.status, kb };
+    S.drag = { key, from: found.issue.status, fromCol: found.col.id, kb };
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', key);
     card.classList.add('is-dragging');
@@ -1346,9 +1594,9 @@
     getTransitions(key).then((list) => {
       if (S.drag !== drag) return;
       $$('.col', root).forEach((c) => {
-        const st = colStatus(c);
-        if (!st || sameStatus(st, drag.from)) return;
-        const blocked = !list.some((tr) => sameStatus(tr.to, st));
+        const col = colOf(c);
+        if (!col || col.id === drag.fromCol) return;
+        const blocked = !transitionsInto(list, col).length;
         c.classList.toggle('is-blocked', blocked);
         if (blocked) c.classList.remove('is-over'); // DR-15: pointer may already be inside it
       });
@@ -1372,7 +1620,7 @@
     if (colEl.classList.contains('is-blocked')) {
       // Known to have no transition: refuse the drop; dragend explains why with a toast.
       e.dataTransfer.dropEffect = 'none';
-      S.drag.blockedOver = colStatus(colEl);
+      S.drag.blockedOver = colOf(colEl);
       $$('.kanban .col.is-over').forEach((c) => c.classList.remove('is-over'));
       return;
     }
@@ -1396,7 +1644,7 @@
     if (!S.drag) return;
     const { key, from, blockedOver } = S.drag;
     endDrag();
-    if (blockedOver) toast(t('board.noTransition', { key, from: nameOf(from), to: blockedOver.name }), { tone: 'warn' });
+    if (blockedOver) toast(t('board.noTransition', { key, from: nameOf(from), to: colLabel(blockedOver) }), { tone: 'warn' });
   }
 
   /** CR-1: anything dragged in from outside (files, links, text) must never navigate the WebView. */
@@ -1421,15 +1669,17 @@
     if (!colEl || kanbanOf(colEl) !== S.drag.kb) return;
     e.preventDefault();
     const { key, kb } = S.drag;
-    const to = colStatus(colEl);
+    const to = colOf(colEl);
     endDrag();
     if (to) moveByDrop(kb, key, to);
   }
 
-  async function moveByDrop(kb, key, toStatus) {
+  /** Transitions into any of the column's statuses: one ⇒ run it, several ⇒ picker, none ⇒ toast. */
+  async function moveByDrop(kb, key, col) {
     const found = kbFind(KANBAN[kb].model(), key);
-    if (!found || sameStatus(found.col.status, toStatus) || S.pendingKeys.has(key)) return;
+    if (!found || found.col.id === col.id || S.pendingKeys.has(key)) return;
     const issue = found.issue;
+    const label = colLabel(col);
     S.pendingKeys.add(key);
     KANBAN[kb].render();
     let list;
@@ -1442,21 +1692,21 @@
       afterBoardMutation();
       return;
     }
-    const matches = list.filter((tr) => sameStatus(tr.to, toStatus));
+    const matches = transitionsInto(list, col);
     let tr = matches[0];
     S.pendingKeys.delete(key);
     if (matches.length > 1) {
       KANBAN[kb].render();
-      tr = await pickTransition(matches, issue, toStatus.name);
+      tr = await pickTransition(matches, issue, label);
       if (!tr) { afterBoardMutation(); return; }
     }
     if (!tr) {
       KANBAN[kb].render();
-      toast(t('board.noTransition', { key, from: nameOf(issue.status), to: toStatus.name }), { tone: 'warn' });
+      toast(t('board.noTransition', { key, from: nameOf(issue.status), to: label }), { tone: 'warn' });
       afterBoardMutation();
       return;
     }
-    await runTransition(key, tr, toStatus);
+    await runTransition(key, tr, col.statuses.find((st) => sameStatus(st, tr.to)) || tr.to);
   }
 
   function onKanbanClick(e) {
@@ -1472,29 +1722,33 @@
     }
     const a = e.target.closest('[data-action]');
     if (!a) return;
+    const focusNext = () => {
+      const next = $('#board .card [data-role="open"]') || $('#board .state .btn') || $('#search');
+      if (next) next.focus({ preventScroll: true });
+    };
     switch (a.dataset.action) {
       case 'board-retry': loadBoard(true); break;
       case 'go-projects': showView('projects'); break;
-      case 'hidden-dismiss': {
+      case 'hidden-dismiss':
         if (S.board && S.board.hidden) S.hiddenDismissed = hiddenSignature(S.board.hidden);
         renderBoard();
-        const next = $('#board .card [data-role="open"]') || $('#board .state .btn') || $('#search');
-        if (next) next.focus({ preventScroll: true });
+        focusNext();
         break;
-      }
+      case 'project-hint-dismiss':
+        prefs.set('board.projectHintOff', true);
+        renderBoard();
+        focusNext();
+        break;
       case 'clear-filters':
-        if (kanbanOf(a) === 'board') { S.q.board = ''; S.filter.projects.clear(); renderBoard(); }
-        else { S.q.sprints = ''; renderSprintBoard(); }
+        S.q.board = '';
         $('#search').value = '';
+        renderBoard();
         break;
-      case 'sp-retry': loadAgileBoards(true); break;
-      case 'sp-sprints-retry': selectBoard(S.sp.boardId, { keepSprint: true }); break;
-      case 'sp-data-retry': loadSprint(); break;
     }
   }
 
   /* ================================================================
-   * Dropdown menu (role=menu): transitions, board and sprint pickers.
+   * Dropdown menu (role=menu): transitions and the board picker.
    * Lives at <body> level so it stays usable while the app is inert under the drawer.
    * Keyboard: ↑/↓/Home/End move, Enter/Space pick, Esc/Tab close (focus returns to the trigger).
    * ================================================================ */
@@ -1506,10 +1760,17 @@
       const m = box();
       const r = cur.anchor.getBoundingClientRect();
       m.style.minWidth = Math.max(Math.round(r.width), 220) + 'px';
+      const scrollTop = m.scrollTop; // FE-CR-7: re-measuring below resets the scroll; keep the user's position
+      m.style.maxHeight = ''; // natural height, capped by the stylesheet (70vh)
+      const below = innerHeight - r.bottom - 14;
+      const above = r.top - 14;
+      // DR-31: open below unless it does not fit there and there is more room above; scroll only in the space we have.
+      const up = m.offsetHeight > below && above > below;
+      m.style.maxHeight = Math.max(120, Math.floor(up ? above : below)) + 'px';
+      m.scrollTop = scrollTop;
       const mh = m.offsetHeight; const mw = m.offsetWidth;
-      let top = r.bottom + 6;
-      let origin = 'top';
-      if (top + mh > innerHeight - 8 && r.top - 6 - mh > 8) { top = r.top - 6 - mh; origin = 'bottom'; }
+      let top = up ? r.top - 6 - mh : r.bottom + 6;
+      const origin = up ? 'bottom' : 'top';
       top = Math.max(8, Math.min(top, innerHeight - mh - 8));
       const left = Math.max(8, Math.min(r.left, innerWidth - mw - 8));
       m.style.top = Math.round(top) + 'px';
@@ -1591,10 +1852,11 @@
       }
     }
     function pick(i) {
+      const has = i >= 0 && i < cur.items.length; // items may be falsy ("" = All projects)
       const it = cur.items[i];
       const fn = cur.opts.onPick;
       close(true);
-      if (it) fn(it);
+      if (has) fn(it);
     }
     function onKey(e) {
       if (!cur) return;
@@ -1790,9 +2052,11 @@
   const drawerKey = () => (S.drawer ? S.drawer.stack[S.drawer.stack.length - 1].key : null);
 
   function findIssueAnywhere(key) {
-    const f = kbFind(S.board, key) || kbFind(S.sp.data && S.sp.data.model, key);
+    const f = kbFind(S.board, key);
     if (f) return f.issue;
     let hit = null;
+    spGroups(S.sp.data).forEach((g) => { if (!hit) hit = g.issues.find((is) => is.key === key) || null; });
+    if (hit) return hit;
     forEachRef(key, (r) => { if (!hit) hit = r; });
     return hit;
   }
@@ -2104,10 +2368,11 @@
     S.ep.cache.clear();
     S.ep.cacheGen++;
   }
-  const epCacheKey = () => `${S.ep.mode}|${S.ep.includeDone ? 1 : 0}|${S.ep.mine ? 'mine' : 'all'}`;
+  const epCacheKey = () => `${S.ep.mode}|${S.ep.includeDone ? 1 : 0}|${S.ep.mine ? 'mine' : 'all'}|${effProject()}`;
 
   function enterEpics() {
-    const cached = S.ep.cache.get(epCacheKey());
+    const key = epCacheKey();
+    const cached = S.ep.cache.get(key) || (S.ep.data && S.ep.data.key === key ? S.ep.data : null);
     if (cached && !S.ep.stale) {
       // CR-8: a request still in flight for other options must not overwrite this view.
       ++S.ep.seq;
@@ -2127,24 +2392,28 @@
     const gen = S.ep.cacheGen; // CR-14: an invalidation while in flight means this answer may be outdated: don't cache it
     const mode = S.ep.mode;
     const params = { includeDone: S.ep.includeDone, scope: S.ep.mine ? 'mine' : 'all' };
+    const project = effProject();
+    if (project) params.project = project;
     if (force) params.force = true;
     const seq = ++S.ep.seq;
+    S.ep.reqKey = key;
     S.ep.loading = true;
     S.ep.stale = false;
     const cached = S.ep.cache.get(key);
-    if (!silent || !S.ep.data || S.ep.data.mode !== mode) { S.ep.data = cached || null; S.ep.error = null; }
+    if (!silent || !S.ep.data || S.ep.data.key !== key) { S.ep.data = cached || null; S.ep.error = null; }
     renderEpics(); renderRefreshState();
     try {
       const res = await api(mode === 'stories' ? 'getStories' : 'getEpics', params);
       const data = mode === 'stories'
-        ? { mode, stories: (res && res.stories) || [], fetchedAt: res && res.fetchedAt, truncated: !!(res && res.truncated) }
-        : { mode, epics: (res && res.epics) || [], orphanStories: (res && res.orphanStories) || [], fetchedAt: res && res.fetchedAt, truncated: !!(res && res.truncated) };
+        ? { key, mode, stories: (res && res.stories) || [], fetchedAt: res && res.fetchedAt, truncated: !!(res && res.truncated) }
+        : { key, mode, epics: (res && res.epics) || [], orphanStories: (res && res.orphanStories) || [], fetchedAt: res && res.fetchedAt, truncated: !!(res && res.truncated) };
       if (gen === S.ep.cacheGen) S.ep.cache.set(key, data);
       if (seq !== S.ep.seq) return;
       S.ep.data = data;
       S.ep.error = null;
     } catch (e) {
       if (seq !== S.ep.seq) return;
+      if (dropBadProject(e, project)) { S.ep.loading = false; if (S.view === 'epics') enterEpics(); return; }
       S.ep.error = e;
       if (S.ep.data) toastError(t('epics.loadFailed'), e);
     } finally {
@@ -2241,7 +2510,7 @@
     $('#ep-done').checked = S.ep.includeDone;
     const el = $('#ep-list');
     const summary = $('#ep-summary');
-    const data = S.ep.data && S.ep.data.mode === S.ep.mode ? S.ep.data : null;
+    const data = S.ep.data && S.ep.data.key === epCacheKey() ? S.ep.data : null;
     if (!data) {
       summary.textContent = '';
       if (S.ep.error && !S.ep.loading) setHTML(el, stateBlock({ iconName: 'alert', tone: 'error', fill: true, title: t('epics.loadFailed'), text: errorText(S.ep.error), action: { id: 'ep-retry', label: t('common.retry') } }));
@@ -2276,8 +2545,9 @@
       if (!q) summary.textContent = '';
       const empty = q
         ? html`<div class="filter-empty" role="status">${icon('search')}<span>${t('epics.noMatches')}</span><button type="button" class="link-btn" data-action="ep-clear">${t('board.clearFilters')}</button></div>`
-        : stateBlock({ iconName: 'layers', fill: true, title: S.ep.mode === 'stories' ? t('epics.emptyStoriesTitle') : t('epics.emptyTitle'), text: S.ep.mine ? t('epics.emptyMineText') : t('epics.emptyText'),
-          action: S.ep.mine ? null : { id: 'go-projects', label: t('board.goProjects') } });
+        : stateBlock({ iconName: 'layers', fill: true, title: S.ep.mode === 'stories' ? t('epics.emptyStoriesTitle') : t('epics.emptyTitle'),
+          text: S.ep.mine ? t('epics.emptyMineText') : effProject() ? t('epics.emptyProjectText', { key: effProject() }) : t('epics.emptyText'),
+          action: S.ep.mine || effProject() ? null : { id: 'go-projects', label: t('board.goProjects') } });
       setHTML(el, empty);
       return;
     }
@@ -2413,6 +2683,7 @@
       S.pj.list = Array.isArray(list) ? list.slice() : [];
       S.pj.error = null;
       syncTrackedSetting();
+      onProjectsChanged();
     } catch (e) {
       if (seq !== S.pj.seq) return;
       S.pj.error = e;
@@ -2437,6 +2708,7 @@
     list.forEach((p) => { if (!cur.some((c) => c.key === p.key)) merged.push(p); });
     S.pj.list = merged;
     syncTrackedSetting();
+    onProjectsChanged();
   }
 
   /** Keeps the cached Settings in step so a later saveSettings does not send an old trackedProjects list. */
@@ -2449,7 +2721,8 @@
     S.boardStale = true;
     invalidateEpics();
     S.ep.stale = true;
-    S.sp.boardsStale = true;
+    invalidateSprints();
+    S.sp.stale = true;
   }
 
   async function setTracked(key, tracked) {
@@ -3527,8 +3800,8 @@
         if (here('board')) loadBoard(false); else S.boardStale = true;
         invalidateEpics();
         if (here('epics') && S.ep.data) loadEpics({ silent: true }); else S.ep.stale = true;
-        S.sp.boardsStale = true;
-        if (here('sprints') && S.sp.data) loadSprint({ silent: true }); else S.sp.dataStale = true;
+        invalidateSprints();
+        if (here('sprints') && S.sp.data) loadSprints({ silent: true }); else S.sp.stale = true;
         break;
       }
       case 'worklog':
@@ -3563,19 +3836,17 @@
     const search = $('#search');
     search.addEventListener('input', () => onSearchInput(search.value));
     $('#mine-toggle').addEventListener('change', (e) => setMine(S.view, e.target.checked));
-    $('#project-chips').addEventListener('scroll', updateChipsFade, { passive: true });
-    window.addEventListener('resize', updateChipsFade);
+    if (typeof ResizeObserver === 'function') new ResizeObserver(() => syncProjectFilter()).observe($('#project-filter'));
+    else window.addEventListener('resize', syncProjectFilter);
+    $('#project-menu-btn').addEventListener('click', (e) => openProjectMenu(e.currentTarget));
     $('#project-chips').addEventListener('click', (e) => {
       const b = e.target.closest('[data-project]');
-      if (!b) return;
-      const p = b.dataset.project;
-      if (!p) S.filter.projects.clear();
-      else if (S.filter.projects.has(p)) S.filter.projects.delete(p);
-      else S.filter.projects.add(p);
-      renderBoard();
+      if (b) setProject(b.dataset.project);
     });
+    $('#project-chips').addEventListener('keydown', onChipsKey);
+    $('#board-picker').addEventListener('click', (e) => openBoardPicker(e.currentTarget));
 
-    // Kanbans (board + sprint): open card, status dropdown, drag & drop
+    // Kanban (board): open card, status dropdown, drag & drop
     $$('.kanban').forEach((root) => {
       root.addEventListener('click', onKanbanClick);
       root.addEventListener('dragstart', onDragStart);
@@ -3588,12 +3859,10 @@
     document.addEventListener('dragstart', guardDragStart, true);
     ['dragenter', 'dragover', 'drop'].forEach((type) => document.addEventListener(type, guardForeignDrag));
 
-    // Sprints: board / sprint pickers
-    $('#sp-toolbar').addEventListener('click', (e) => {
-      const b = e.target.closest('[data-picker]');
-      if (!b || b.disabled) return;
-      if (b.dataset.picker === 'board') openBoardPicker(b); else openSprintPicker(b);
-    });
+    // Sprints: grouped list
+    $('#sp-closed').addEventListener('change', (e) => setSprintsClosed(e.target.checked));
+    $('#sp-list').addEventListener('click', onSprintsClick);
+    $('#sp-list').addEventListener('keydown', onSprintsKey);
 
     // Epics & stories
     $('#ep-mode').addEventListener('click', (e) => {

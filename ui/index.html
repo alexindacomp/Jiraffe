@@ -92,7 +92,10 @@
           <input type="checkbox" role="switch" class="switch" id="mine-toggle">
           <span data-i18n="scope.mine"></span>
         </label>
-        <div class="chips" id="project-chips" role="group" data-i18n-attr="aria-label:board.projectsLabel" hidden></div>
+        <div class="project-filter" id="project-filter">
+          <div class="chips" id="project-chips" role="radiogroup" data-i18n-attr="aria-label:projectFilter.label" hidden></div>
+          <button type="button" class="picker-btn picker-btn-sm" id="project-menu-btn" aria-haspopup="menu" aria-expanded="false" hidden></button>
+        </div>
       </div>
       <div class="topbar-end">
         <button type="button" class="icon-btn" id="refresh-btn" data-i18n-attr="aria-label:common.refreshShortcut;title:common.refreshShortcut">
@@ -111,14 +114,23 @@
 
       <!-- Board -->
       <section class="view view-board" id="view-board" hidden>
+        <div class="view-toolbar board-bar" id="board-bar" hidden>
+          <button type="button" class="picker-btn picker-btn-sm" id="board-picker" aria-haspopup="menu" aria-expanded="false" hidden></button>
+          <p class="board-note" id="board-note" hidden></p>
+        </div>
         <div class="board kanban" id="board" data-kanban="board"></div>
       </section>
 
       <!-- Sprints -->
       <section class="view view-sprints" id="view-sprints" hidden>
-        <div class="view-toolbar" id="sp-toolbar"></div>
-        <div class="sprint-head" id="sp-head"></div>
-        <div class="board kanban" id="sprint-board" data-kanban="sprint"></div>
+        <div class="view-toolbar">
+          <label class="mine-toggle" id="sp-closed-wrap">
+            <input type="checkbox" role="switch" class="switch" id="sp-closed">
+            <span data-i18n="sprints.showClosed"></span>
+          </label>
+          <p class="toolbar-note" id="sp-summary" aria-live="polite"></p>
+        </div>
+        <div class="tree-scroll" id="sp-scroll"><div class="tree-page" id="sp-list"></div></div>
       </section>
 
       <!-- Epics & stories -->
@@ -454,7 +466,7 @@
   </div>
 </dialog>
 
-<!-- Dropdown menu (status transitions, board/sprint pickers); positioned by app.js next to its trigger. -->
+<!-- Dropdown menu (status transitions, board picker); positioned by app.js next to its trigger. -->
 <div class="menu" id="menu" hidden></div>
 
 <div class="toasts" id="toasts" aria-live="polite" aria-relevant="additions"></div>

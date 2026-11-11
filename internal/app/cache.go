@@ -19,6 +19,11 @@ const (
 	// with issues, so invalidateBoard keeps it.
 	cacheProjectList = "projlist"
 	cacheAgile       = "agile"
+	// cacheSprintGroups is the getSprintGroups result; dropped with the boards.
+	cacheSprintGroups = "sprintgroups"
+	// cacheLayout is the column layout of a project board (metadata: issue
+	// changes do not drop it).
+	cacheLayout = "layout"
 )
 
 const (

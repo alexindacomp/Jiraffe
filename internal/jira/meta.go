@@ -131,6 +131,52 @@ func (c *Client) Projects(ctx context.Context) ([]Project, error) {
 	return out, nil
 }
 
+// IssueTypeStatuses lists the statuses one issue type of a project can have
+// (an entry of GET /rest/api/2/project/{key}/statuses).
+type IssueTypeStatuses struct {
+	ID       string   `json:"id"` // issue type id
+	Name     string   `json:"name"`
+	Subtask  bool     `json:"subtask"`
+	Statuses []Status `json:"statuses"`
+}
+
+// ProjectStatuses returns the statuses of a project per issue type.
+func (c *Client) ProjectStatuses(ctx context.Context, projectKey string) ([]IssueTypeStatuses, error) {
+	if !ValidProjectKey(projectKey) {
+		return nil, &Error{Code: CodeBadRequest, Message: "invalid project key " + strconv.Quote(projectKey)}
+	}
+	var out []IssueTypeStatuses
+	if err := c.do(ctx, "GET", "/rest/api/2/project/"+projectKey+"/statuses", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// StatusByID returns one status (GET /rest/api/2/status/{id}). Status ids
+// are numeric; anything else is rejected without a request.
+func (c *Client) StatusByID(ctx context.Context, id string) (*Status, error) {
+	if !numericID(id) {
+		return nil, &Error{Code: CodeBadRequest, Message: "invalid status id " + strconv.Quote(id)}
+	}
+	var out Status
+	if err := c.do(ctx, "GET", "/rest/api/2/status/"+id, nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func numericID(s string) bool {
+	if s == "" || len(s) > 20 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // ValidProjectKey reports whether key looks like a Jira project key, so it
 // can be used in JQL and request parameters.
 func ValidProjectKey(key string) bool {

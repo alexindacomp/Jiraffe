@@ -46,19 +46,11 @@ func (p *Progress) add(category string) {
 	}
 }
 
-// PointsDTO is getSprint.storyPoints.
+// PointsDTO is SprintGroup.storyPoints: story points of done issues and
+// of all issues.
 type PointsDTO struct {
 	Done  float64 `json:"done"`
 	Total float64 `json:"total"`
-}
-
-// SprintBoard is the getSprint result.
-type SprintBoard struct {
-	Sprint      SprintDTO `json:"sprint"`
-	Columns     []Column  `json:"columns"`
-	Progress    Progress  `json:"progress"`
-	StoryPoints PointsDTO `json:"storyPoints"`
-	Truncated   bool      `json:"truncated"`
 }
 
 // agileWorkers bounds the concurrent per-project board requests.
@@ -176,19 +168,35 @@ func (a *App) getSprints(ctx context.Context, boardID int, force bool) ([]Sprint
 	if err != nil {
 		return nil, err
 	}
-	// Finding the newest closed sprints walks all of them: cache per board.
+	l, err := a.boardSprints(ctx, c, id, boardID, force)
+	if err != nil {
+		return nil, err
+	}
+	return OrderSprints(l.open, l.closed, boardID), nil
+}
+
+// sprintLists are all sprints of a board in Jira's order (closed ones
+// oldest first by Jira's listing).
+type sprintLists struct {
+	open, closed []jira.Sprint
+}
+
+// boardSprints reads the open and all closed sprints of a board (finding
+// the newest closed ones walks all of them), cached per board. A board
+// without sprints (kanban, HTTP 400) has none.
+func (a *App) boardSprints(ctx context.Context, c *jira.Client, identity string, boardID int, force bool) (*sprintLists, error) {
 	key := cacheAgile + ":sprints:" + strconv.Itoa(boardID)
-	cached, gen, ok := a.cacheGet(key, id, agileTTL)
+	cached, gen, ok := a.cacheGet(key, identity, agileTTL)
 	if ok && !force {
-		return cached.([]SprintDTO), nil
+		return cached.(*sprintLists), nil
 	}
 	now := a.clock.Now()
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	open, err := c.BoardSprints(ctx, boardID, jira.SprintActive+","+jira.SprintFuture, maxOpenSprints)
 	if jira.IsCode(err, jira.CodeBadRequest) {
-		out := []SprintDTO{} // "the board does not support sprints"
-		a.cachePut(key, id, gen, now, out)
+		out := &sprintLists{} // "the board does not support sprints"
+		a.cachePut(key, identity, gen, now, out)
 		return out, nil
 	}
 	if err != nil {
@@ -198,8 +206,8 @@ func (a *App) getSprints(ctx context.Context, boardID int, force bool) ([]Sprint
 	if err != nil {
 		return nil, err
 	}
-	out := OrderSprints(open, closed, boardID)
-	a.cachePut(key, id, gen, now, out)
+	out := &sprintLists{open: open, closed: closed}
+	a.cachePut(key, identity, gen, now, out)
 	return out, nil
 }
 
@@ -222,60 +230,6 @@ func OrderSprints(open, closed []jira.Sprint, boardID int) []SprintDTO {
 		}
 	}
 	return out
-}
-
-var sprintFields = []string{"summary", "status", "issuetype", "priority", "updated", "assignee", "project"}
-
-func (a *App) getSprint(ctx context.Context, sprintID int, scope string) (*SprintBoard, error) {
-	scope, err := a.parseScope(scope, ScopeAll)
-	if err != nil {
-		return nil, err
-	}
-	if sprintID <= 0 {
-		return nil, a.newErr(CodeBadParams, "err_bad_params")
-	}
-	c, id, err := a.client()
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
-	sp, err := c.GetSprint(ctx, sprintID)
-	if err != nil {
-		return nil, err
-	}
-	v, err := a.newView(ctx, c, id)
-	if err != nil {
-		return nil, err
-	}
-	jql := "sprint = " + strconv.Itoa(sprintID) + " ORDER BY Rank ASC"
-	res, err := c.SearchAll(ctx, jql, jira.SearchOptions{Fields: v.fields(sprintFields, false), Limit: maxSprintIssues})
-	if err != nil {
-		return nil, err
-	}
-	var epicKeys []string
-	for i := range res.Issues {
-		epicKeys = append(epicKeys, v.epicLink(&res.Issues[i]))
-	}
-	a.loadEpics(ctx, v, epicKeys)
-	out := &SprintBoard{Sprint: sprintDTO(*sp, 0), Truncated: res.Truncated()}
-	dtos := make([]IssueDTO, 0, len(res.Issues))
-	for _, is := range res.Issues {
-		d := v.issue(is)
-		if scope == ScopeMine && !d.Mine {
-			continue
-		}
-		dtos = append(dtos, d)
-		out.Progress.add(d.Status.Category)
-		if d.StoryPoints != nil {
-			out.StoryPoints.Total += *d.StoryPoints
-			if d.Status.Category == "done" {
-				out.StoryPoints.Done += *d.StoryPoints
-			}
-		}
-	}
-	out.Columns = BuildColumns(dtos)
-	return out, nil
 }
 
 // sortRefs orders issues: not-done first (in progress, then to do), done
