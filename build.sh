@@ -4,6 +4,10 @@
 #
 #   ./build.sh            build
 #   ./build.sh --check    also run go vet and go test (Linux) first
+#
+# The release binary embeds the UI as one compressed bundle
+# (build/ui.bundle.gz from tools/uibundle, -tags uibundle); plain
+# `go build` / `go test` embed the raw ui/ files instead (ui_raw.go).
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -21,18 +25,24 @@ fi
 WINRES="github.com/tc-hib/go-winres@v0.3.3"
 MAX_BYTES=$((5 * 1024 * 1024))
 
-if [[ "${1:-}" == "--check" ]]; then
-  echo "==> go vet / go test (linux)"
-  go vet ./...
-  GOOS=windows go vet ./...
-  go test ./...
-fi
-
 # The UI is developed separately; make sure the embed target exists.
 if [[ ! -f ui/index.html ]]; then
   echo "==> ui/index.html missing, writing a placeholder"
   mkdir -p ui
   printf '<!doctype html><meta charset="utf-8"><title>Jiraffe</title><p>UI is not built yet.</p>\n' > ui/index.html
+fi
+
+echo "==> ui bundle"
+mkdir -p build
+go run ./tools/uibundle -src ui -out build/ui.bundle.gz
+
+if [[ "${1:-}" == "--check" ]]; then
+  echo "==> go vet / go test (linux)"
+  go vet ./...
+  GOOS=windows go vet ./...
+  GOOS=windows go vet -tags uibundle ./...
+  go test ./...
+  go test -tags uibundle .
 fi
 
 echo "==> icon"
@@ -46,7 +56,7 @@ go run "$WINRES" make --in assets/winres.json --arch amd64 --out rsrc \
 
 echo "==> build $VERSION"
 mkdir -p build
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -tags uibundle \
   -ldflags "-s -w -H windowsgui -X jiraffe/internal/app.Version=$VERSION" \
   -o build/jiraffe.exe .
 

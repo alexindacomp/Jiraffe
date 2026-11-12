@@ -93,6 +93,10 @@ type Error struct {
 	Kind    string // finer classification (Net* or Kind*), may be empty
 	Detail  string // text from Jira (errorMessages) or the redirect host; untranslated
 	Message string // English, human readable, safe to show to the user
+	// FieldErrors and Messages are Jira's error body ("errors" by field id,
+	// "errorMessages"), as sent; set for 4xx responses that carry them.
+	FieldErrors map[string]string
+	Messages    []string
 }
 
 func (e *Error) Error() string { return e.Message }
@@ -202,7 +206,10 @@ func statusError(resp *Response) *Error {
 		}
 	}
 	detail := strings.Join(details, "; ")
-	e := &Error{Status: resp.StatusCode}
+	e := &Error{Status: resp.StatusCode, Messages: body.ErrorMessages}
+	if len(body.Errors) > 0 {
+		e.FieldErrors = body.Errors
+	}
 	switch {
 	case resp.StatusCode == 401:
 		e.Code, e.Message = CodeUnauthorized, "Jira rejected the token (HTTP 401): check the personal access token"

@@ -6,7 +6,8 @@ filter and each project's own columns (from its agile board or workflow), quick
 status changes from a dropdown, issue details (description, comments, history,
 estimates, links, epic and stories), sprints as a backlog-style list grouped by
 sprint, epics & stories, tracked projects and alerts about new comments on my
-issues, a per-project epic time dashboard and automatic updates. One
+issues, creating and editing issues (rich-text editor for HTML descriptions),
+a per-project epic time dashboard and automatic updates. One
 self-contained `jiraffe.exe` (Go, no CGO, WebView2 UI, about 4.6 MB). The full specification is in [SPEC.md](SPEC.md).
 
 ## Download
@@ -50,7 +51,10 @@ SPEC.md §5.
 VERSION=1.2.0 ./build.sh   # default version: the latest vX.Y.Z git tag
 ```
 
-`build.sh` generates the icon (`tools/icongen` → `assets/icon.ico`), embeds icon,
+`build.sh` first packs ui/ (without `mock.js`) into a gzip bundle
+(`tools/uibundle` → `build/ui.bundle.gz`, embedded with `-tags uibundle`; plain
+`go build`/`go test` embed the raw files listed in `ui_raw.go` — add new ui
+scripts there), then generates the icon (`tools/icongen` → `assets/icon.ico`), embeds icon,
 manifest (PerMonitorV2 DPI awareness, common controls v6) and version info as
 `rsrc_windows_amd64.syso` via `go run github.com/tc-hib/go-winres@v0.3.3`
 (the tool is not added to go.mod and nothing of it ends up in the binary), then
@@ -83,7 +87,7 @@ Files:
 ## Layout
 
 ```
-main.go                 embeds ui/, calls run()
+main.go                 calls run(); ui_raw.go / ui_bundle.go embed the UI
 main_windows.go         wiring, single instance, tray + webview main-thread loop, JS binding
 main_other.go           stub for non-Windows builds
 internal/worklog        pure: in-progress intervals, clipping, allocation, durations, calendar
@@ -98,6 +102,8 @@ internal/winapi         *_windows.go: WinHTTP transport, DPAPI, tray/balloons, a
 internal/applog         rotating log writer
 tools/icongen           build-time icon generator
 tools/sign              CI release signer (ed25519, key from env)
+tools/uibundle          build-time UI bundler (gzip JSON of ui/ files)
+internal/uibundle       bundle format: Build / Open (fs.FS)
 assets/winres.json      go-winres resource definition
 ```
 
@@ -123,7 +129,8 @@ assets/winres.json      go-winres resource definition
   parallel time split equally, already-logged time subtracted, daily cap with
   proportional scaling, whole minutes. Scheduled run at `worklogTime` on working
   days with same-day catch-up; failures are retried every 15 minutes (max 4 per day).
-- **Security.** The page gets a strict CSP (no network) and the binding nonce;
+- **Security.** The page gets a strict CSP (no network; scripts only with a
+  per-start nonce) and the binding nonce;
   files/links dropped from outside are cancelled so they cannot replace the app
   page. `openUrl` only opens http(s) links under the configured Jira URL. The
   stored token is only ever sent to the saved Jira origin (scheme + host +
@@ -142,5 +149,12 @@ assets/winres.json      go-winres resource definition
   `MZ` and the ed25519 signature, rename the running exe to `jiraffe.exe.old`,
   move the new one in (rollback on any failure), start it with `--updated-from`
   and exit. `.old` is removed after the new version has run 10 minutes.
+- **Create / edit issues.** Forms are built from Jira's create/edit meta (main
+  fields + everything Jira requires). HTML (JEditor) descriptions use a built-in
+  rich-text editor whose serializer emits only a fixed HTML subset; the backend
+  re-validates every HTML description against the same contract (SPEC.md v0.5)
+  and rejects anything else, so nothing unexpected reaches other Jira users.
+  Wiki descriptions are edited as raw markup. Only changed fields are sent, and
+  a change made in Jira meanwhile is reported as a conflict.
 - **Errors** from Jira/WinHTTP become readable messages; every goroutine and
   binding call recovers from panics and logs them.

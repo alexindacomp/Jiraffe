@@ -839,3 +839,337 @@ only while `autoCheckUpdates` is on. While the new version is being started, wor
 5. At startup a newer GitHub release is detected; the user can update now (download, verify, swap, automatic
    restart into the new version) or postpone (Later ⇒ not asked again for that version; update from Settings).
 6. `go vet`, `go test` pass (incl. GOOS=windows vet); `build/jiraffe.exe` ≤ 5 MB; ru/uk/en; light/dark; no network resources in the page.
+
+# v0.5 — create and edit issues
+
+Decisions (user): **rich-text editor** for HTML descriptions; editing via an **edit form** (same form as create,
+pre-filled); fields = **main + everything Jira marks required** for the project/type.
+
+## Jira (additions)
+
+- Create meta (Jira ≥ 8.4): `GET /rest/api/2/issue/createmeta/{projectKey}/issuetypes` (paged: `startAt`,
+  `maxResults`, `isLast`/`total`) and `GET /rest/api/2/issue/createmeta/{projectKey}/issuetypes/{typeId}` (paged
+  fields: `fieldId`, `name`, `required`, `schema`, `allowedValues`, `hasDefaultValue`, `defaultValue`, `autoCompleteUrl`).
+  On 404 fall back to the legacy `GET /rest/api/2/issue/createmeta?projectKeys=KEY&expand=projects.issuetypes.fields`
+  (same field objects keyed by id).
+- Edit meta: `GET /rest/api/2/issue/{key}/editmeta` → `{fields: {id: FieldMeta}}`. Empty ⇒ no edit permission.
+- Create: `POST /rest/api/2/issue {fields}` → `{id, key, self}`. Edit: `PUT /rest/api/2/issue/{key} {fields}` → 204.
+  Errors: 400 `{errorMessages: [], errors: {fieldId: message}}` ⇒ per-field errors.
+- Assignable users: `GET /rest/api/2/user/assignable/search?project=KEY&username=Q&maxResults=20` (create) or
+  `?issueKey=KEY&username=Q` (edit). Users are identified by `name` (Server/DC): value `{"name": "…"}`.
+- Issue picker: JQL search (existing `Search`) — epics: `project = KEY AND issuetype = Epic AND statusCategory != Done
+  [AND (summary ~ "Q*" OR key = Q)]`; parents for sub-tasks: same without the type filter but `issuetype not in subTaskIssueTypes()`.
+- Values on write (backend maps; the UI never builds Jira JSON):
+  text/textarea/description ⇒ string; number ⇒ number; date ⇒ `"YYYY-MM-DD"`; datetime ⇒ Jira datetime;
+  select/radio (option) ⇒ `{"id": "…"}`; multiselect/checkboxes ⇒ `[{"id"}]`; priority ⇒ `{"id"}`;
+  components / fixVersions / versions ⇒ `[{"id"}]`; labels ⇒ `["a","b"]` (no spaces); assignee/user ⇒ `{"name"}`
+  (`null` = unassigned); multi-user ⇒ `[{"name"}]`; Epic Link ⇒ `"KEY"` (or null); Sprint ⇒ sprint id number (or null);
+  parent ⇒ `{"key"}`; timetracking ⇒ `{"originalEstimate": "1d 2h", "remainingEstimate": …}`; issuetype/project
+  only on create (`{"id"}` / `{"key"}`); Epic Name ⇒ string.
+- If Sprint is not in edit meta but the board allows it, change the sprint via
+  `POST /rest/agile/1.0/sprint/{id}/issue {"issues":[KEY]}` (and `POST /rest/agile/1.0/backlog/issue` to remove).
+
+## Description format
+
+- `descriptionFormat: "html" | "wiki"` per issue / project:
+  - edit: `"html"` if the current raw description looks like HTML (same detection as the v0.4 renderer), `"wiki"`
+    if it is non-empty and not HTML; empty ⇒ project default;
+  - project default (create, and empty descriptions): look at up to 10 latest issues of the project with a non-empty
+    description; `"html"` if most look like HTML, else `"wiki"`; cached per project (30 min).
+- `"html"` ⇒ **rich-text editor** (below), saved as clean HTML. `"wiki"` ⇒ a monospace textarea with the raw wiki
+  markup (lossless) and a **Preview** toggle using the existing wiki renderer. Never convert between formats.
+
+## Rich-text editor (frontend, no libraries)
+
+- `contenteditable` region with a toolbar: Heading (H3/H4/paragraph), **Bold**, *Italic*, Underline, Strikethrough,
+  inline Code, bulleted / numbered list, indent/outdent in lists, Link (dialog: text + http(s) URL), Code block,
+  Quote, Horizontal rule, Table (insert 2×2; add/remove row/column via the row's context buttons), Clear formatting,
+  Undo/Redo. Keyboard: Ctrl+B/I/U, Ctrl+K (link), Ctrl+Z/Y, Tab/Shift+Tab in lists. Accessible toolbar
+  (`role=toolbar`, roving tabindex, `aria-pressed` for toggles), the region has a label.
+- **Document model = the v0.4 safe subset**: the editor only ever contains elements of the sanitizer's allow-list
+  (p br b strong i em u s code pre ul ol li a table thead tbody tr td th h3 h4 hr blockquote, plus panel blocks and
+  image chips). After every input/paste/command it is normalized: unknown elements unwrapped, attributes stripped
+  (except the editor's own data-* markers), `<b>`→`<strong>`, `<i>`→`<em>`, empty inline elements removed.
+- **Loading existing HTML**: parse with the v0.4 sanitizer into the editor; JEditor panels become editable panel
+  blocks (`div.desc-panel[data-variant=info|warning|neutral]` with a header line and a body); images become
+  non-editable image chips that **keep the original `src`/`alt`/`width`/`height`** in data attributes. If the
+  sanitizer dropped anything meaningful (an unknown element with text, inline colours/fonts, iframes, etc.), the form
+  shows a notice: "Some formatting from Jira will be simplified when you save" + "Edit in Jira" link; the description
+  is only sent if the user changed it (unchanged description is never re-written).
+- **Saving**: a serializer walks the editor DOM and emits HTML strings with full escaping of text and attribute
+  values (never `innerHTML` read-back of untrusted content as the output): allowed tags only; links as
+  `<a href="…">` (http/https only); panels back to JEditor markup
+  (`<div class="jePanel_blue|jePanel_yell" style="…fixed template…"><div class="jePanelHeader|jePanelHeader_red" style="…">HEADER</div><div class="jePanelContent" style="…">…</div></div>`,
+  styles copied from the real Jira templates in the v0.4 facts); image chips back to
+  `<span class="image-wrap"><img src alt width height></span>` with the original attribute values (src must be
+  http(s), else the image is dropped); paragraphs `<p dir="auto">`.
+- **Paste**: intercept `paste`; take `text/html` → v0.4 sanitizer → normalized subset; else `text/plain` with line
+  breaks → paragraphs. Never insert pasted HTML unsanitized; images from the clipboard are not supported (notice).
+- **Insert panel** toolbar button (BRIEF/TASK style): Info panel / Warning panel, with an editable header.
+
+## HTML description contract (serializer ⇄ server-side validator)
+
+The frontend serializer emits, and the backend validator (`description`/`textarea` values that look like HTML) accepts,
+**only** this subset; anything else ⇒ `validation` error on that field (reject, never rewrite):
+- tags: `p br strong em u s code pre ul ol li a table thead tbody tr td th h3 h4 hr blockquote div span img`;
+- attributes: `p[dir="auto"]`; `a[href]` http(s) only; `td/th[colspan|rowspan]` integers 1–50; `ol[start]` integer;
+  `img[src|alt|width|height]` — src http(s) and (create) on the Jira origin, (edit) on the Jira origin or already present
+  in the issue's current description; width/height integers;
+- JEditor panels, exact values only (class + style must match one row; no other class/style anywhere):
+
+| element | class | style |
+|---|---|---|
+| panel div | `jePanel_blue` | `background-color:#e0efff; border:1px dashed #cccccc; margin-bottom:1em; margin-left:1em; margin-right:1em; margin-top:1em` |
+| panel div | `jePanel_yell` | `background-color:#ffffce; border:1px dashed #cccccc; margin-bottom:1em; margin-left:1em; margin-right:1em; margin-top:1em` |
+| header div | `jePanelHeader` | `border-bottom-color:#cccccc; border-bottom-style:dashed; border-bottom-width:1px; font-weight:bold; padding:.3em; text-align:center` |
+| header div | `jePanelHeader_red` | `background-color:#f7d6c1; border-bottom-color:#cccccc; border-bottom-style:dashed; border-bottom-width:1px; font-weight:bold; padding:.3em; text-align:center` |
+| content div | `jePanelContent` | `padding:.5em 2em .5em 2em` |
+| image wrapper span | `image-wrap` | (none) |
+
+  Info variant ⇒ `jePanel_blue` + `jePanelHeader`; warning variant ⇒ `jePanel_yell` + `jePanelHeader_red`;
+  neutral panels are serialized as info. No wrapper `div.userTemplate` is emitted.
+- no comments, CDATA, doctype, processing instructions, `on*` attributes, `javascript:`/`data:` URLs, entities other than
+  the standard named/numeric ones; nesting depth ≤ 64.
+
+## Methods (additions)
+
+| method | params | result |
+|---|---|---|
+| `getCreateMeta` | `{ project, issueTypeId? }` | `{ project: {key, name}, issueTypes: [{id, name, kind, subtask}], issueTypeId, fields: [FieldMeta], descriptionFormat }` — without `issueTypeId` the backend picks the last used type for the project (uiPrefs passes it) or the first non-subtask type; `fields` are for the chosen type |
+| `getEditMeta` | `{ key }` | `{ key, issueTypeId, project: {key,name}, updated, fields: [FieldMeta], descriptionFormat, values: { fieldId: FieldValue } }`; `fields: []` ⇒ no edit permission |
+| `searchAssignable` | `{ project?, key?, query }` | `[User]` (≤ 20; empty query ⇒ first 20) |
+| `searchIssuesFor` | `{ purpose: "epic"|"parent", project, query }` | `[IssueRef]` (≤ 20) |
+| `createIssue` | `{ project, issueTypeId, values: { fieldId: FieldValue } }` | `{ key, url }`; emits the existing data-changed events so open views refresh |
+| `updateIssue` | `{ key, values: { fieldId: FieldValue }, expectedUpdated }` | `{ key, updated }` — only changed fields are sent; if the issue's `updated` differs from `expectedUpdated` ⇒ error `edit_conflict` (nothing written) |
+
+Errors: `bad_params`; `validation { fields: [{field, message}] }` (localized; from our checks or Jira's 400 `errors`,
+Jira field ids mapped back to the form's field ids; `errorMessages` ⇒ form-level message); `forbidden_edit`
+(no permission); `edit_conflict`; existing Jira/transport errors. Caches (board, sprints, epics, issue detail) are
+invalidated for the affected project/issue.
+
+```
+FieldMeta {
+  id,                 // Jira field id ("summary", "customfield_10100", …)
+  name,               // localized label from Jira
+  kind,               // "summary" | "description" | "text" | "textarea" | "number" | "date" | "datetime" |
+                      // "select" | "multiselect" | "priority" | "user" | "users" | "labels" | "components" |
+                      // "versions" | "epic" | "epicName" | "sprint" | "parent" | "estimate" | "storyPoints" | "unsupported"
+  required: bool,
+  main: bool,         // one of the main fields (shown always) vs required-only extras
+  options?: [{ id, name }],      // select/multiselect/priority/components/versions (+ sprint: open/future sprints of the project's boards)
+  default?: FieldValue,
+  max?: number        // e.g. summary 255
+}
+FieldValue = string | number | null | string[] | { id } | { name, displayName } | { key, summary } |
+             { originalEstimate?, remainingEstimate? }
+```
+
+- **Main fields** (when present in the meta, in this order): Summary, Issue type (create only, a separate control),
+  Description, Assignee, Priority, Epic Link (not for epics and sub-tasks), Epic Name (epics), Parent (sub-tasks),
+  Sprint, Story Points, Dev Story Points, QA Story Points, Labels, Components, Fix Version/s, Due date, Original /
+  Remaining estimate. Plus **every other field with `required: true`** (`main: false`), rendered generically by
+  kind. Required fields of an unsupported schema ⇒ `kind: "unsupported"`: the form shows them with "This field
+  can only be filled in Jira" and disables Create (with an "Open in Jira" button to the Jira create screen).
+- Story points select fields (Dev/QA) use their `options`; number Story Points uses a number input.
+
+## UI v0.5
+
+- **Create button** in the top bar on Board, Sprints and Epics & stories: primary button "+ Create" (icon-only with a
+  tooltip/aria-label below ~900 px window width); keyboard shortcut `C` (not while typing). The top bar must not
+  overflow at 760 px (fix the pre-existing overflow too: avatar, project picker and buttons never overlap; items
+  shrink/collapse in a defined order).
+- **Create dialog** (large modal, ~720 px, full height scroll, sticky footer):
+  - Project (defaults to the current project filter, else the last used project; tracked projects first) and
+    Issue type (icons; defaults to the last used type per project, uiPrefs). Changing them reloads the meta
+    keeping compatible values (summary, description, labels, assignee).
+  - Fields per the meta in the order above; required fields marked; per-field inline errors; the description editor
+    per `descriptionFormat`.
+  - Context defaults: on the Epics page with an epic expanded/selected ⇒ Epic Link = that epic (if the user opened
+    Create from that epic's "+ issue" action); on Sprints from a sprint header "+" ⇒ Sprint = that sprint. (Add a
+    small "+" action on sprint headers and on epic rows that opens Create pre-filled.)
+  - Footer: "Create another" checkbox (keeps project/type/epic/sprint, clears the rest), Cancel, **Create** (busy
+    state). Success ⇒ toast "PROJ-123 created" with "Open" (opens the drawer); the current view refreshes.
+  - Unsaved changes ⇒ closing (Esc/Cancel/scrim) asks to discard. Draft is kept in memory if the dialog is closed
+    by an error, not persisted.
+- **Edit**: an "Edit" button (pencil) in the drawer header ⇒ the same dialog in edit mode, title "Edit PROJ-123",
+  pre-filled from `getEditMeta`; project and type are read-only; Save sends only changed fields (`updateIssue`);
+  disabled with a tooltip when `fields` is empty (no permission). `edit_conflict` ⇒ message "The issue was changed in
+  Jira after you opened it" with **Reload** (re-fetch, keeps the user's edits in fields the other change didn't
+  touch, marks the rest) and Cancel. After save the drawer re-renders.
+- Pickers: Assignee (search-as-you-type via `searchAssignable`, "Unassigned", "Assign to me"), Epic and Parent
+  (search via `searchIssuesFor`, shows key + summary + status), Labels (chips, Enter/comma to add, no spaces),
+  multiselects (chips + dropdown with filter), Sprint (open/future sprints, "Backlog" = none), Estimate (Jira
+  duration text `1d 2h 30m` validated on blur with the configured hours-per-day; shown as hint).
+- All new strings ru/uk/en; both themes; keyboard and screen reader accessible (labels, `aria-invalid`,
+  `aria-describedby` for errors, focus to the first invalid field on submit).
+- `ui/mock.js`: create meta for 2 projects (one HTML/JEditor with Dev/QA SP selects and a required custom select,
+  one wiki with an unsupported required field), edit meta, user/issue search, validation errors from "Jira",
+  `edit_conflict`, no-permission issue.
+
+## Security
+
+- The editor never puts Jira or pasted HTML into the live DOM without the v0.4 sanitizer; the serializer escapes
+  everything; links/images keep only http(s) URLs.
+- `createIssue`/`updateIssue` only write fields present in the current create/edit meta (unknown field ids ⇒
+  `bad_params`); values are type-checked against `kind` in Go; strings length-limited (description ≤ 32 000 chars,
+  summary ≤ 255); requests go only to the configured Jira origin (existing transport).
+
+## Contract additions (v0.5)
+
+Exact shapes as implemented (the frontend builds against this block; deviations from the sections above are marked **≠**).
+
+### FieldMeta
+```json
+{ "id": "customfield_10204", "name": "Dev Story Points", "kind": "storyPoints", "required": false, "main": true,
+  "options": [{ "id": "10601", "name": "8" }, { "id": "10603", "name": "5" }] }
+{ "id": "summary", "name": "Summary", "kind": "summary", "required": true, "main": true, "max": 255 }
+{ "id": "priority", "name": "Priority", "kind": "priority", "required": false, "main": true,
+  "options": [{ "id": "2", "name": "High" }, { "id": "3", "name": "Medium" }], "default": { "id": "3" } }
+{ "id": "customfield_10107", "name": "Sprint", "kind": "sprint", "required": false, "main": true,
+  "options": [{ "id": "12", "name": "BI Sprint 7", "state": "active" }, { "id": "13", "name": "BI Sprint 8", "state": "future" }] }
+{ "id": "customfield_10301", "name": "Region", "kind": "unsupported", "required": true, "main": false }
+```
+- `max`: summary 255, text / epicName 255, description / textarea 32000 (absent for other kinds).
+- `options` (omitted when none): select, multiselect, priority, components, versions, storyPoints (select-type Dev/QA SP),
+  sprint. Disabled options and archived versions are left out. **≠** sprint options carry `state`
+  (`"active"|"future"`, active first) and their `id` is the sprint id **as a string**; the sprint FieldValue is a number.
+- `default` (omitted when none): Jira's default in FieldValue form (below).
+- Order: the main fields present, in the SPEC order (Summary, Description, Assignee, Priority, Epic Link / Epic Name /
+  Parent by type, Sprint, Story Points, Dev SP, QA SP, Labels, Components, Fix Version/s, Due date, Time tracking), then
+  every other `required` field in Jira's order with `main: false`. Optional fields outside the main list are not
+  returned (and cannot be written). Issue type and project are never in `fields`.
+- **≠** Sprint: when Jira's create/edit meta has no Sprint field but the project's agile boards have open/future
+  sprints, a Sprint field is still returned (name localized, `required: false`); the backend sets it through the agile
+  API (`POST /rest/agile/1.0/sprint/{id}/issue`, `null` ⇒ `POST /rest/agile/1.0/backlog/issue`) after the create/update.
+  Not for sub-task types (they follow their parent's sprint). A failed sprint move after the issue was created / its
+  fields were saved is not an error: the result carries a localized `warning` ("Saved, but the sprint was not changed: …").
+- A required `reporter` without a Jira default gets the current user as `default` (`{name, displayName}`); on create it
+  may be left out (Jira Server fills it in) and is then not sent.
+- `kind` mapping: system fields by id (summary, description, environment ⇒ textarea, assignee/reporter ⇒ user,
+  priority, labels, components, fixVersions/versions ⇒ versions, duedate ⇒ date, timetracking ⇒ estimate, parent);
+  Epic Link / Epic Name / Sprint / Story Points / Dev SP / QA SP by the discovered field ids (Story Points and Dev/QA SP
+  ⇒ `storyPoints` for number or select schemas); custom fields by schema (string textfield/url ⇒ text, textarea,
+  number, date, datetime, option/radio/single version/security level ⇒ select, array of option ⇒ multiselect, user,
+  array of user ⇒ users, labels, array of version ⇒ versions, array of component ⇒ components). Anything else
+  (cascading select, group, project picker, read-only, select without allowed values, …) ⇒ `unsupported`.
+
+### FieldValue per kind (read in `values`/`default`; accepted by createIssue/updateIssue)
+| kind | read | write (also accepted) | sent to Jira |
+|---|---|---|---|
+| summary, text, epicName | `"text"` | string (trimmed; no line breaks) | string |
+| description, textarea | `"text"` | string, as is | string |
+| number | `2.5` | number | number |
+| storyPoints (no options) | `3` | number | number |
+| storyPoints (options), select, priority | `{"id":"10601"}` | `{"id":"…"}` (id string or number) | `{"id":"…"}` |
+| multiselect, components, versions | `["100","101"]` | `["100"]` or `[{"id":"100"}]` | `[{"id":"100"}]` |
+| labels | `["a","b"]` | string[] (trimmed, deduplicated, no whitespace) | `["a","b"]` |
+| user | `{"name":"bob","displayName":"Bob"}` | `{"name":"bob"}` or `"bob"`; `null` = unassigned | `{"name":"bob"}` / `null` |
+| users **≠** | `[{"name":"bob","displayName":"Bob"}]` | `[{"name":"bob"}]` or `["bob"]` | `[{"name":"bob"}]` |
+| epic | `{"key":"RBI-1","summary":"Platform"}` | `"RBI-1"` or `{"key":"RBI-1"}`; `null` = none | `"RBI-1"` / `null` |
+| parent | `{"key":"RBI-2","summary":"…"}` | `"RBI-2"` or `{"key":"RBI-2"}` (not null) | `{"key":"RBI-2"}` |
+| sprint | `12` (the issue's active/future sprint) | sprint id number from `options`; `null` = backlog | number / agile move |
+| date | `"2026-12-01"` | `"YYYY-MM-DD"`; `""`/`null` = none | `"2026-12-01"` |
+| datetime | RFC 3339 (`"2026-12-01T10:30:00+02:00"`) | RFC 3339, or local `"YYYY-MM-DDTHH:MM[:SS]"` | `"2026-12-01T10:30:00.000+0200"` |
+| estimate | `{"originalEstimate":"1d","remainingEstimate":"4h"}` | same; each a Jira duration (`1w 2d 3h 30m`, `2h30m`, `1.5h`, w/d/h/m each once) checked with `hoursPerDay`; `""`/missing part = not sent | `{"originalEstimate":"1d 2h"}` (normalized: lower case, one space) |
+| unsupported | – | never writable | – |
+
+Empty values (`null`, `""`, `[]`) of a `required` field ⇒ field error "required". On create, empty optional values are
+simply not sent; on update they clear the field (`null` / `[]`). Clearing an estimate is not supported.
+
+### Methods
+```jsonc
+// getCreateMeta {"project":"RBI","issueTypeId":"10001"}   (issueTypeId optional; unknown/absent ⇒ first non-subtask type)
+{ "project": { "key": "RBI", "name": "BI platform" },
+  "issueTypes": [ { "id": "10000", "name": "Epic", "kind": "epic", "subtask": false },
+                  { "id": "5", "name": "Подзадача", "kind": "subtask", "subtask": true } ],
+  "issueTypeId": "10001", "fields": [ /* FieldMeta */ ], "descriptionFormat": "html" }
+
+// getEditMeta {"key":"RBI-12"}
+{ "key": "RBI-12", "issueTypeId": "3", "project": { "key": "RBI", "name": "BI platform" },
+  "updated": "2026-11-12T10:00:00.000+0200",   // opaque Jira timestamp: pass it back unchanged as expectedUpdated
+  "fields": [ /* FieldMeta; [] ⇒ no edit permission */ ], "descriptionFormat": "wiki",
+  "values": { "summary": "Old", "assignee": { "name": "alex", "displayName": "Alex" }, "customfield_10107": 12 } }
+  // values: only fields of `fields` that have a value
+
+// searchAssignable {"project":"RBI","query":"bo"} or {"key":"RBI-12","query":""}   (query ≤ 100 chars)
+[ { "name": "bob", "displayName": "Bob" } ]          // ≤ 20
+
+// searchIssuesFor {"purpose":"epic"|"parent","project":"RBI","query":"load"}   (query ≤ 100 chars)
+[ IssueRef ]                                          // ≤ 20, not done, newest updated first
+
+// createIssue {"project":"RBI","issueTypeId":"3","values":{"summary":"New","customfield_10107":12}}
+{ "key": "RBI-77", "url": "https://sd.local/browse/RBI-77" }
+{ "key": "RBI-77", "url": "https://sd.local/browse/RBI-77",
+  "warning": "Saved, but the sprint was not changed: Jira rejected the request (HTTP 400): Sprint is closed" }
+
+// updateIssue {"key":"RBI-12","values":{"summary":"New"},"expectedUpdated":"2026-11-12T10:00:00.000+0200"}
+{ "key": "RBI-12", "updated": "2026-11-12T10:05:00.000+0200" }   // the new opaque timestamp
+{ "key": "RBI-12", "updated": "",                                 // saved, but `updated` could not be re-read: refetch
+  "warning": "Saved, but the sprint was not changed: …" }         // fields saved, the agile sprint move failed
+```
+- `warning` (optional, localized): the save succeeded but a part did not apply; show it, do not treat it as an error.
+  If only the sprint was to change and that fails, updateIssue returns the error (nothing was saved).
+- `updated: ""`: the write succeeded but the new timestamp is unknown ⇒ call getEditMeta again before another save.
+- `searchIssuesFor` JQL: `project = "KEY" AND issuetype = Epic AND statusCategory != Done` (epic) or
+  `… AND issuetype not in subTaskIssueTypes() AND statusCategory != Done` (parent), plus
+  ` AND (summary ~ "q*" [OR key = "Q"])` for a non-empty query and ` ORDER BY updated DESC` **≠**: `q` keeps only
+  letters and digits, plus `-` `_` `.` between them, everything else becomes a space, lower-cased (so no Lucene
+  operators or AND/OR/NOT); the key clause only when the query is an issue key. The search is sent with
+  `validateQuery=false`, so a key that does not exist yet simply finds nothing.
+- `descriptionFormat` of a project: the 10 latest issues with `description is not EMPTY`; `"html"` only if more than half
+  look like HTML; no sample or a failing search ⇒ `"wiki"`. Cached per project for 30 min.
+- **HTML descriptions** are checked against "HTML description contract" above (reject, never rewrite;
+  `validation` on that field with "This formatting cannot be saved: <reason>"): the `description` value always when the
+  project (create, format of the create meta) or the issue (edit: its own `descriptionFormat`, the project's when the
+  description is empty) uses HTML descriptions. For wiki targets (and `textarea` values) the text is checked as HTML —
+  and so rejected unless it is contract HTML — when it looks like HTML or has a tag (`<` + letter, read like a browser)
+  with any attribute, a deny-listed tag (script, style, iframe, svg, img, form, details, …), a tag that never ends, or a
+  comment/CDATA/PI. Regions Jira's wiki renderer shows literally — `{code…}…{code}`, `{noformat…}…{noformat}` (an
+  unclosed one runs to the end) and one-line `{{…}}` — are exempt only when the wiki format is **known**: an edit of an
+  issue whose own description is wiki, or a project format from a real sample (≥ 1 described issue read). A guessed
+  format (no sample, failed sample search) screens the whole text, and so does any text containing `{html`, `{iframe`,
+  `{script` or `{javascript`. So in a known wiki target `Map<String, Integer>` is fine inside `{code}` or `{{…}}` but
+  rejected in plain text. Images: create — the Jira origin only; edit — the Jira origin or a `src`
+  already in the issue's current description; on the Jira origin only attachment/thumbnail/avatar/JEditor-file paths.
+  Attribute values may contain `&lt;` but not a raw `<`; URLs never contain `<`.
+- `createIssue` refuses the same request (project, type and values) while it is running or for 10 s after it
+  succeeded: error `busy` ("This issue is already being created").
+- `updateIssue` re-reads the issue's `updated` and edit meta first; a different `updated` (other than the same instant
+  written differently) ⇒ `edit_conflict`, nothing written. Only the given fields are sent (one PUT), then the agile
+  sprint move if any. `createIssue` uses the create meta cached for 10 min (as returned by getCreateMeta).
+- After a successful create/update: board, sprint groups, epics, stories, project counts and epic names are dropped and
+  the existing event `board` (`{}`) is emitted. There is no issue-detail cache (getIssue always reads Jira).
+
+### Errors
+```jsonc
+{ "code": "bad_params", "message": "Field customfield_10302 cannot be written here" }   // a field id not in the meta
+{ "code": "validation", "message": "Some fields are invalid",                              // our checks, localized
+  "fields": [ { "field": "summary", "message": "This field is required" },
+              { "field": "customfield_10301", "message": "This field can only be filled in Jira" } ] }
+{ "code": "validation", "message": "Some fields are invalid: foo: Bar; Team is wrong",     // Jira's 400
+  "fields": [ { "field": "customfield_10300", "message": "Bad team" },                     // Jira's text, as sent
+              { "field": "timetracking", "message": "Bad estimate" } ] }                   // timeoriginalestimate etc. ⇒ timetracking
+{ "code": "forbidden_edit", "message": "You have no permission to edit this issue in Jira" }  // empty edit meta, HTTP 403
+{ "code": "busy", "message": "This issue is already being created" }                     // duplicate createIssue
+{ "code": "edit_conflict", "message": "The issue was changed in Jira after you opened it" }
+```
+- Jira 400: `errors` of form fields ⇒ `fields`; `errors` of other ids (as `id: message`) and `errorMessages` are appended
+  to `message`. At most 20 entries are used, each message ≤ 300 characters, the whole `message` ≤ 2000, field ids
+  ≤ 64, control characters dropped. Unknown field ids in `bad_params` messages are cut to 64 characters. A create in a project where no type can be created ⇒ `forbidden_edit` ("You cannot create issues in
+  this project").
+- Field messages (localized): required, too long (`At most N characters`), invalid value, choose one of the offered
+  values, labels without spaces, date `YYYY-MM-DD`, date and time, Jira duration, number, issue key, line breaks not
+  allowed, can only be filled in Jira, formatting cannot be saved.
+- `getCreateMeta`: the type list is cached per project and the fields per resolved type (10 min); an unknown
+  `issueTypeId` still falls back to the first non-subtask type.
+
+## Acceptance criteria v0.5
+
+1. "+ Create" in the top bar of Board, Sprints, Epics (and `C`) opens a create form for the current project with
+   the main fields + required fields from Jira; creating an issue works and the view refreshes.
+2. An existing issue can be edited from the drawer; only changed fields are sent; conflicts are detected.
+3. HTML (JEditor) descriptions are edited in a rich-text editor and saved as clean HTML with panels and images
+   preserved; wiki descriptions are edited as raw markup with preview.
+4. Validation errors (ours and Jira's) are shown per field; unsupported required fields block creation with a way
+   to finish in Jira.
+5. `go vet`, `go test` pass; exe ≤ 5 MB; ru/uk/en; light/dark; no network resources in the page; top bar fits at 760 px.

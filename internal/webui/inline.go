@@ -12,9 +12,12 @@ import (
 	"strings"
 )
 
-// CSP blocks all network access from the page; everything is inline.
-const CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
-	"img-src data: blob:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'"
+// CSP returns the page policy: no network access, only the scripts that
+// carry the per-start nonce (everything the app inlines), inline styles.
+func CSP(scriptNonce string) string {
+	return "default-src 'none'; script-src 'nonce-" + scriptNonce + "'; style-src 'unsafe-inline'; " +
+		"img-src data: blob:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'"
+}
 
 type attr struct{ name, value string }
 
@@ -143,20 +146,34 @@ func isHex(s string) bool {
 //     kept); scripts with "defer" (classic) are moved to the end of <body> in
 //     order, which matches defer semantics for inline code
 //   - mock.js is removed (the real backend is present)
-//   - a Content-Security-Policy meta is added unless the page has one
+//   - a Content-Security-Policy meta is added unless the page has one; its
+//     script-src allows only scripts with the CSP nonce scriptNonce, which
+//     every inline script of the document gets (inlined files, inline
+//     scripts of the page, the bootstrap below) — no 'unsafe-inline', so an
+//     injected script or on…= handler does not run
 //   - <script>window.__jiraffeNonce="<nonce>";</script> is placed first in
 //     <head>, before every other script; only this document knows the nonce
 //     the binding requires (a dropped file or foreign page does not)
-func Inline(fsys fs.FS, dir, nonce string) (string, error) {
-	if !isHex(nonce) {
-		return "", fmt.Errorf("nonce must be lowercase hex")
+//
+// nonce (binding) and scriptNonce (CSP) are random lowercase hex values of
+// one start and must differ.
+func Inline(fsys fs.FS, dir, nonce, scriptNonce string) (string, error) {
+	if !isHex(nonce) || !isHex(scriptNonce) {
+		return "", fmt.Errorf("nonces must be lowercase hex")
 	}
+	if nonce == scriptNonce {
+		return "", fmt.Errorf("the CSP nonce must differ from the binding nonce")
+	}
+	nonceAttr := ` nonce="` + scriptNonce + `"`
 	b, err := fs.ReadFile(fsys, path.Join(dir, "index.html"))
 	if err != nil {
 		return "", fmt.Errorf("read index.html: %w", err)
 	}
 	src := string(b)
 	lower := strings.ToLower(src)
+	if hasCSPMeta(src) {
+		return "", fmt.Errorf("index.html has its own Content-Security-Policy meta; the page policy is set here")
+	}
 	var out strings.Builder
 	var deferred []string
 	i := 0
@@ -227,13 +244,18 @@ func Inline(fsys fs.FS, dir, nonce string) (string, error) {
 				}
 				typ, _ := get(attrs, "type")
 				_, isDefer := get(attrs, "defer")
-				el := "<script" + renderAttrs(attrs, "src", "defer", "async") + ">" +
+				el := "<script" + renderAttrs(attrs, "src", "defer", "async", "nonce") + nonceAttr + ">" +
 					strings.ReplaceAll(js, "</script", `<\/script`) + "</script>"
 				if isDefer && !strings.EqualFold(typ, "module") {
 					deferred = append(deferred, el)
 				} else {
 					out.WriteString(el)
 				}
+				continue
+			}
+			if !hasSrc { // an inline script of the page: allowed by the nonce
+				out.WriteString("<script" + renderAttrs(attrs, "nonce") + nonceAttr + ">")
+				i = gt + 1
 				continue
 			}
 		}
@@ -249,16 +271,38 @@ func Inline(fsys fs.FS, dir, nonce string) (string, error) {
 			html += all
 		}
 	}
-	head := `<script>window.__jiraffeNonce="` + nonce + `";</script>`
-	if !strings.Contains(strings.ToLower(html), "content-security-policy") {
-		head = `<meta http-equiv="Content-Security-Policy" content="` + CSP + `">` + head
-	}
+	// Always our policy, first in <head> (text such as "content-security-policy"
+	// in inlined JS or CSS never suppresses it).
+	head := `<meta http-equiv="Content-Security-Policy" content="` + CSP(scriptNonce) + `">` +
+		`<script` + nonceAttr + `>window.__jiraffeNonce="` + nonce + `";</script>`
 	if k := headStart(html); k >= 0 {
 		html = html[:k] + head + html[k:]
 	} else {
 		html = head + html
 	}
 	return html, nil
+}
+
+// hasCSPMeta reports whether a page has a <meta http-equiv=
+// "Content-Security-Policy"> tag (before inlining, so only the page's own
+// markup counts).
+func hasCSPMeta(src string) bool {
+	lower := strings.ToLower(src)
+	for from := 0; ; {
+		k := strings.Index(lower[from:], "<meta")
+		if k < 0 {
+			return false
+		}
+		k += from
+		end := strings.IndexByte(src[k:], '>')
+		if end < 0 {
+			return false
+		}
+		if v, _ := get(parseAttrs(src[k+1:k+end]), "http-equiv"); strings.EqualFold(strings.TrimSpace(v), "content-security-policy") {
+			return true
+		}
+		from = k + end
+	}
 }
 
 // headStart returns the index just after the <head …> start tag, or -1.

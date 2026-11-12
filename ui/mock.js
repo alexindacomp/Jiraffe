@@ -15,6 +15,7 @@
    | untracked (trackedProjects = null) | closedfail (getSprintGroups: closed sprints fail ⇒ closedUnavailable)
    | limit (tracking more than 6 projects fails with a validation error, like the Go limit of 200) | noprefs (no getUiPrefs: older backend)
    | timepartial (getEpics reports timePartial: some issues' time could not be read)
+   | (v0.5 create / edit: see the "v0.5 create / edit issues" block)
    | update | update-oncheck | update-fail | update-nowrite | update-badsig | update-checkfail | noupdate | devbuild | updated
    (auto-update, see the "v0.4 auto-update" block below). */
 (function () {
@@ -308,6 +309,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
 <iframe src="https://example.com"></iframe><form action="https://example.com"><input value="x"><button>Отправить</button></form>
 </div>`,
   };
+  DESC['RBI-1028'] = DESC['RBI-1028'].replace(/\n/g, '\r\n'); // Jira Server sends CRLF
   const COMMENTS = {
     'RBI-1028': [
       ['am', 60 * 26, 'Пару моментов по *архитектуре*:\n# шлюз уже отдаёт CORS-заголовки\n# фронт можно собирать отдельно\n\nГлянь, пожалуйста, [~o.koval].'],
@@ -819,6 +821,180 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     }, 190);
   }
 
+  /* ---------- v0.5 create / edit issues ----------
+     HTML (JEditor) projects: RBI (Dev/QA story point selects + a required custom select "Среда"), EDS.
+     Wiki projects: CMA (Bug has a required cascading field ⇒ unsupported, and requires "Шаги воспроизведения"),
+     MB and the rest. RBI bugs have required number / datetime extras (RBI-1019: 1234, 0.25, a datetime with seconds);
+     RBI-1028's wiki description and CMA bug steps come with CRLF line ends (an untouched edit must send nothing).
+     Edit: HR-7 has no edit permission; EDS-230 is changed "in Jira" while you edit it (the first save
+     gets edit_conflict, Reload works). "Jira" validation: a due date in the past, or "#jira" in the summary
+     (field error + form-level errorMessages). */
+  const HTML_PROJECTS = ['RBI', 'EDS'];
+  const NO_EDIT = ['HR-7'];
+  const CONFLICT_KEY = 'EDS-230';
+  let conflictDone = false;
+  let createBusy = false; // a duplicate createIssue while one is in flight ⇒ busy
+  const PRIOS = [{ id: '1', name: 'Highest' }, { id: '2', name: 'High' }, { id: '3', name: 'Medium' }, { id: '4', name: 'Low' }, { id: '5', name: 'Lowest' }];
+  const SP_OPTS = ['1', '2', '3', '5', '8', '13'].map((v, i) => ({ id: String(10400 + i), name: v }));
+  const ENV_OPTS = [['20001', 'dev'], ['20002', 'test'], ['20003', 'preprod'], ['20004', 'prod']].map(([id, name]) => ({ id, name }));
+  const COMPONENTS = { RBI: ['Export', 'Auth', 'Reports'], CMA: ['UI', 'API', 'Journal'], EDS: ['Signing', 'Archive'] };
+  const VERSIONS = { RBI: ['4.2.0', '4.3.0'], CMA: ['2.0', '2.1'], MB: ['3.14', '3.15'] };
+  const optList = (names, base) => (names || ['Core']).map((name, i) => ({ id: String(base + i), name }));
+  const TYPE_IDS = { epic: '10000', story: '10001', task: '10002', subtask: '10003', bug: '10004' };
+  const NAMES = {
+    summary: 'Тема', description: 'Описание', assignee: 'Исполнитель', priority: 'Приоритет', epic: 'Epic Link', epicName: 'Epic Name',
+    parent: 'Родительская задача', sprint: 'Спринт', sp: 'Story Points', devSp: 'Dev Story Points', qaSp: 'QA Story Points', labels: 'Метки',
+    components: 'Компоненты', fixVersions: 'Исправить в версиях', duedate: 'Срок исполнения', timetracking: 'Учёт времени',
+    env: 'Среда', region: 'Регион и филиал', steps: 'Шаги воспроизведения', reporter: 'Автор',
+    budget: 'Бюджет, ч', risk: 'Коэффициент риска', start: 'Начало работ',
+  };
+  const looksHtml = (s) => /<\/?(?:p|div|br|span|b|strong|i|em|u|s|code|pre|ul|ol|li|a|img|table|tr|td|th|h[1-6]|hr|blockquote|font)\b[^>]*>/i
+    .test(String(s || '').replace(/\{(code|noformat)(?::[^}\n]*)?\}[\s\S]*?\{\1\}|\{\{[^\n]*?\}\}/g, ''));
+  const projectTypes = (project) => {
+    const list = [['10002', 'Задача', 'task'], ['10001', 'История', 'story'], ['10004', 'Ошибка', 'task'], ['10000', 'Epic', 'epic'], ['10003', 'Подзадача', 'subtask']];
+    return (project === 'CMA' ? list.filter((x) => x[0] !== '10000') : list).map(([id, name, kind]) => ({ id, name, kind, subtask: kind === 'subtask' }));
+  };
+  function sprintOpts(project) {
+    const boards = new Set(boardsOf(project).map((b) => b.id));
+    return SPRINTS.filter((sp) => sp.state !== 'closed' && boards.has(sp.boardId)).sort((a, b) => (a.state === 'active' ? 0 : 1) - (b.state === 'active' ? 0 : 1) || a.id - b.id)
+      .map((sp) => ({ id: String(sp.id), name: sp.name, state: sp.state }));
+  }
+  /** FieldMeta list for a project / type (main fields in SPEC order, then the required extras). */
+  function metaFields(project, typeId) {
+    const ty = projectTypes(project).find((x) => x.id === typeId) || projectTypes(project)[0];
+    const kind = ty.kind;
+    const html = HTML_PROJECTS.includes(project);
+    const f = (key, id, k, extra) => Object.assign({ id, name: NAMES[key], kind: k, required: false, main: true }, extra || {});
+    const out = [f('summary', 'summary', 'summary', { required: true, max: 255 }), f('description', 'description', 'description'),
+      f('assignee', 'assignee', 'user'), f('priority', 'priority', 'priority', { options: PRIOS, default: { id: '3' } })];
+    if (kind !== 'epic' && kind !== 'subtask') out.push(f('epic', 'customfield_10103', 'epic'));
+    if (kind === 'epic') out.push(f('epicName', 'customfield_10105', 'epicName', { required: true, max: 255 }));
+    if (kind === 'subtask') out.push(f('parent', 'parent', 'parent', { required: true }));
+    const sprints = sprintOpts(project);
+    if (kind !== 'epic' && kind !== 'subtask' && sprints.length) out.push(f('sprint', 'customfield_10107', 'sprint', { options: sprints })); // no Sprint for sub-tasks
+    if (kind === 'story' || (kind === 'task' && project !== 'CMA')) out.push(f('sp', 'customfield_10130', 'storyPoints'));
+    if (project === 'RBI' && kind !== 'epic') out.push(f('devSp', 'customfield_10204', 'storyPoints', { options: SP_OPTS }), f('qaSp', 'customfield_10205', 'storyPoints', { options: SP_OPTS }));
+    out.push(f('labels', 'labels', 'labels'));
+    if (kind !== 'epic') out.push(f('components', 'components', 'components', { options: optList(COMPONENTS[project], 11000) }));
+    if (kind !== 'epic' && project !== 'EDS') out.push(f('fixVersions', 'fixVersions', 'versions', { options: optList(VERSIONS[project], 12000) }));
+    out.push(f('duedate', 'duedate', 'date'));
+    if (kind !== 'epic') out.push(f('timetracking', 'timetracking', 'estimate'));
+    if (project === 'RBI' && kind !== 'epic') out.push(f('env', 'customfield_10300', 'select', { required: true, main: false, options: ENV_OPTS }));
+    // RBI bugs: required number / datetime extras (edit RBI-1019 → Save without changes must send nothing: 1234, 0.25, seconds)
+    if (project === 'RBI' && ty.id === '10004') out.push(f('budget', 'customfield_900', 'number', { required: true, main: false }), f('risk', 'customfield_902', 'number', { required: true, main: false }), f('start', 'customfield_903', 'datetime', { required: true, main: false }));
+    if (project === 'CMA' && ty.id === '10004') out.push(f('region', 'customfield_10400', 'unsupported', { required: true, main: false }));
+    if (project === 'CMA' && ty.id === '10004') out.push(f('steps', 'customfield_10500', 'textarea', { required: true, main: false }));
+    if (project === 'CMA' && ty.id === '10001') out.push(f('reporter', 'reporter', 'user', { required: true, main: false, default: { name: ME.name, displayName: ME.displayName } }));
+    return { type: ty, fields: out, descriptionFormat: html ? 'html' : 'wiki' };
+  }
+  const hpd = () => settings.hoursPerDay || 8;
+  function durText(sec) {
+    let m = Math.round(sec / 60); const d = Math.floor(m / (hpd() * 60)); m -= d * hpd() * 60; const h = Math.floor(m / 60); m -= h * 60;
+    return [d ? d + 'd' : '', h ? h + 'h' : '', m ? m + 'm' : ''].filter(Boolean).join(' ') || '0m';
+  }
+  function durSeconds(text) {
+    let sec = 0; const re = /(\d+(?:[.,]\d+)?)\s*([wdhm])/gi; let m;
+    while ((m = re.exec(String(text || '')))) { const n = Number(m[1].replace(',', '.')); sec += n * { w: 5 * hpd() * 3600, d: hpd() * 3600, h: 3600, m: 60 }[m[2].toLowerCase()]; }
+    return Math.round(sec);
+  }
+  const typeIdOf = (r) => (r.type === TYPES.epic ? '10000' : r.type === TYPES.story ? '10001' : r.type === TYPES.sub ? '10003' : r.type === TYPES.bug ? '10004' : '10002');
+  const descOf = (r) => (Object.prototype.hasOwnProperty.call(DESC, r.key) ? DESC[r.key] : r.type.kind === 'epic' ? '' : `Задача *${r.key}*: ${r.summary}.`);
+  function editValues(r, fields) {
+    const v = {};
+    const comps = optList(COMPONENTS[projOf(r)], 11000); const vers = optList(VERSIONS[projOf(r)], 12000);
+    fields.forEach((f) => {
+      switch (f.id) {
+        case 'summary': v[f.id] = r.summary; break;
+        case 'description': v[f.id] = descOf(r); break;
+        case 'assignee': v[f.id] = r.assignee ? { name: r.assignee.name, displayName: r.assignee.displayName } : null; break;
+        case 'priority': { const p = PRIOS.find((x) => x.name === r.priority.name); v[f.id] = p ? { id: p.id } : null; break; }
+        case 'customfield_10103': v[f.id] = r.epic ? { key: r.epic, summary: (rec(r.epic) || {}).summary || '' } : null; break;
+        case 'customfield_10105': v[f.id] = r.epicName || null; break;
+        case 'parent': v[f.id] = r.parent ? { key: r.parent, summary: (rec(r.parent) || {}).summary || '' } : null; break;
+        case 'customfield_10107': { const open = SPRINTS.find((sp) => sp.state !== 'closed' && r.sprints.includes(sp.id)); v[f.id] = open ? open.id : null; break; }
+        case 'customfield_10130': v[f.id] = r.storyPoints != null ? r.storyPoints : null; break;
+        case 'customfield_10204': { const o = SP_OPTS.find((x) => Number(x.name) === r.devStoryPoints); v[f.id] = o ? { id: o.id } : null; break; }
+        case 'customfield_10205': { const o = SP_OPTS.find((x) => Number(x.name) === r.qaStoryPoints); v[f.id] = o ? { id: o.id } : null; break; }
+        case 'labels': v[f.id] = r.labels.slice(); break;
+        case 'components': v[f.id] = r.components.map((n) => (comps.find((c) => c.name === n) || {}).id).filter(Boolean); break;
+        case 'fixVersions': v[f.id] = r.fixVersions.map((n) => (vers.find((c) => c.name === n) || {}).id).filter(Boolean); break;
+        case 'duedate': v[f.id] = r.dueDate || null; break;
+        case 'timetracking': v[f.id] = r.est ? { originalEstimate: durText(r.est[0] * H), remainingEstimate: durText(r.est[1] * H) } : null; break;
+        case 'customfield_10300': v[f.id] = { id: r.env || '20001' }; break; // a required field: Jira has a value
+        case 'customfield_10500': v[f.id] = r.steps != null ? r.steps : 'Открыть журнал\r\nНажать «Экспорт»\r\nОшибка 500'; break; // Jira Server: CRLF
+        case 'customfield_900': v[f.id] = r.budget != null ? r.budget : 1234; break;
+        case 'customfield_902': v[f.id] = r.risk != null ? r.risk : 0.25; break;
+        case 'customfield_903': v[f.id] = r.start || '2026-11-20T09:30:15+02:00'; break;
+        default:
+      }
+    });
+    return v;
+  }
+  const msg = (ru, uk, en) => ({ ru, uk, en }[settings.language] || ru);
+  /** Our checks + "Jira's" 400 errors; returns [{field, message}]. */
+  function checkValues(fields, values, creating) {
+    const errs = [];
+    const extra = []; // Jira's errorMessages: appended to the message, not field errors
+    Object.keys(values).forEach((id) => { if (!fields.some((f) => f.id === id)) throw new MockError('bad_params', `unknown field ${id}`); });
+    fields.forEach((f) => {
+      const v = values[f.id];
+      const present = Object.prototype.hasOwnProperty.call(values, f.id);
+      const empty = v == null || v === '' || (Array.isArray(v) && !v.length);
+      if (f.required && f.kind !== 'unsupported' && empty && (creating || present)) errs.push({ field: f.id, message: msg(`Поле «${f.name}» обязательно.`, `Поле «${f.name}» обовʼязкове.`, `${f.name} is required.`) });
+      if (f.kind === 'labels' && Array.isArray(v) && v.some((x) => /\s/.test(x))) errs.push({ field: f.id, message: msg('Метки не могут содержать пробелы.', 'Мітки не можуть містити пробіли.', 'Labels cannot contain spaces.') });
+      if (f.kind === 'date' && v && v < isoDay(new Date())) errs.push({ field: f.id, message: msg('Jira: срок исполнения не может быть в прошлом.', 'Jira: термін виконання не може бути в минулому.', 'Jira: the due date cannot be in the past.') });
+      if (f.kind === 'summary' && typeof v === 'string' && v.includes('#jira')) {
+        errs.push({ field: 'summary', message: msg('Jira: тема содержит недопустимый символ «#».', 'Jira: тема містить недопустимий символ «#».', 'Jira: the summary contains an invalid character "#".') });
+        extra.push(msg('Jira: валидатор бизнес-процесса отклонил задачу.', 'Jira: валідатор бізнес-процесу відхилив задачу.', 'Jira: the workflow validator rejected the issue.'));
+      }
+      if (f.kind === 'unsupported' && creating) errs.push({ field: f.id, message: msg('Это поле можно заполнить только в Jira.', 'Це поле можна заповнити лише в Jira.', 'This field can only be filled in Jira.') });
+    });
+    if (errs.length || extra.length) {
+      const base = msg('Некоторые поля заполнены неверно', 'Деякі поля заповнено неправильно', 'Some fields are invalid');
+      throw new MockError('validation', extra.length ? `${base}: ${extra.join('; ')}` : base, errs);
+    }
+  }
+  /** Writes FieldValues into a mock record (the backend maps them to Jira JSON). */
+  function applyValues(r, fields, values) {
+    const project = projOf(r);
+    const comps = optList(COMPONENTS[project], 11000); const vers = optList(VERSIONS[project], 12000);
+    const items = [];
+    Object.entries(values).forEach(([id, v]) => {
+      const f = fields.find((x) => x.id === id);
+      switch (id) {
+        case 'summary': r.summary = String(v || ''); break;
+        case 'description': DESC[r.key] = String(v || ''); break;
+        case 'assignee': r.assignee = v ? Object.values(U).find((u) => u.name === v.name) || { name: v.name, displayName: v.displayName || v.name } : null; break;
+        case 'priority': r.priority = { name: (PRIOS.find((p) => p.id === (v && v.id)) || PRIOS[2]).name }; break;
+        case 'customfield_10103': r.epic = v ? v.key : null; break;
+        case 'customfield_10105': r.epicName = v || r.summary; break;
+        case 'parent': r.parent = v ? v.key : null; break;
+        case 'customfield_10107': r.sprints = r.sprints.filter((sid) => !SPRINTS.some((sp) => sp.id === sid && sp.state !== 'closed')).concat(v != null ? [Number(v)] : []); break;
+        case 'customfield_10130': r.storyPoints = v == null ? undefined : Number(v); break;
+        case 'customfield_10204': r.devStoryPoints = v ? Number((SP_OPTS.find((o) => o.id === v.id) || {}).name) : undefined; break;
+        case 'customfield_10205': r.qaStoryPoints = v ? Number((SP_OPTS.find((o) => o.id === v.id) || {}).name) : undefined; break;
+        case 'labels': r.labels = (v || []).slice(); break;
+        case 'components': r.components = (v || []).map((x) => (comps.find((c) => c.id === String(x)) || {}).name).filter(Boolean); break;
+        case 'fixVersions': r.fixVersions = (v || []).map((x) => (vers.find((c) => c.id === String(x)) || {}).name).filter(Boolean); break;
+        case 'duedate': r.dueDate = v || undefined; break;
+        case 'timetracking': {
+          const spent = r.est ? r.est[2] : 0;
+          r.est = v ? [durSeconds(v.originalEstimate) / H, v.remainingEstimate != null ? durSeconds(v.remainingEstimate) / H : durSeconds(v.originalEstimate) / H, spent] : null;
+          break;
+        }
+        case 'customfield_10300': r.env = v ? v.id : null; break;
+        case 'customfield_10500': r.steps = v || ''; break;
+        case 'customfield_900': r.budget = v == null ? null : Number(v); break;
+        case 'customfield_902': r.risk = v == null ? null : Number(v); break;
+        case 'customfield_903': r.start = v || null; break;
+        case 'reporter': r.reporter = v ? Object.values(U).find((u) => u.name === (v.name || v)) || r.reporter : r.reporter; break;
+        default:
+      }
+      items.push({ field: f ? f.name : id, from: '', to: typeof v === 'string' ? v.slice(0, 60) : Array.isArray(v) ? v.map((x) => (typeof x === 'object' ? x.name || x.key || x.id : x)).join(', ') : v && typeof v === 'object' ? v.displayName || v.key || v.name || (PRIOS.find((p) => p.id === v.id) || {}).name || v.id || '' : String(v == null ? '' : v) });
+    });
+    return items;
+  }
+
   /* ---------- methods ---------- */
   class MockError { constructor(code, message, fields) { this.code = code; this.message = message; if (fields) this.fields = fields; } }
   let boardCalls = 0;
@@ -868,7 +1044,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       Object.assign(tt, { originalSeconds: o, remainingSeconds: rem, spentSeconds: sp, original: fmt(o), remaining: fmt(rem), spent: fmt(sp) });
     }
     const det = {
-      issue: toIssue(r), description: DESC[key] || (r.type.kind === 'epic' ? '' : `Задача *${r.key}*: ${r.summary}.`),
+      issue: toIssue(r), description: descOf(r),
       reporter: r.reporter, creator: r.reporter, created: r.created, updated: r.updated,
       labels: r.labels, components: r.components, fixVersions: r.fixVersions, priority: r.priority,
       timeTracking: tt, sprints: SPRINTS.filter((s) => r.sprints.includes(s.id)),
@@ -1037,6 +1213,97 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       upd.skipped = v;
       saveUpd({ skipped: v });
       return updStatus();
+    },
+    getCreateMeta(p) {
+      requireConfigured();
+      const project = p && p.project;
+      const pr = PROJECTS.find((x) => x.key === project);
+      if (!pr) throw new MockError('project_unavailable', `project ${project} is not accessible`);
+      const types = projectTypes(project);
+      const typeId = types.some((x) => x.id === String(p.issueTypeId)) ? String(p.issueTypeId) : types.find((x) => !x.subtask).id;
+      const m = metaFields(project, typeId);
+      return clone({ project: { key: pr.key, name: pr.name }, issueTypes: types, issueTypeId: typeId, fields: m.fields, descriptionFormat: m.descriptionFormat });
+    },
+    getEditMeta(p) {
+      requireConfigured();
+      const r = rec(p && p.key);
+      if (!r) throw new MockError('not_found', `issue ${p && p.key} not found`);
+      const project = projOf(r);
+      const pr = PROJECTS.find((x) => x.key === project) || { key: project, name: project };
+      const m = metaFields(project, typeIdOf(r));
+      const fields = NO_EDIT.includes(r.key) ? [] : m.fields;
+      const desc = descOf(r);
+      const format = looksHtml(desc) ? 'html' : desc.trim() ? 'wiki' : m.descriptionFormat;
+      return clone({ key: r.key, issueTypeId: typeIdOf(r), project: { key: pr.key, name: pr.name }, updated: r.updated, fields, descriptionFormat: format, values: fields.length ? editValues(r, fields) : {} });
+    },
+    searchAssignable(p) {
+      requireConfigured();
+      const q = String((p && p.query) || '').trim().toLowerCase();
+      return clone(Object.values(U).filter((u) => !q || u.name.toLowerCase().includes(q) || u.displayName.toLowerCase().includes(q)).slice(0, 20));
+    },
+    searchIssuesFor(p) {
+      requireConfigured();
+      const purpose = p && p.purpose;
+      if (purpose !== 'epic' && purpose !== 'parent') throw new MockError('bad_params', 'purpose must be epic or parent');
+      const q = String((p && p.query) || '').trim().toLowerCase();
+      return clone(all().filter((r) => projOf(r) === p.project && !isDone(r) && (purpose === 'epic' ? r.type.kind === 'epic' : r.type.kind !== 'subtask'))
+        .filter((r) => !q || r.key.toLowerCase() === q || r.key.toLowerCase().startsWith(q) || r.summary.toLowerCase().includes(q) || String(r.epicName || '').toLowerCase().includes(q))
+        .sort((a, b) => b.key.localeCompare(a.key, undefined, { numeric: true })).slice(0, 20).map((r) => toRef(r)));
+    },
+    createIssue(p) {
+      requireConfigured();
+      const project = p && p.project;
+      if (!PROJECTS.some((x) => x.key === project)) throw new MockError('project_unavailable', `project ${project} is not accessible`);
+      const type = projectTypes(project).find((x) => x.id === String(p.issueTypeId));
+      if (!type) throw new MockError('bad_params', 'unknown issue type');
+      const m = metaFields(project, type.id);
+      const values = (p && p.values) || {};
+      if (createBusy) throw new MockError('busy', msg('Задача уже создаётся — подождите.', 'Задача вже створюється — зачекайте.', 'An issue is already being created — please wait.'));
+      createBusy = true;
+      setTimeout(() => { createBusy = false; }, 400);
+      checkValues(m.fields, values, true);
+      const n = Math.max(0, ...all().filter((r) => projOf(r) === project).map((r) => Number(r.key.split('-')[1]) || 0)) + 1;
+      const key = `${project}-${n}`;
+      const kindKey = { 10000: 'epic', 10001: 'story', 10003: 'sub', 10004: 'bug' }[type.id] || 'task';
+      const st = statusesOf(project).includes('todo') ? 'todo' : statusesOf(project)[0];
+      const r = { id: String(30000 + n), rank: recs.size, key, summary: '', status: ST[st], type: TYPES[kindKey], priority: { name: 'Medium' }, assignee: null,
+        updated: rfc(now()), created: rfc(now()), reporter: ME, epic: null, epicName: undefined, epicColor: kindKey === 'epic' ? 'ghx-label-12' : undefined,
+        storyPoints: undefined, devStoryPoints: undefined, qaStoryPoints: undefined, parent: null, sprints: [], labels: [], components: [], fixVersions: [],
+        est: null, dueDate: undefined, watchers: 1, comments: [], changelog: [] };
+      DESC[key] = '';
+      applyValues(r, m.fields, values);
+      if (kindKey === 'epic' && !r.epicName) r.epicName = r.summary;
+      recs.set(key, r);
+      setTimeout(() => emit('board', {}), 30);
+      return { key, url: url(key) };
+    },
+    updateIssue(p) {
+      requireConfigured();
+      const r = rec(p && p.key);
+      if (!r) throw new MockError('not_found', `issue ${p && p.key} not found`);
+      if (NO_EDIT.includes(r.key)) throw new MockError('forbidden_edit', msg('Нет прав на редактирование этой задачи.', 'Немає прав на редагування цієї задачі.', 'You do not have permission to edit this issue.'));
+      if (r.key === CONFLICT_KEY && !conflictDone) {
+        // someone else edits the issue while the form is open
+        conflictDone = true;
+        r.summary += ' (уточнено)';
+        r.priority = { name: 'Highest' };
+        r.storyPoints = 5; // also changed in Jira: a number the user may have typed over (conflict Reload keeps the typed value)
+        r.updated = rfc(new Date(Date.now() + 1000));
+        r.changelog.unshift({ id: String(commentSeq++), author: U.am, created: r.updated, items: [{ field: 'summary', from: '', to: r.summary }, { field: 'priority', from: 'High', to: 'Highest' }] });
+      }
+      if (String((p && p.expectedUpdated) || '') !== r.updated) throw new MockError('edit_conflict', msg('Задачу изменили в Jira после того, как вы её открыли.', 'Задачу змінили в Jira після того, як ви її відкрили.', 'The issue was changed in Jira after you opened it.'));
+      const m = metaFields(projOf(r), typeIdOf(r));
+      const values = (p && p.values) || {};
+      checkValues(m.fields, values, false);
+      const items = applyValues(r, m.fields, values);
+      const t0 = new Date(Math.max(Date.now(), new Date(r.updated).getTime() + 1000));
+      r.updated = rfc(t0);
+      if (items.length) r.changelog.unshift({ id: String(commentSeq++), author: ME, created: r.updated, items: items.map((i) => ({ field: i.field, from: '', to: i.to })) });
+      setTimeout(() => emit('board', {}), 30);
+      const out = { key: r.key, updated: r.updated };
+      // MB: the fields are saved, but the agile sprint move "fails" (contract: warning, still a success)
+      if (projOf(r) === 'MB' && Object.prototype.hasOwnProperty.call(values, 'customfield_10107')) out.warning = msg('Спринт не изменён: доска BI DEV Agile board недоступна.', 'Спринт не змінено: дошка BI DEV Agile board недоступна.', 'Sprint not changed: the BI DEV Agile board is not available.');
+      return out;
     },
     setWindowTheme(p) { // v0.4: the native title bar; nothing to paint in a browser
       if (!p || typeof p.dark !== 'boolean' || (p.caption != null && !/^#[0-9a-f]{6}$/i.test(String(p.caption)))) throw new MockError('bad_params', 'dark must be a boolean, caption "#rrggbb"');

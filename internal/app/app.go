@@ -193,6 +193,11 @@ type App struct {
 	bgCancel     context.CancelFunc
 	startOnce    sync.Once
 
+	// createIssue duplicate guard (editwrite.go): request key → zero while
+	// in flight, else the time it succeeded.
+	createMu sync.Mutex
+	creating map[string]time.Time
+
 	// updates (see update.go); upd is nil when updates are not enabled
 	upd        *update.Updater
 	updHost    UpdateHost
@@ -407,6 +412,63 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 			return nil, err
 		}
 		return nil, a.setWindowTheme(p.Dark, p.Caption)
+	case "getCreateMeta":
+		var p struct {
+			Project     string `json:"project"`
+			IssueTypeID string `json:"issueTypeId"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.getCreateMeta(ctx, p.Project, p.IssueTypeID)
+	case "getEditMeta":
+		var p struct {
+			Key string `json:"key"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.getEditMeta(ctx, p.Key)
+	case "searchAssignable":
+		var p struct {
+			Project string `json:"project"`
+			Key     string `json:"key"`
+			Query   string `json:"query"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.searchAssignable(ctx, p.Project, p.Key, p.Query)
+	case "searchIssuesFor":
+		var p struct {
+			Purpose string `json:"purpose"`
+			Project string `json:"project"`
+			Query   string `json:"query"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.searchIssuesFor(ctx, p.Purpose, p.Project, p.Query)
+	case "createIssue":
+		var p struct {
+			Project     string                     `json:"project"`
+			IssueTypeID string                     `json:"issueTypeId"`
+			Values      map[string]json.RawMessage `json:"values"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.createIssue(ctx, p.Project, p.IssueTypeID, p.Values)
+	case "updateIssue":
+		var p struct {
+			Key             string                     `json:"key"`
+			Values          map[string]json.RawMessage `json:"values"`
+			ExpectedUpdated string                     `json:"expectedUpdated"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.updateIssue(ctx, p.Key, p.Values, p.ExpectedUpdated)
 	case "getUpdateStatus":
 		return a.updateStatus(), nil
 	case "checkForUpdates":

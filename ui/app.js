@@ -220,6 +220,10 @@
     notif: { list: null, loading: false, error: null, markingAll: false },
 
     // Updates (SPEC v0.4 §5): status = UpdateStatus; dlg = { mode: prompt|progress|failed, release, progress, error }
+    cf: null,                // create / edit issue dialog (SPEC v0.5)
+    noEditKeys: new Set(),   // issues whose edit meta had no fields (no permission), for this session
+    cfDraft: null,           // { project, values } kept after the dialog was closed by an error
+
     // job: an install is known to run (started here, or `installing` at startup); progress events without it are ignored
     upd: { status: null, checking: false, dlg: null, toasted: false, job: false },
 
@@ -253,12 +257,16 @@
    * Layers (drawer + dialogs). Non-modal <dialog>s; the app is made
    * inert while a layer is open so toasts remain interactive on top.
    * ================================================================ */
+  const LAYER_Z = 50; // = --z-layer; layer n gets LAYER_Z + 2n, the scrim LAYER_Z + 2n − 1
   const layers = {
     stack: [],
     open(el, opts = {}) {
       const entry = { el, opts, prevFocus: document.activeElement };
       this.stack.forEach((l) => { l.el.inert = true; });
       this.stack.push(entry);
+      const z = LAYER_Z + 2 * this.stack.length; // DR-16: a stacked dialog (e.g. the discard prompt) is always on top
+      el.style.zIndex = String(z);
+      $('#scrim').style.zIndex = String(z - 1);
       $('#app').inert = true;
       $('#scrim').hidden = false;
       el.inert = false;
@@ -272,9 +280,10 @@
       if (i < 0) return;
       const [entry] = this.stack.splice(i, 1);
       el.close();
+      el.style.zIndex = '';
       const top = this.stack[this.stack.length - 1];
-      if (top) top.el.inert = false;
-      else { $('#app').inert = false; $('#scrim').hidden = true; }
+      if (top) { top.el.inert = false; $('#scrim').style.zIndex = String(Number(top.el.style.zIndex) - 1); }
+      else { $('#app').inert = false; $('#scrim').hidden = true; $('#scrim').style.zIndex = ''; }
       if (entry.opts.onClose) entry.opts.onClose(result);
       const restore = (entry.opts.restoreFocus && entry.opts.restoreFocus()) || entry.prevFocus;
       if (restore && document.contains(restore) && typeof restore.focus === 'function') restore.focus({ preventScroll: true });
@@ -288,11 +297,16 @@
     },
   };
 
-  function confirmDialog({ title, body, okLabel }) {
+  /** safeDefault: the cancel button ("Keep editing") is the primary, focused choice; OK is the destructive one. */
+  function confirmDialog({ title, body, okLabel, cancelLabel, safeDefault }) {
     const dlg = $('#dlg-confirm');
+    const cancel = $('#dlg-confirm [data-action="cancel"]');
     $('#confirm-title').textContent = title;
     $('#confirm-body').textContent = body;
     $('#confirm-ok').textContent = okLabel || t('common.ok');
+    cancel.textContent = cancelLabel || t('common.cancel');
+    $('#confirm-ok').className = safeDefault ? 'btn' : 'btn btn-primary';
+    cancel.className = safeDefault ? 'btn btn-primary' : 'btn';
     return new Promise((resolve) => {
       let done = false;
       const finish = (v) => { if (done) return; done = true; resolve(v); layers.close(dlg); };
@@ -300,7 +314,7 @@
         const a = e.target.closest('[data-action]');
         if (a) finish(a.dataset.action === 'ok');
       };
-      layers.open(dlg, { focus: '#confirm-ok', onClose: () => { if (!done) { done = true; resolve(false); } } });
+      layers.open(dlg, { focus: safeDefault ? '[data-action="cancel"]' : '#confirm-ok', onClose: () => { if (!done) { done = true; resolve(false); } } });
     });
   }
 
@@ -501,6 +515,7 @@
     const tools = $('#view-tools');
     const ns = v && SEARCH_VIEWS[v];
     tools.hidden = !ns;
+    $('#create-btn').hidden = true;
     if (!ns) return;
     const search = $('#search');
     search.placeholder = t(ns + '.searchPlaceholder');
@@ -508,6 +523,7 @@
     if (search.value !== S.q[v]) search.value = S.q[v];
     $('#mine-wrap').hidden = !MINE_VIEWS.includes(v);
     $('#mine-toggle').checked = mineFor(v);
+    $('#create-btn').hidden = !(PROJECT_VIEWS.includes(v) && isConfigured());
     renderChips();
     renderBoardBar();
   }
@@ -1340,6 +1356,7 @@
       <span class="sp-meta" id="sp-m-${id}">
         ${d && d.range ? html`<span class="sp-dates">${icon('calendar', 'icon-sm')}<span>${d.range}</span></span>` : ''}${d && d.rel ? html`<span class="chip${d.tone ? ' ' + d.tone : ''}">${d.rel}</span>` : ''}
         <span class="sp-count">${t('board.count', { n: g.issues.length })}</span>
+        ${s && s.state !== 'closed' ? html`<button type="button" class="icon-btn icon-btn-sm sp-add" data-sp-create="${g.id}" aria-label="${t('cf.createInSprint', { name: s.name })}" title="${t('cf.createInSprint', { name: s.name })}">${icon('plus')}</button>` : ''}
         ${pts ? html`<span class="sp-points" title="${t('sprints.points', pts)}"><span aria-hidden="true">${t('sprints.pointsShort', pts)}</span><span class="sr-only">${t('sprints.points', pts)}</span></span>` : ''}
         ${s && g.progress ? html`<span class="sp-progress">${progressBar(g.progress, { size: 'md' })}</span>` : ''}
       </span>
@@ -1417,7 +1434,33 @@
     menu.sync();
   }
 
+  /** Sprint "+": the project of the sprint's board (agile boards are cached by the backend), else the filter / the
+      sprint's issues; the Sprint field is pre-filled. */
+  async function createInSprint(g, gid) {
+    if (S.cf) return;
+    let project = effProject();
+    if (!project) {
+      try {
+        const boards = await api('getAgileBoards');
+        const b = (boards || []).find((x) => String(x.id) === String(g.sprint.boardId));
+        if (b && b.projectKey) project = b.projectKey;
+      } catch { /* fall back to the issues */ }
+    }
+    if (!project) {
+      const counts = new Map();
+      g.issues.forEach((is) => { const k = projectOf(is); counts.set(k, (counts.get(k) || 0) + 1); });
+      project = [...counts].sort((a, b) => b[1] - a[1]).map((x) => x[0])[0] || '';
+    }
+    openCreate({ project, sprint: { id: g.sprint.id, name: g.sprint.name }, returnSel: `[data-sp-create="${CSS.escape(String(gid))}"]` });
+  }
+
   function onSprintsClick(e) {
+    const add = e.target.closest('[data-sp-create]');
+    if (add) {
+      const g = spGroups(S.sp.data).find((x) => String(x.id) === add.dataset.spCreate);
+      if (g && g.sprint) createInSprint(g, add.dataset.spCreate);
+      return;
+    }
     const statusBtn = e.target.closest('[data-status-menu]');
     if (statusBtn) { openStatusMenu(statusBtn); return; }
     const toggle = e.target.closest('.sp-toggle');
@@ -2079,7 +2122,7 @@
     const MAX_NODES = 5000;
     const MAX_DEPTH = 64;
     const INT_ATTR = /^\s*\d{1,6}\s*$/;
-    const blank = (el) => !el.querySelector('img, .desc-img, hr, table, li, pre') && !/[^\s\u00a0\u200b]/.test(el.textContent);
+    const blank = (el) => !el.querySelector('img, .desc-img, .ed-img, hr, table, li, pre') && !/[^\s\u00a0\u200b]/.test(el.textContent);
 
     function panelVariant(cls) {
       if (/_blue\b/i.test(cls)) return 'info';
@@ -2104,6 +2147,7 @@
     }
 
     const XHTML = 'http://www.w3.org/1999/xhtml';
+    const C0 = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
     /** Visible text of a parsed subtree: skips dropped elements (script, style, …) and SVG / MathML (CR-2). */
     function plainText(node) {
       let out = '';
@@ -2114,13 +2158,34 @@
       return out;
     }
 
-    function renderHtml(src) {
-      const root = mk('div', 'wiki wiki-html');
+    /** ed (v0.5 editor mode): the same walk, allow-list and drop-list, but the output is the editor's model (bare
+        tags, a[data-href], image chips keeping src/alt/width/height, h3/h4 only, no table wrapper) and the result
+        is { root, lossy }: lossy = something meaningful could not be kept (colours/fonts, frames, embedded
+        objects, unknown elements with text, sub/sup, invalid spans / numbering, non-http links/images, truncation). */
+    function renderHtml(src, ed) {
+      const root = mk('div', ed ? '' : 'wiki wiki-html');
       const doc = new DOMParser().parseFromString(String(src), 'text/html');
       let count = 0;
       let full = false;
+      let lossy = false;
       const room = () => { if (count >= MAX_NODES) full = true; return !full; };
       const add = (parent, node) => { count++; parent.append(node); return node; };
+      const QUIET = /^(script|style|link|meta|head|title|template|noscript|base|colgroup|col|param|source|track)$/;
+      const styled = (n) => {
+        const st = n.getAttribute('style');
+        if (!st || n.localName === 'img' || /(^|\s)(jePanel|userTemplate|image-wrap)/.test(n.getAttribute('class') || '')) return false;
+        return /(^|;)\s*(color|background|font)/i.test(st);
+      };
+      function editorImage(n) {
+        const chip = mk('span', 'ed-img');
+        chip.setAttribute('contenteditable', 'false');
+        const src = String(n.getAttribute('src') || '').trim();
+        if (JiraffeEditor.isHttpUrl(src)) chip.dataset.src = src; else lossy = true;
+        const alt = String(n.getAttribute('alt') || '').trim().slice(0, 200);
+        if (alt) chip.dataset.alt = alt;
+        ['width', 'height'].forEach((a) => { const v = JiraffeEditor.dimension(String(n.getAttribute(a) || '').trim().replace(/px$/i, '')); if (v) chip.dataset[a] = v; });
+        return chip;
+      }
 
       /** Copies the children of `from` into `to` (an element we created). */
       function kids(from, to, depth, inPre) {
@@ -2130,21 +2195,31 @@
         const structure = TABLE_KIDS[out.tagName.toLowerCase()];
         if (n.nodeType === Node.TEXT_NODE) {
           if (structure && !/\S/.test(n.data)) return; // whitespace between table rows / cells
-          add(out, document.createTextNode(n.data));
+          add(out, document.createTextNode(n.data.replace(C0, ''))); // C0 controls (not \t \n \r) dropped (S-F1)
           return;
         }
         if (n.nodeType !== Node.ELEMENT_NODE) return; // comments, processing instructions, CDATA
         const tag = n.localName;
-        if (DROP.has(tag) || n.namespaceURI !== XHTML) return;
+        if (DROP.has(tag) || n.namespaceURI !== XHTML) { if (ed && !QUIET.test(tag)) lossy = true; return; }
+        if (ed && styled(n)) lossy = true;
         if (structure && !structure.includes(tag)) {
           // A stray element inside the table structure: keep the rows / cells under it, drop the rest.
           if (!KEEP.has(tag) && depth < MAX_DEPTH) kids(n, out, depth + 1, inPre);
           return;
         }
-        if (depth >= MAX_DEPTH) { add(out, document.createTextNode(plainText(n))); return; } // pathological nesting
+        if (depth >= MAX_DEPTH) { lossy = true; add(out, document.createTextNode(plainText(n))); return; } // pathological nesting
         if (tag === 'br') { add(out, mk('br')); return; }
         if (tag === 'hr') { add(out, mk('hr')); return; }
+        if (tag === 'img' && ed) { add(out, editorImage(n)); return; }
         if (tag === 'img') { add(out, imageButton(String(n.getAttribute('src') || '').trim(), String(n.getAttribute('alt') || '').trim().slice(0, 80))); return; }
+        if (tag === 'a' && ed) {
+          const href = String(n.getAttribute('href') || '').trim();
+          if (!JiraffeEditor.isHttpUrl(href)) { if (href && !href.startsWith('#')) lossy = true; kids(n, out, depth + 1, inPre); return; }
+          const a = add(out, mk('a'));
+          a.dataset.href = href;
+          kids(n, a, depth + 1, inPre);
+          return;
+        }
         if (tag === 'a') {
           const href = String(n.getAttribute('href') || '').trim();
           const label = plainText(n).replace(/\s+/g, ' ').trim();
@@ -2153,6 +2228,7 @@
           kids(n, out, depth + 1, inPre); // other schemes, anchors, linked images: the content only
           return;
         }
+        if (/^h[1-6]$/.test(tag) && ed) { const h = add(out, mk(Number(tag[1]) <= 3 ? 'h3' : 'h4')); kids(n, h, depth + 1, inPre); return; }
         if (/^h[1-6]$/.test(tag)) {
           // Demoted to the drawer scale: h1 → 16 px, h2 → 14 px bold, h3–h6 → 13 px (same classes as wiki h2.–h4.).
           const level = Number(tag[1]);
@@ -2175,7 +2251,27 @@
           if (blank(el)) { el.remove(); count--; } // empty wrappers and "&nbsp;" blocks
           return;
         }
-        if (!KEEP.has(tag) && tag !== 'strike') { kids(n, out, depth + 1, inPre); return; } // span, font, unknown: unwrapped
+        if (!KEEP.has(tag) && tag !== 'strike') { // span, font, unknown: unwrapped
+          if (ed && (tag === 'font' ? ['color', 'face', 'size'].some((a) => n.hasAttribute(a)) : tag !== 'span' && /\S/.test(plainText(n)))) lossy = true;
+          kids(n, out, depth + 1, inPre);
+          return;
+        }
+        if (ed && (tag === 'sub' || tag === 'sup')) { lossy = true; kids(n, out, depth + 1, inPre); return; }
+        if (ed) {
+          const map = { strike: 's', del: 's', ins: 'u', tfoot: 'tbody', b: 'strong', i: 'em' };
+          const e2 = add(out, mk(map[tag] || tag));
+          // DR-18: merged cells and list numbering are kept (validated like the backend); invalid values ⇒ lossy
+          const keepInt = (attr, max) => {
+            const v = n.getAttribute(attr);
+            if (v == null || v.trim() === '1') return;
+            if (/^[1-9]\d{0,5}$/.test(v.trim()) && Number(v) <= max) e2.setAttribute(attr, v.trim()); else lossy = true;
+          };
+          if (tag === 'td' || tag === 'th') { keepInt('colspan', 50); keepInt('rowspan', 50); }
+          if (tag === 'ol') keepInt('start', 100000);
+          kids(n, e2, depth + 1, inPre || tag === 'pre');
+          if (tag === 'p' && blank(e2)) { e2.remove(); count--; }
+          return;
+        }
         const el = mk(tag === 'strike' ? 's' : tag);
         if (tag === 'ul' || tag === 'ol') el.className = 'wiki-list';
         else if (tag === 'pre') el.className = 'wiki-pre';
@@ -2217,11 +2313,11 @@
         const before = prev && prev.nodeName === 'BR' ? sib(prev, 'previousSibling') : null;
         if (!prev || !next || BLOCK.test(prev.nodeName) || BLOCK.test(next.nodeName) || (before && before.nodeName === 'BR')) br.remove();
       });
-      if (full) { const more = mk('p', 'desc-more'); more.textContent = '…'; root.append(more); }
-      return root;
+      if (full && !ed) { const more = mk('p', 'desc-more'); more.textContent = '…'; root.append(more); }
+      return ed ? { root, lossy: lossy || full } : root;
     }
 
-    return { render: (src) => (isHtml(src || '') ? renderHtml(src) : render(src)), isHtml };
+    return { render: (src) => (isHtml(src || '') ? renderHtml(src) : render(src)), isHtml, sanitizeForEditor: (src) => renderHtml(src, true) };
   })();
 
   /* ================================================================
@@ -2278,6 +2374,33 @@
     d.stack.pop();
     d.tab = 'details';
     loadDetail({ navigated: true });
+  }
+
+  /** Drawer "Edit": the edit meta is fetched on click only (no prefetch on drawer open). No fields ⇒ no permission:
+      remembered for the issue for this session, so the button is shown disabled without another request. */
+  async function editFromDrawer() {
+    const d = S.drawer;
+    const key = drawerKey();
+    if (!d || !key || S.cf || d.editLoading) return;
+    if (S.noEditKeys.has(key)) { toast(t('cf.noPermission')); return; }
+    d.editLoading = true;
+    renderDrawer(); // spinner; the button stays focusable (aria-busy), clicks are ignored meanwhile
+    let meta = null;
+    try {
+      meta = await api('getEditMeta', { key });
+    } catch (e) {
+      toastError(t('cf.editLoadFailed'), e);
+    } finally {
+      d.editLoading = false;
+    }
+    if (S.drawer !== d || drawerKey() !== key) return;
+    if (meta && !(Array.isArray(meta.fields) && meta.fields.length)) {
+      S.noEditKeys.add(key);
+      toast(t('cf.noPermission'));
+      meta = null;
+    }
+    renderDrawer(); // the button: busy off, or disabled for this issue
+    if (meta) openEdit(key, meta);
   }
 
   async function loadDetail({ navigated, silent } = {}) {
@@ -2479,6 +2602,7 @@
         ${prev ? html`<button type="button" class="icon-btn" data-action="back" aria-label="${t('drawer.back', { key: prev.key })}" title="${t('drawer.back', { key: prev.key })}">${icon('arrow-left')}</button>` : ''}
         <div class="drawer-crumbs">${is.type ? typeIcon(is.type) : ''}<span class="card-key">${is.key}</span>${d.loading && det ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : ''}</div>
         <div class="drawer-head-end">
+          ${det ? (() => { const no = S.noEditKeys.has(top.key); return html`<button type="button" class="icon-btn" data-action="edit" aria-label="${no ? t('cf.noPermission') : t('drawer.edit')}" title="${no ? t('cf.noPermission') : t('drawer.editTitle')}"${no ? html` aria-disabled="true"` : ''}${d.editLoading ? html` aria-busy="true"` : ''}>${d.editLoading ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : icon('pencil')}</button>`; })() : ''}
           <button type="button" class="icon-btn" data-action="open-jira" aria-label="${t('common.openInJira')}" title="${t('common.openInJira')}" ${is.url ? '' : html`disabled`}>${icon('external')}</button>
           <button type="button" class="icon-btn" data-action="close" aria-label="${t('common.close')}" title="${t('common.closeEsc')}">${icon('x')}</button>
         </div>
@@ -2533,6 +2657,10 @@
       case 'close': layers.close($('#drawer')); break;
       case 'back': drawerBack(); break;
       case 'detail-retry': loadDetail(); break;
+      case 'edit':
+        if (a.getAttribute('aria-disabled') === 'true') toast(t('cf.noPermission'));
+        else editFromDrawer();
+        break;
       case 'open-jira': {
         const cur = (d.detail && d.detail.issue) || findIssueAnywhere(drawerKey()) || {};
         openUrl(cur.url);
@@ -2555,6 +2683,1089 @@
   async function openUrl(url) {
     if (!url) return;
     try { await api('openUrl', { url }); } catch (e) { toastError(t('common.openFailed'), e); }
+  }
+
+  /* ================================================================
+   * CREATE / EDIT ISSUE (SPEC v0.5): one dialog for both. Fields come from getCreateMeta / getEditMeta and are
+   * rendered generically by kind; values are FieldValues (the backend maps them to Jira JSON). Edit sends only the
+   * changed fields with expectedUpdated. The HTML description uses the rich-text editor (editor.js) fed by the
+   * v0.4 sanitizer; wiki descriptions stay raw markup with a preview.
+   * ================================================================ */
+  const CF_WIDE = new Set(['summary', 'description', 'textarea', 'labels', 'multiselect', 'components', 'versions', 'users', 'unsupported', 'estimate']);
+  const CF_LOCAL = new Set(['multiselect', 'components', 'versions']);
+  const CF_MULTI = new Set(['multiselect', 'components', 'versions', 'users']);
+  const CF_KEEP_ON_SWITCH = ['summary', 'description', 'labels', 'assignee']; // SPEC: project / type change keeps these
+  const DURATION = /^\s*(\d+(?:[.,]\d+)?\s*[wdhm]\s*)+$/i;
+  const cfId = (fid) => 'cf-' + domId(fid);
+  /** A number as typed back: no grouping, full precision, the locale's decimal separator (1234 → "1234", 0.25 → "0,25"). */
+  const cfNumText = (v) => (v == null || v === '' ? '' : nf({ useGrouping: false, maximumFractionDigits: 20 }).format(Number(v)));
+  /** Parses typed numbers: spaces / NBSP (grouping) ignored, "," or "." as the decimal separator. */
+  function cfParseNum(text) {
+    const s1 = String(text).replace(/[\s\u00a0\u202f]/g, '').replace(',', '.');
+    return /^-?\d+(\.\d+)?$/.test(s1) ? Number(s1) : NaN;
+  }
+  const cfField = (fid) => S.cf && S.cf.fields.find((f) => f.id === fid);
+  const isEmptyVal = (v) => v == null || v === '' || (Array.isArray(v) && !v.length) || (typeof v === 'object' && !Array.isArray(v) && !Object.values(v).some((x) => x != null && x !== ''));
+  const me = () => (S.appState && S.appState.user) || null;
+
+  /** Text as compared / sent: CRLF → LF (Jira Server answers with CRLF, a textarea gives LF); one-line kinds trimmed,
+      multi-line kinds lose trailing whitespace only. */
+  const cfText = (kind, v) => {
+    const s1 = String(v == null ? '' : v).replace(/\r\n?/g, '\n');
+    return kind === 'textarea' || kind === 'description' ? s1.replace(/\s+$/, '') : s1.trim();
+  };
+  /** Canonical form of a value for comparisons (edit: changed fields only; conflict reload). */
+  function cfCanon(kind, v) {
+    if (kind === 'summary' || kind === 'text' || kind === 'epicName' || kind === 'textarea' || kind === 'description') return cfText(kind, v);
+    if (isEmptyVal(v)) return '';
+    switch (kind) {
+      case 'user': return v.name || '';
+      case 'users': return v.map((u) => u.name).sort().join('\n');
+      case 'epic': case 'parent': return v.key || '';
+      case 'select': case 'priority': return v.id != null ? String(v.id) : '';
+      case 'storyPoints': return typeof v === 'object' ? 'id:' + v.id : String(Number(v));
+      case 'multiselect': case 'components': case 'versions': case 'labels': return [...v].map(String).sort().join('\n');
+      case 'sprint': case 'number': return String(Number(v));
+      case 'datetime': { const ms = Date.parse(v); return Number.isNaN(ms) ? String(v) : String(ms); } // the same instant, any notation
+      case 'estimate': return `${v.originalEstimate || ''}|${v.remainingEstimate || ''}`;
+      default: return typeof v === 'string' ? v : JSON.stringify(v);
+    }
+  }
+
+  /* --- opening / loading --- */
+  function cfDefaultProject() {
+    const keys = trackedKeys() || [];
+    const last = prefs.get('create.project', '');
+    return effProject() || (keys.includes(last) ? last : '') || keys[0] || last || '';
+  }
+  function canCreate() { return isConfigured() && PROJECT_VIEWS.includes(S.view) && activeSectionId() === 'view-' + S.view; }
+
+  /** ctx: { project?, epic?: {key, summary}, sprint?: {id, name} } — context "+" actions pre-fill Epic Link / Sprint. */
+  function openCreate(ctx = {}) {
+    if (!isConfigured() || S.cf) return;
+    const project = ctx.project || cfDefaultProject();
+    S.cf = { mode: 'create', project, issueTypeId: null, prefill: { epic: ctx.epic || null, sprint: ctx.sprint || null }, returnSel: ctx.returnSel || null,
+      fields: [], values: {}, raw: {}, initial: {}, errors: {}, marks: {}, cb: {}, formError: '', loading: true, loadError: null,
+      saving: false, dirty: false, createAnother: false, wikiPreview: false, editor: null, lossy: false, conflict: false, seq: 0 };
+    if (S.cfDraft && S.cfDraft.project === project) { S.cf.carry = S.cfDraft.values; S.cf.dirty = true; }
+    S.cfDraft = null;
+    cfOpenDialog();
+    cfLoad();
+  }
+  /** meta: an edit meta just fetched by the caller (the drawer's Edit button), so the dialog needs no second request. */
+  function openEdit(key, meta) {
+    if (!isConfigured() || S.cf || !key) return;
+    S.cf = { mode: 'edit', key, fields: [], values: {}, raw: {}, initial: {}, errors: {}, marks: {}, cb: {}, formError: '', loading: true,
+      loadError: null, saving: false, dirty: false, wikiPreview: false, editor: null, lossy: false, conflict: false, seq: 0 };
+    if (meta) {
+      cfApplyMeta(meta);
+      S.cf.loading = false;
+      cfOpenDialog();
+      cfFocusFirst();
+      return;
+    }
+    cfOpenDialog();
+    cfLoad();
+  }
+  function cfOpenDialog() {
+    const mode = S.cf.mode;
+    const returnSel = S.cf.returnSel; // the "+" / tree row that opened it (re-found: lists re-render after a create)
+    cfRender();
+    layers.open($('#dlg-issue'), {
+      focus: '#cf-title',
+      onDismiss: () => { if (!S.cf || !S.cf.saving) cfClose(false); }, // CR-13: Esc / scrim do nothing while saving
+      onClose: () => { if (S.cf && S.cf.editor) S.cf.editor.destroy(); S.cf = null; },
+      // edit: back to the drawer's Edit button; create: the top-bar button (else the element that opened it)
+      restoreFocus: () => (mode === 'edit' ? $('#drawer [data-action="edit"]') : (returnSel && $(returnSel)) || $('#create-btn:not([hidden])')) || null,
+    });
+  }
+
+  async function cfLoad(opts = {}) {
+    const cf = S.cf;
+    if (!cf) return;
+    const seq = ++cf.seq;
+    cf.loading = true;
+    cf.loadError = null;
+    cfRender();
+    try {
+      let meta;
+      if (cf.mode === 'edit') meta = await api('getEditMeta', { key: cf.key });
+      else {
+        if (!cf.project) { // no filter / remembered project yet: wait for the tracked projects
+          if (!S.pj.list) await loadProjects(false);
+          if (S.cf !== cf || seq !== cf.seq) return;
+          cf.project = cfDefaultProject();
+          if (!cf.project) throw new ApiError('no_project', t('cf.noProject'));
+        }
+        const params = { project: cf.project };
+        const typeId = opts.issueTypeId || (prefs.get('create.types', {}) || {})[cf.project];
+        if (typeId) params.issueTypeId = String(typeId);
+        meta = await api('getCreateMeta', params);
+      }
+      if (S.cf !== cf || seq !== cf.seq) return;
+      cfApplyMeta(meta, opts.keep);
+    } catch (e) {
+      if (S.cf !== cf || seq !== cf.seq) return;
+      cf.loadError = e;
+      if (cf.dirty) cf.keepDraft = true; // closed by an error: the draft stays in memory for the next Create
+    } finally {
+      if (S.cf === cf && seq === cf.seq) {
+        cf.loading = false;
+        cfRender();
+        const back = cf.focusAfterLoad && $(cf.focusAfterLoad);
+        cf.focusAfterLoad = null;
+        if (back) back.focus({ preventScroll: true }); else cfFocusFirst();
+      }
+    }
+  }
+
+  function cfApplyMeta(meta, keep) {
+    const cf = S.cf;
+    cf.fields = Array.isArray(meta.fields) ? meta.fields : [];
+    cf.descriptionFormat = meta.descriptionFormat === 'wiki' ? 'wiki' : 'html';
+    cf.projectName = (meta.project && meta.project.name) || cf.project;
+    cf.errors = {};
+    cf.marks = {};
+    cf.cb = {};
+    if (cf.mode === 'edit') {
+      cf.project = (meta.project && meta.project.key) || String(cf.key).split('-')[0];
+      cf.issueTypeId = meta.issueTypeId;
+      cf.updated = meta.updated;
+      cf.values = Object.assign({}, meta.values || {});
+      cf.initial = Object.assign({}, meta.values || {});
+      cf.noPermission = !cf.fields.length;
+      cf.url = (findIssueAnywhere(cf.key) || {}).url || (S.drawer && S.drawer.detail && S.drawer.detail.issue && S.drawer.detail.issue.key === cf.key ? S.drawer.detail.issue.url : '');
+      return;
+    }
+    cf.project = (meta.project && meta.project.key) || cf.project;
+    cf.issueTypes = Array.isArray(meta.issueTypes) ? meta.issueTypes : [];
+    cf.issueTypeId = meta.issueTypeId || (cf.issueTypes[0] && cf.issueTypes[0].id);
+    const values = {};
+    cf.fields.forEach((f) => { if (f.default != null) values[f.id] = f.default; });
+    const kept = keep || cf.carry || {};
+    cf.carry = null;
+    // never convert between description formats: a description typed for the other format is not carried over
+    cf.droppedDescription = !!(kept.descriptionFormat && kept.descriptionFormat !== cf.descriptionFormat && !isEmptyVal(kept.description));
+    cf.fields.forEach((f) => {
+      const k = f.kind === 'summary' ? 'summary' : f.kind === 'description' ? 'description' : f.id;
+      if (k === 'description' && cf.droppedDescription) return;
+      if (Object.prototype.hasOwnProperty.call(kept, k) && !isEmptyVal(kept[k])) values[f.id] = kept[k];
+      if (f.kind === 'epic' && cf.prefill.epic) values[f.id] = cf.prefill.epic;
+      if (f.kind === 'sprint' && cf.prefill.sprint) {
+        if ((f.options || []).some((o) => String(o.id) === String(cf.prefill.sprint.id))) values[f.id] = Number(cf.prefill.sprint.id);
+        else cf.marks[f.id] = t('cf.sprintNotOffered', { sprint: cf.prefill.sprint.name, project: cf.project });
+      }
+    });
+    cf.values = values;
+    cf.initial = {};
+  }
+
+  /** Values kept when the project / type changes (description only if the format stays the same). */
+  function cfKeepValues() {
+    const cf = S.cf;
+    const out = {};
+    cfCollectRaw();
+    cf.fields.forEach((f) => {
+      const k = f.kind === 'summary' ? 'summary' : f.kind === 'description' ? 'description' : f.id;
+      if (CF_KEEP_ON_SWITCH.includes(k) || f.kind === 'labels' || f.kind === 'user' && f.id === 'assignee') out[k] = cf.values[f.id];
+    });
+    out.descriptionFormat = cf.descriptionFormat;
+    return out;
+  }
+
+  /* --- rendering --- */
+  function cfTitle(cf) {
+    if (cf.mode === 'edit') return t('cf.editTitle', { key: cf.key });
+    return t('cf.createTitle');
+  }
+  function cfRender() {
+    const cf = S.cf;
+    if (!cf) return;
+    $('#cf-title').textContent = cfTitle(cf);
+    const body = $('#cf-body');
+    if (cf.editor) { cf.editor.destroy(); cf.editor = null; }
+    let content;
+    const keepFocus = document.activeElement && document.activeElement.id === 'cf-project';
+    if (cf.loading && !cf.fields.length && cf.mode === 'create' && cf.project) {
+      content = html`${cfHeadHTML(cf)}<div class="cf-skeleton" role="status" aria-label="${t('common.loading')}">${[92, 100, 60, 60].map((w) => html`<span class="skeleton sk-line" style="width:${w}%"></span>`)}<span class="skeleton" style="height:140px"></span></div>`;
+    } else if (cf.loading && !cf.fields.length) {
+      content = html`<div class="cf-skeleton" role="status" aria-label="${t('common.loading')}">${[40, 92, 100, 60, 60].map((w) => html`<span class="skeleton sk-line" style="width:${w}%"></span>`)}<span class="skeleton" style="height:140px"></span></div>`;
+    } else if (cf.loadError && !cf.fields.length) {
+      content = stateBlock({ iconName: 'alert', tone: 'error', title: t(cf.mode === 'edit' ? 'cf.editLoadFailed' : 'cf.loadFailed'), text: errorText(cf.loadError), action: { id: 'cf-retry', label: t('common.retry') } });
+    } else if (cf.mode === 'edit' && cf.noPermission) {
+      content = stateBlock({ iconName: 'alert', tone: 'warn', title: t('cf.noPermission'), text: t('cf.noPermissionText') });
+    } else content = cfFormHTML(cf);
+    setHTML(body, content);
+    if (keepFocus && $('#cf-project')) $('#cf-project').focus({ preventScroll: true });
+    body.setAttribute('aria-busy', cf.loading ? 'true' : 'false');
+    cfAfterRender();
+    cfRenderFooter();
+  }
+  function cfHeadHTML(cf) {
+    const projects = (S.pj.list || []).filter((p) => p.available !== false);
+    const projOpts = projects.length ? projects : [{ key: cf.project, name: cf.projectName || cf.project, tracked: true }];
+    if (!projOpts.some((p) => p.key === cf.project)) projOpts.unshift({ key: cf.project, name: cf.projectName || cf.project, tracked: true });
+    const tracked = projOpts.filter((p) => p.tracked);
+    const others = projOpts.filter((p) => !p.tracked);
+    const opt = (p) => html`<option value="${p.key}"${p.key === cf.project ? html` selected` : ''}>${p.key} — ${p.name || p.key}</option>`;
+    const head = cf.mode === 'create'
+      ? html`<div class="cf-row cf-head">
+          <div class="cf-field">
+            <label class="cf-label" for="cf-project">${t('cf.project')}</label>
+            <select class="input select" id="cf-project" data-cf-control="project">${others.length ? html`<optgroup label="${t('cf.projectsTracked')}">${tracked.map(opt)}</optgroup><optgroup label="${t('cf.projectsOther')}">${others.map(opt)}</optgroup>` : projOpts.map(opt)}</select>
+          </div>
+          <div class="cf-field cf-types-field">
+            <span class="cf-label" id="cf-type-l">${t('cf.issueType')}</span>
+            <div class="cf-types" role="radiogroup" aria-labelledby="cf-type-l">${(cf.issueTypes || []).map((ty) => {
+              const on = String(ty.id) === String(cf.issueTypeId);
+              return html`<button type="button" role="radio" class="cf-type" data-cf-type="${ty.id}" aria-checked="${on ? 'true' : 'false'}" tabindex="${on ? '0' : '-1'}"${cf.loading ? html` disabled` : ''}>${typeIcon({ name: ty.name, kind: ty.subtask ? 'subtask' : ty.kind }, true)}<span>${ty.name}</span></button>`;
+            })}</div>
+          </div>
+        </div>`
+      : html`<p class="cf-context">${t('cf.editContext', { project: cf.projectName || cf.project })}</p>`;
+    return head;
+  }
+  function cfFormHTML(cf) {
+    const unsupported = cf.fields.filter((f) => f.kind === 'unsupported' && f.required);
+    const head = cfHeadHTML(cf);
+    const created = cf.created && cf.created.key
+      ? html`<div class="notice cf-created">${icon('check-circle')}<span class="notice-text">${t('cf.created', { key: cf.created.key })}${cf.created.warning ? html`<span class="cf-created-warn">${cf.created.warning}</span>` : ''}</span><button type="button" class="link-btn" data-cf="open-created" data-key="${cf.created.key}">${t('common.open')}</button></div>`
+      : '';
+    const notice = unsupported.length
+      ? html`<div class="notice notice-warn cf-unsupported-notice" role="note">${icon('alert')}<span>${t('cf.unsupportedNotice', { n: unsupported.length })}</span><button type="button" class="link-btn" data-cf="open-jira">${t('cf.openInJira')}</button></div>`
+      : '';
+    const conflict = cf.conflict
+      ? html`<div class="notice notice-warn cf-conflict" role="alert">${icon('alert')}<span class="notice-text">${t('cf.conflict')}</span><button type="button" class="btn btn-sm" data-cf="reload">${icon('refresh')}<span>${t('cf.reload')}</span></button><button type="button" class="btn btn-sm btn-ghost" data-cf="cancel">${t('common.cancel')}</button></div>`
+      : '';
+    const formErr = cf.formError ? html`<div class="form-alert" role="alert" id="cf-form-error">${icon('alert')}<span>${cf.formError}</span></div>` : '';
+    // DR-25: consecutive story-point fields (SP, Dev SP, QA SP) share one row of equal compact controls
+    const parts = [];
+    let sp = [];
+    const flush = () => { if (sp.length > 1) parts.push(html`<div class="cf-sp-row">${sp.map(cfFieldHTML)}</div>`); else sp.forEach((f) => parts.push(cfFieldHTML(f))); sp = []; };
+    cf.fields.forEach((f) => { if (f.kind === 'storyPoints') sp.push(f); else { flush(); parts.push(cfFieldHTML(f)); } });
+    flush();
+    return html`${created}${head}${notice}${conflict}${formErr}<div class="cf-fields">${parts}</div>`;
+  }
+
+  function cfFieldHTML(f) {
+    const cf = S.cf;
+    const id = cfId(f.id);
+    const v = cf.values[f.id];
+    const err = cf.errors[f.id];
+    const mark = cf.marks[f.id];
+    const wide = CF_WIDE.has(f.kind) || (f.kind === 'text' && (f.max || 255) > 100 && f.main === false);
+    const descIds = [err ? id + '-e' : '', mark ? id + '-m' : '', id + '-h'].filter(Boolean).join(' ');
+    const a11y = html`id="${id}" data-field="${f.id}" aria-describedby="${descIds}"${f.required ? html` aria-required="true"` : ''}${err ? html` aria-invalid="true"` : ''}`;
+    let control;
+    let hint = '';
+    let labelFor = id;
+    switch (f.kind) {
+      case 'summary': case 'text': case 'epicName':
+        control = html`<input class="input" type="text" ${a11y} maxlength="${f.max || (f.kind === 'summary' ? 255 : 255)}" value="${v || ''}" autocomplete="off">`;
+        break;
+      case 'textarea':
+        control = html`<textarea class="input textarea" rows="3" ${a11y}>${v || ''}</textarea>`;
+        break;
+      case 'description':
+        if (cf.descriptionFormat === 'wiki') {
+          const pv = cf.wikiPreview;
+          control = html`<div class="cf-wiki">
+            <div class="cf-wiki-bar"><span class="cf-wiki-note">${t('cf.wikiNote')}</span><button type="button" class="btn btn-sm${pv ? ' is-on' : ''}" data-cf="preview" aria-pressed="${pv ? 'true' : 'false'}" aria-controls="${id}-pv">${icon('eye')}<span>${t('cf.preview')}</span></button></div>
+            <textarea class="input textarea mono cf-wiki-text" rows="8" ${a11y} spellcheck="false"${pv ? html` hidden` : ''}>${v || ''}</textarea>
+            <div class="cf-wiki-preview" id="${id}-pv" role="region" aria-label="${t('cf.preview')}" tabindex="0"${pv ? '' : html` hidden`}></div>
+          </div>`;
+        } else {
+          labelFor = '';
+          control = html`${cf.lossy ? html`<div class="notice notice-tip cf-lossy" role="note">${icon('info')}<span class="notice-text">${t('cf.lossy')}</span>${cf.url ? html`<button type="button" class="link-btn" data-cf="open-jira">${t('cf.editInJira')}</button>` : ''}</div>` : ''}<div class="cf-editor" data-editor="${f.id}"></div>`;
+        }
+        break;
+      case 'number':
+        control = html`<input class="input input-num cf-num" type="text" inputmode="decimal" ${a11y} value="${cf.raw[f.id] != null ? cf.raw[f.id] : cfNumText(v)}" autocomplete="off">`;
+        break;
+      case 'storyPoints':
+        if (f.options && f.options.length) control = cfSelect(f, a11y, v && v.id);
+        else control = html`<input class="input input-num cf-num" type="text" inputmode="decimal" ${a11y} value="${cf.raw[f.id] != null ? cf.raw[f.id] : cfNumText(v)}" autocomplete="off">`;
+        break;
+      case 'select': case 'priority':
+        control = cfSelect(f, a11y, v && v.id);
+        break;
+      case 'sprint':
+        control = cfSelect(f, a11y, v, t('cf.backlog'));
+        break;
+      case 'date':
+        control = html`<input class="input input-date" type="text" inputmode="numeric" maxlength="10" data-mask="date" ${a11y} value="${cf.raw[f.id] != null ? cf.raw[f.id] : v ? i18n.formatInputDate(v) : ''}" placeholder="${t('settings.datePlaceholder')}" autocomplete="off">`;
+        break;
+      case 'datetime':
+        control = html`<input class="input cf-datetime" type="text" ${a11y} value="${cf.raw[f.id] != null ? cf.raw[f.id] : v ? cfFormatDateTime(v) : ''}" placeholder="${t('cf.datetimePlaceholder', { date: t('settings.datePlaceholder') })}" autocomplete="off">`;
+        break;
+      case 'labels':
+        control = cfChips(f, id, a11y, (v || []).map((x) => ({ key: x, label: x })), t('cf.labelsPlaceholder'));
+        hint = t('cf.labelsHint');
+        break;
+      case 'multiselect': case 'components': case 'versions': {
+        const byId = new Map((f.options || []).map((o) => [String(o.id), o.name]));
+        control = cfChips(f, id, a11y, (v || []).map((x) => ({ key: String(x), label: byId.get(String(x)) || String(x) })), t('cf.choose'));
+        break;
+      }
+      case 'users':
+        control = cfChips(f, id, a11y, (v || []).map((u) => ({ key: u.name, label: u.displayName || u.name })), t('cf.searchPeople'));
+        break;
+      case 'user': {
+        control = cfCombo(f, id, a11y, v ? v.displayName || v.name : '', t('cf.searchPeople'), !!v);
+        const self = me();
+        control = html`${control}<div class="cf-quick">${self && (!v || v.name !== self.name) ? html`<button type="button" class="link-btn" data-cf="assign-me" data-field="${f.id}">${t('cf.assignToMe')}</button>` : ''}${!f.required && v ? html`<button type="button" class="link-btn" data-cf="unassign" data-field="${f.id}">${t('cf.unassign')}</button>` : ''}</div>`;
+        break;
+      }
+      case 'epic': case 'parent':
+        control = cfCombo(f, id, a11y, v ? `${v.key}${v.summary ? ' ' + v.summary : ''}` : '', t(f.kind === 'epic' ? 'cf.searchEpic' : 'cf.searchParent'), !!v);
+        break;
+      case 'estimate': {
+        const raw = cf.raw[f.id] || {};
+        const val = v || {};
+        labelFor = id;
+        control = html`<div class="cf-estimate">
+          <label class="cf-sublabel"><span>${t('drawer.estOriginal')}</span><input class="input cf-est" type="text" ${a11y} data-part="originalEstimate" value="${raw.originalEstimate != null ? raw.originalEstimate : val.originalEstimate || ''}" placeholder="1d 2h" autocomplete="off"></label>
+          <label class="cf-sublabel"><span>${t('drawer.estRemaining')}</span><input class="input cf-est" type="text" id="${id}-rem" data-field="${f.id}" data-part="remainingEstimate" aria-describedby="${descIds}"${err ? html` aria-invalid="true"` : ''} value="${raw.remainingEstimate != null ? raw.remainingEstimate : val.remainingEstimate || ''}" placeholder="1d" autocomplete="off"></label>
+        </div>`;
+        hint = t('cf.estimateHint', { h: fmtNum((S.settings && S.settings.hoursPerDay) || 8) });
+        break;
+      }
+      case 'unsupported':
+        labelFor = '';
+        control = html`<div class="cf-unsupported" id="${id}" data-field="${f.id}" aria-describedby="${descIds}">${icon('external', 'icon-sm')}<span>${t('cf.unsupported')}</span><button type="button" class="link-btn" data-cf="open-jira">${t('cf.openInJira')}</button></div>`;
+        break;
+      default:
+        control = html`<input class="input" type="text" ${a11y} value="${typeof v === 'string' ? v : ''}">`;
+    }
+    const req = f.required ? html`<span class="cf-req" aria-hidden="true">*</span><span class="sr-only">${t('cf.requiredSr')}</span>` : '';
+    const label = labelFor ? html`<label class="cf-label" for="${labelFor}" id="${id}-l">${f.name}${req}</label>` : html`<span class="cf-label" id="${id}-l">${f.name}${req}</span>`;
+    return html`<div class="cf-field${wide ? ' is-wide' : ''}" data-fwrap="${f.id}" data-kind="${f.kind}">
+      ${label}${control}
+      <p class="hint cf-hint" id="${id}-h"${hint ? '' : html` hidden`}>${hint}</p>
+      <p class="cf-mark" id="${id}-m"${mark ? '' : html` hidden`}>${icon('alert', 'icon-sm')}<span>${mark || ''}</span></p>
+      <p class="field-error" id="${id}-e" data-cf-error="${f.id}"${err ? '' : html` hidden`}>${err || ''}</p>
+    </div>`;
+  }
+  function cfSelect(f, a11y, cur, emptyLabel) {
+    const sel = cur == null ? '' : String(cur);
+    const opts = f.options || [];
+    return html`<select class="input select" ${a11y}>
+      ${!f.required || !sel ? html`<option value=""${sel ? '' : html` selected`}>${emptyLabel || t('cf.none')}</option>` : ''}
+      ${opts.map((o) => html`<option value="${o.id}"${String(o.id) === sel ? html` selected` : ''}>${o.name}${o.state === 'active' ? ' · ' + t('sprints.state.active') : ''}</option>`)}
+    </select>`;
+  }
+  function cfCombo(f, id, a11y, text, placeholder, hasValue) {
+    return html`<div class="cb" data-cb="${f.id}">
+      <div class="cb-box">
+        <input class="input cb-input" type="text" ${a11y} role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="${id}-lb" value="${text}" placeholder="${placeholder}" autocomplete="off" spellcheck="false">
+        ${hasValue && !f.required ? html`<button type="button" class="icon-btn icon-btn-sm cb-clear" data-cf="clear" data-field="${f.id}" aria-label="${t('cf.clearField', { name: f.name })}" title="${t('cf.clearField', { name: f.name })}">${icon('x')}</button>` : ''}
+      </div>
+      <ul class="cb-list" id="${id}-lb" role="listbox" aria-label="${f.name}" hidden></ul>
+    </div>`;
+  }
+  function cfChips(f, id, a11y, chips, placeholder) {
+    const listbox = f.kind !== 'labels';
+    return html`<div class="cb cb-multi" data-cb="${f.id}">
+      <div class="cb-box">
+        <ul class="cb-chips" role="list" aria-label="${f.name}">${chips.map((c) => html`<li class="chip cb-chip"><span>${c.label}</span><button type="button" class="cb-chip-x" data-cf="chip-remove" data-field="${f.id}" data-key="${c.key}" aria-label="${t('cf.removeValue', { value: c.label })}">${icon('x')}</button></li>`)}</ul>
+        <input class="cb-input cb-inline" type="text" ${a11y}${listbox ? html` role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="${id}-lb"` : ''} placeholder="${placeholder}" autocomplete="off" spellcheck="false">
+      </div>
+      ${listbox ? html`<ul class="cb-list" id="${id}-lb" role="listbox" aria-label="${f.name}" aria-multiselectable="true" hidden></ul>` : ''}
+    </div>`;
+  }
+
+  /** Editor / preview after the field markup is in place. */
+  function cfAfterRender() {
+    const cf = S.cf;
+    const host = $('#cf-body [data-editor]');
+    if (host) {
+      const fid = host.dataset.editor;
+      const id = cfId(fid);
+      const f = cfField(fid);
+      cf.editor = JiraffeEditor.create({
+        host, label: f ? f.name : t('drawer.description'), describedBy: `${id}-e ${id}-h`, t,
+        sanitize: (src) => wiki.sanitizeForEditor(src),
+        onChange: () => { cf.dirty = true; cfSetError(fid, null); },
+        onNotice: (msg) => toast(msg, { tone: 'warn' }),
+      });
+      cf.editor.el.id = id;
+      cf.editor.el.dataset.field = fid;
+      const res = cf.editor.load(cf.values[fid] || '');
+      if (cf.mode === 'edit' && cf.lossyKnown == null) { cf.lossyKnown = true; if (res.lossy && !cf.lossy) { cf.lossy = true; cfRender(); return; } }
+      if (cf.errors[fid]) cf.editor.setInvalid(true, `${id}-e ${id}-h`);
+    }
+    const pv = $('#cf-body .cf-wiki-preview:not([hidden])');
+    if (pv) pv.replaceChildren(wiki.render($('#cf-body .cf-wiki-text').value || ''));
+  }
+
+  function cfRenderFooter() {
+    const cf = S.cf;
+    const foot = $('#cf-foot');
+    if (!cf) return;
+    const x = $('#dlg-issue [data-cf="close"]');
+    if (cf.saving) x.setAttribute('aria-disabled', 'true'); else x.removeAttribute('aria-disabled');
+    const ready = !cf.loading && !cf.loadError && cf.fields.length && !(cf.mode === 'edit' && cf.noPermission);
+    const blocked = cf.mode === 'create' && cf.fields.some((f) => f.kind === 'unsupported' && f.required);
+    const primary = cf.mode === 'create' ? t('cf.create') : t('common.save');
+    setHTML(foot, html`
+      ${cf.mode === 'create' ? html`<label class="mine-toggle cf-another"><input type="checkbox" role="switch" class="switch" id="cf-another"${cf.createAnother ? html` checked` : ''}><span>${t('cf.createAnother')}</span></label>` : ''}
+      <span class="cf-foot-note" id="cf-foot-note">${blocked ? t('cf.blockedNote') : ''}</span>
+      <button type="button" class="btn" data-cf="cancel"${cf.saving ? html` aria-disabled="true"` : ''}>${t('common.cancel')}</button>
+      <button type="button" class="btn btn-primary" data-cf="submit"${cf.saving ? html` aria-busy="true"` : ''}${!ready || blocked ? html` aria-disabled="true"` : ''}${blocked ? html` aria-describedby="cf-foot-note"` : ''}>${primary}</button>`);
+  }
+
+  /** Re-renders one field (pickers, chips, preview); keeps focus on its main control. */
+  function cfRerenderField(fid, focusSel) {
+    const cf = S.cf;
+    const f = cfField(fid);
+    const wrap = $(`#cf-body [data-fwrap="${CSS.escape(fid)}"]`);
+    if (!f || !wrap || f.kind === 'description' && cf.descriptionFormat !== 'wiki') return;
+    const box = document.createElement('div');
+    setHTML(box, cfFieldHTML(f));
+    const fresh = box.firstElementChild;
+    cf.replacing = true; // removing the focused control fires focusout: don't react to it
+    try { wrap.replaceWith(fresh); } finally { cf.replacing = false; }
+    const pv = $('.cf-wiki-preview:not([hidden])', fresh);
+    if (pv) pv.replaceChildren(wiki.render($('.cf-wiki-text', fresh).value || ''));
+    const target = (focusSel && $(focusSel, fresh)) || $(`#${CSS.escape(cfId(fid))}`, fresh);
+    if (target && focusSel !== false) target.focus({ preventScroll: true });
+  }
+
+  function cfSetError(fid, msg) {
+    const cf = S.cf;
+    if (!cf) return;
+    if (msg) cf.errors[fid] = msg; else delete cf.errors[fid];
+    const id = cfId(fid);
+    const p = $(`#cf-body [data-cf-error="${CSS.escape(fid)}"]`);
+    if (p) { p.textContent = msg || ''; p.hidden = !msg; }
+    $$(`#cf-body [data-field="${CSS.escape(fid)}"]`).forEach((c) => {
+      if (c.classList.contains('rte-content')) return;
+      if (msg) c.setAttribute('aria-invalid', 'true'); else c.removeAttribute('aria-invalid');
+      const ids = [msg ? id + '-e' : '', cf.marks[fid] ? id + '-m' : '', id + '-h'].filter(Boolean).join(' ');
+      c.setAttribute('aria-describedby', ids);
+    });
+    if (cf.editor && cf.editor.el.dataset.field === fid) cf.editor.setInvalid(!!msg, `${id}-e ${id}-h`);
+  }
+  function cfFocusFirst(invalidOnly) {
+    const cf = S.cf;
+    if (!cf || !$('#dlg-issue').open) return;
+    const body = $('#cf-body');
+    if (invalidOnly) {
+      const fid = cf.fields.map((f) => f.id).find((x) => cf.errors[x]);
+      const target = fid ? (fid === 'description' || (cfField(fid) || {}).kind === 'description') && cf.editor ? cf.editor.el : $(`[data-field="${CSS.escape(fid)}"]`, body) : $('#cf-form-error');
+      if (target) { if (target.id === 'cf-form-error') target.setAttribute('tabindex', '-1'); target.focus(); target.scrollIntoView({ block: 'nearest' }); }
+      return;
+    }
+    if (body.contains(document.activeElement)) return;
+    const first = $('[data-field]:not([disabled])', body) || $('#cf-retry, [data-action="cf-retry"]', body);
+    if (first) first.focus({ preventScroll: true });
+  }
+
+  /* --- values --- */
+  /** Reads the plain inputs into cf.raw / cf.values (pickers and chips update values directly). */
+  function cfCollectRaw() {
+    const cf = S.cf;
+    $$('#cf-body [data-field]').forEach((c) => {
+      const fid = c.dataset.field;
+      const f = cfField(fid);
+      if (!f || c.classList.contains('cb-input') || c.classList.contains('rte-content')) return;
+      if (c.tagName === 'SELECT') {
+        const val = c.value;
+        if (f.kind === 'sprint') cf.values[fid] = val ? Number(val) : null;
+        else cf.values[fid] = val ? { id: val } : null;
+        return;
+      }
+      // number / date / datetime / estimate: cf.raw is set by the input handler only when the user typed there (CR-11);
+      // an untouched control keeps the value Jira sent.
+      if (f.kind === 'estimate' || ['number', 'storyPoints', 'date', 'datetime'].includes(f.kind)) return;
+      if (c.tagName === 'INPUT' || c.tagName === 'TEXTAREA') cf.values[fid] = c.value;
+    });
+    if (cf.editor) {
+      const fid = cf.editor.el.dataset.field;
+      cf.values[fid] = cf.editor.getHTML();
+    }
+  }
+  /** The current value of one field and its error: typed text is parsed only for touched controls (cf.raw). */
+  function cfFieldValue(f) {
+    const cf = S.cf;
+    const fid = f.id;
+    let v = cf.values[fid];
+    const raw = cf.raw[fid];
+    let err = null;
+    switch (f.kind) {
+      case 'number': case 'storyPoints':
+        if (f.kind === 'storyPoints' && f.options && f.options.length) break;
+        if (raw != null) {
+          if (!String(raw).trim()) v = null;
+          else { const n = cfParseNum(raw); if (Number.isNaN(n)) err = t('cf.numberInvalid'); else v = n; }
+        }
+        break;
+      case 'date':
+        if (raw != null) { const s1 = raw.trim(); if (!s1) v = null; else { const iso = i18n.parseInputDate(s1); if (iso) v = iso; else err = t('settings.dateInvalid'); } }
+        break;
+      case 'datetime':
+        if (raw != null) { const s1 = raw.trim(); if (!s1) v = null; else { const iso = cfParseDateTime(s1); if (iso) v = iso; else err = t('cf.datetimeInvalid'); } }
+        break;
+      case 'estimate': {
+        const init = cf.initial[fid] || {};
+        const r = Object.assign({ originalEstimate: (v || {}).originalEstimate || '', remainingEstimate: (v || {}).remainingEstimate || '' }, raw || {});
+        const o = String(r.originalEstimate || '').trim(); const rem = String(r.remainingEstimate || '').trim();
+        if ((o && !DURATION.test(o)) || (rem && !DURATION.test(rem))) err = t('cf.estimateInvalid');
+        // CR-17: a part that had a value can't be cleared (Jira would keep the old value)
+        else if (cf.mode === 'edit' && ((!o && init.originalEstimate) || (!rem && init.remainingEstimate))) err = t('cf.estimateNoClear');
+        v = o || rem ? Object.assign(o ? { originalEstimate: o } : {}, rem ? { remainingEstimate: rem } : {}) : null;
+        break;
+      }
+      default:
+    }
+    return { v, err };
+  }
+
+  /** Parses and validates everything; returns { values, errors }. */
+  function cfValidate() {
+    const cf = S.cf;
+    cfCollectRaw();
+    const errors = {};
+    const values = {};
+    cf.fields.forEach((f) => {
+      const fid = f.id;
+      const parsed = cfFieldValue(f);
+      let v = parsed.v;
+      if (parsed.err) errors[fid] = parsed.err;
+      switch (f.kind) {
+        case 'summary': case 'text': case 'textarea': case 'epicName':
+          v = typeof v === 'string' ? (f.kind === 'textarea' ? v.replace(/\s+$/, '') : v.trim()) : v;
+          if (v && v.length > (f.max || 255) && f.kind !== 'textarea') errors[fid] = t('cf.tooLong', { n: f.max || 255 });
+          break;
+        case 'description':
+          if (typeof v === 'string' && v.length > 32000) errors[fid] = t('cf.tooLong', { n: 32000 });
+          break;
+        default:
+      }
+      if (f.required && f.kind !== 'unsupported' && !errors[fid] && isEmptyVal(f.kind === 'description' && cf.editor ? (cf.editor.isEmpty() ? '' : v) : v)) errors[fid] = t('cf.required');
+      values[fid] = isEmptyVal(v) ? null : v;
+    });
+    return { values, errors };
+  }
+  /** FieldValue as written (SPEC "Contract additions (v0.5)"): users / issues by name / key only. */
+  function cfWire(kind, v) {
+    if (v == null) return v;
+    if (kind === 'user') return { name: v.name };
+    if (kind === 'users') return v.map((u) => ({ name: u.name }));
+    if (kind === 'epic' || kind === 'parent') return { key: v.key };
+    return v;
+  }
+  /** Create: non-empty values; edit: the changed fields only (unchanged description is never re-sent). */
+  function cfPayload(values) {
+    const cf = S.cf;
+    const out = {};
+    cf.fields.forEach((f) => {
+      if (f.kind === 'unsupported') return;
+      const v = cfWire(f.kind, values[f.id]);
+      if (cf.mode === 'create') { if (!isEmptyVal(v)) out[f.id] = v; return; }
+      if (f.kind === 'description') {
+        const changed = cf.editor ? cf.editor.isChanged() || cf.descForced : cfCanon('description', v) !== cfCanon('description', cf.initial[f.id]);
+        if (changed) out[f.id] = v == null ? '' : v;
+        return;
+      }
+      if (cfCanon(f.kind, v) !== cfCanon(f.kind, cf.initial[f.id])) out[f.id] = v;
+    });
+    return out;
+  }
+  function cfParseDateTime(s) {
+    const m = /^(\d{1,2})[./-](\d{1,2})[./-](\d{4})\s+(\d{1,2}):(\d{2})$/.exec(s) || /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})/.exec(s);
+    if (!m) return null;
+    const [y, mo, d] = m[1].length === 4 ? [m[1], m[2], m[3]] : [m[3], m[2], m[1]];
+    const dt = new Date(Number(y), Number(mo) - 1, Number(d), Number(m[4]), Number(m[5]));
+    if (isNaN(dt.getTime()) || dt.getDate() !== Number(d)) return null;
+    const off = -dt.getTimezoneOffset();
+    const p2 = (n) => String(Math.abs(n)).padStart(2, '0');
+    return `${y}-${p2(mo)}-${p2(d)}T${p2(m[4])}:${m[5]}:00${off >= 0 ? '+' : '-'}${p2(Math.floor(Math.abs(off) / 60))}:${p2(Math.abs(off) % 60)}`;
+  }
+  function cfFormatDateTime(iso) {
+    const d = parseDate(iso);
+    if (!d) return String(iso || '');
+    const p2 = (n) => String(n).padStart(2, '0');
+    return `${i18n.formatInputDate(i18n.isoDate(d))} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+  }
+
+  function cfSetValue(fid, v, focusSel) {
+    const cf = S.cf;
+    cf.values[fid] = v;
+    cf.dirty = true;
+    delete cf.errors[fid];
+    cfRerenderField(fid, focusSel);
+  }
+
+  /* --- submit --- */
+  async function cfSubmit() {
+    const cf = S.cf;
+    if (!cf || cf.saving || cf.loading) return;
+    const btn = $('#cf-foot [data-cf="submit"]');
+    if (btn && btn.getAttribute('aria-disabled') === 'true') return;
+    const { values, errors } = cfValidate();
+    cf.formError = '';
+    if (cf.created) { cf.created = null; const n = $('#cf-body .cf-created'); if (n) n.remove(); }
+    Object.keys(cf.errors).forEach((k) => cfSetError(k, null));
+    Object.entries(errors).forEach(([k, m]) => cfSetError(k, m));
+    const fe = $('#cf-form-error'); if (fe) fe.remove();
+    cf.errorLinks = [];
+    if (Object.keys(errors).length) {
+      const order = cf.fields.map((f) => f.id).filter((x) => errors[x]);
+      const req = order.filter((x) => errors[x] === t('cf.required')).length;
+      const other = order.length - req;
+      cf.formError = [req ? t('cf.fillRequired', { n: req }) : '', other ? t('cf.fixInvalid', { n: other }) : ''].filter(Boolean).join(' ');
+      cf.formErrorQuiet = true; // announced through #cf-live below (no second role=alert)
+      cf.errorLinks = order;
+      cfRefreshNotices();
+      $('#cf-live').textContent = cf.formError;
+      cfFocusFirst(true);
+      return;
+    }
+    cf.formErrorQuiet = false;
+    const payload = cfPayload(values);
+    if (cf.mode === 'edit' && !Object.keys(payload).length) { cf.dirty = false; cfClose(true); toast(t('cf.nothingChanged')); return; }
+    cf.saving = true;
+    cfRenderFooter();
+    try {
+      if (cf.mode === 'create') {
+        const res = await api('createIssue', { project: cf.project, issueTypeId: String(cf.issueTypeId), values: payload });
+        prefs.set('create.project', cf.project);
+        prefs.set('create.types', Object.assign({}, prefs.get('create.types', {}) || {}, { [cf.project]: String(cf.issueTypeId) }));
+        const key = res && res.key;
+        cfAfterChange(cf.project, null);
+        if (cf.createAnother && S.cf === cf) {
+          // DR-30: the form stays open — the result is a notice at the top of the form (a toast would cover the dialog)
+          cf.created = { key, warning: (res && res.warning) || '' };
+          cfResetForAnother();
+          $('#cf-live').textContent = [t('cf.created', { key }), cf.created.warning].filter(Boolean).join('. ');
+          return;
+        }
+        toast(t('cf.created', { key }), { tone: 'success', action: key ? { label: t('common.open'), run: () => openIssue(key) } : null });
+        if (res && res.warning) toast(res.warning, { tone: 'warn' }); // created, but e.g. the sprint move failed
+        cf.dirty = false;
+        cfClose(true);
+      } else {
+        const res = await api('updateIssue', { key: cf.key, values: payload, expectedUpdated: cf.updated });
+        toast(t('cf.saved', { key: cf.key }), { tone: 'success' });
+        if (res && res.warning) toast(res.warning, { tone: 'warn' }); // saved, but e.g. the sprint move failed
+        cfAfterChange(cf.project, cf.key);
+        cf.dirty = false;
+        cfClose(true);
+      }
+    } catch (e) {
+      if (S.cf !== cf) return;
+      if (e.code === 'validation' && e.fields.length) {
+        const known = e.fields.filter((x) => cfField(x.field));
+        const rest = e.fields.filter((x) => !cfField(x.field));
+        known.forEach((x) => cfSetError(x.field, x.message));
+        cf.errorLinks = cf.fields.map((f) => f.id).filter((x) => known.some((k) => k.field === x));
+        // the message names the problem and carries Jira's errorMessages / errors of other fields
+        cf.formError = [e.message, ...rest.map((x) => x.message).filter((m) => !String(e.message).includes(m))].filter(Boolean).join(' ');
+      } else if (e.code === 'validation') cf.formError = e.message || t('cf.saveFailed');
+      else if (e.code === 'edit_conflict') { cf.conflict = true; cf.formError = ''; }
+      else cf.formError = `${t(cf.mode === 'create' ? 'cf.createFailed' : 'cf.saveFailed')}: ${errorText(e)}`;
+      cfRefreshNotices();
+      if (cf.conflict) { const r = $('#cf-body [data-cf="reload"]'); if (r) r.focus(); } else cfFocusFirst(true);
+    } finally {
+      if (S.cf === cf) { cf.saving = false; cfRenderFooter(); }
+    }
+  }
+  /** Conflict / form error banners without re-rendering the fields (the editor keeps its state). */
+  function cfRefreshNotices() {
+    const cf = S.cf;
+    const body = $('#cf-body');
+    $$('.cf-conflict, #cf-form-error', body).forEach((x) => x.remove());
+    const fields = $('.cf-fields', body);
+    if (!fields) return;
+    const box = document.createElement('div');
+    const parts = [];
+    if (cf.conflict) parts.push(html`<div class="notice notice-warn cf-conflict" role="alert">${icon('alert')}<span class="notice-text">${t('cf.conflict')}</span><button type="button" class="btn btn-sm" data-cf="reload">${icon('refresh')}<span>${t('cf.reload')}</span></button><button type="button" class="btn btn-sm btn-ghost" data-cf="cancel">${t('common.cancel')}</button></div>`);
+    if (cf.formError) {
+      const links = (cf.errorLinks || []).map((fid) => cfField(fid)).filter(Boolean);
+      parts.push(html`<div class="form-alert cf-form-alert"${cf.formErrorQuiet ? '' : html` role="alert"`} id="cf-form-error">${icon('alert')}<div><span>${cf.formError}</span>${links.length ? html`<ul class="cf-error-links" role="list">${links.map((f) => html`<li><button type="button" class="link-btn" data-cf="goto" data-field="${f.id}">${f.name}</button></li>`)}</ul>` : ''}</div></div>`);
+    }
+    setHTML(box, html`${parts}`);
+    fields.before(...box.childNodes);
+  }
+  function cfAfterChange(project, key) {
+    // The backend emits `board` (views reload); the drawer re-reads the edited issue.
+    if (key) {
+      detailCache.delete(key);
+      if (S.drawer && drawerKey() === key) loadDetail({ silent: true });
+    }
+  }
+  function cfResetForAnother() {
+    const cf = S.cf;
+    const keep = {};
+    cf.fields.forEach((f) => { if (f.kind === 'epic' || f.kind === 'sprint') keep[f.id] = cf.values[f.id]; });
+    cf.values = Object.assign({}, keep);
+    cf.fields.forEach((f) => { if (f.default != null && cf.values[f.id] == null) cf.values[f.id] = f.default; });
+    cf.raw = {};
+    cf.errors = {};
+    cf.formError = '';
+    cf.saving = false;
+    cfRender();
+    cf.dirty = false; // DR-22: the reset form is the new baseline (closing it doesn't prompt)
+    const s = $('#cf-body [data-field="summary"]');
+    if (s) s.focus();
+  }
+
+  /* --- edit conflict: reload --- */
+  async function cfReloadConflict() {
+    const cf = S.cf;
+    if (!cf || cf.mode !== 'edit') return;
+    cfCollectRaw();
+    let meta;
+    try { meta = await api('getEditMeta', { key: cf.key }); } catch (e) { toastError(t('cf.reloadFailed'), e); return; }
+    if (S.cf !== cf) return;
+    const fresh = meta.values || {};
+    const oldInitial = cf.initial;
+    const marks = {};
+    cf.fields.forEach((f) => {
+      const fid = f.id;
+      const serverChanged = cfCanon(f.kind, fresh[fid]) !== cfCanon(f.kind, oldInitial[fid]);
+      const cur = cfFieldValue(f); // typed numbers / dates / estimates live in cf.raw until parsed (CR-14)
+      const userChanged = f.kind === 'description' && cf.editor
+        ? cf.editor.isChanged()
+        : cur.err != null || cfCanon(f.kind, cur.v) !== cfCanon(f.kind, oldInitial[fid]);
+      if (!serverChanged) return;
+      if (userChanged) { marks[fid] = t('cf.conflictField'); if (f.kind === 'description') cf.descForced = true; return; }
+      cf.values[fid] = fresh[fid];
+      delete cf.raw[fid];
+      if (f.kind === 'description' && cf.editor) { cf.editor.load(fresh[fid] || ''); return; }
+      cfRerenderField(fid, false);
+    });
+    cf.initial = Object.assign({}, fresh);
+    cf.updated = meta.updated;
+    cf.conflict = false;
+    cf.marks = marks;
+    Object.keys(marks).forEach((fid) => {
+      const m = $(`#${CSS.escape(cfId(fid))}-m`);
+      if (m) { m.hidden = false; $('span', m).textContent = marks[fid]; }
+      cfSetError(fid, cf.errors[fid] || null); // refresh aria-describedby with the mark
+    });
+    cfRefreshNotices();
+    const live = $('#cf-live');
+    live.textContent = Object.keys(marks).length ? t('cf.reloadedMarked', { n: Object.keys(marks).length }) : t('cf.reloaded');
+    const first = Object.keys(marks)[0];
+    const target = first ? $(`#cf-body [data-field="${CSS.escape(first)}"]`) : $('#cf-foot [data-cf="submit"]');
+    if (target) target.focus();
+  }
+
+  /* --- closing --- */
+  async function cfClose(force) {
+    const cf = S.cf;
+    if (!cf || (cf.saving && !force)) return; // a running save decides (success closes, failure keeps the form)
+    if (!force && !cf.saving) {
+      cfCollectRaw();
+      const changed = cf.dirty || (cf.editor && cf.editor.isChanged());
+      if (changed && !cf.keepDraft) {
+        const ok = await confirmDialog({ title: t('cf.discardTitle'), body: t('cf.discardText'), okLabel: t('cf.discard'), cancelLabel: t('cf.keepEditing'), safeDefault: true });
+        if (!ok || S.cf !== cf) return;
+      }
+    }
+    if (cf.keepDraft && cf.mode === 'create') {
+      const kept = {};
+      cf.fields.forEach((f) => { const k = f.kind === 'summary' ? 'summary' : f.kind === 'description' ? 'description' : f.id; if (!isEmptyVal(cf.values[f.id])) kept[k] = cf.values[f.id]; });
+      S.cfDraft = { project: cf.project, values: kept };
+    }
+    layers.close($('#dlg-issue'));
+  }
+
+  async function cfOpenInJira() {
+    const cf = S.cf;
+    if (!cf) return;
+    if (cf.mode === 'edit' && cf.url) { openUrl(cf.url); return; }
+    const s = await ensureSettings();
+    const base = s && s.jiraUrl ? String(s.jiraUrl).replace(/\/+$/, '') : '';
+    if (base) openUrl(`${base}/secure/CreateIssue!default.jspa`);
+  }
+
+  /* --- pickers (combobox) --- */
+  function cbState(fid) { const cf = S.cf; if (!cf.cb[fid]) cf.cb[fid] = { open: false, options: [], active: -1, seq: 0, loading: false, timer: null }; return cf.cb[fid]; }
+  function cbSelected(f) {
+    const v = S.cf.values[f.id];
+    if (f.kind === 'users') return new Set((v || []).map((u) => u.name));
+    if (CF_LOCAL.has(f.kind)) return new Set((v || []).map(String));
+    return new Set();
+  }
+  function cbRenderList(fid) {
+    const cf = S.cf;
+    const f = cfField(fid);
+    const st = cbState(fid);
+    const id = cfId(fid);
+    const list = $(`#${CSS.escape(id)}-lb`);
+    const input = $(`#${CSS.escape(id)}`);
+    if (!list || !input) return;
+    list.hidden = !st.open;
+    input.setAttribute('aria-expanded', st.open ? 'true' : 'false');
+    if (!st.open) { input.removeAttribute('aria-activedescendant'); return; }
+    let items;
+    if (st.loading && !st.options.length) items = html`<li class="cb-state" role="option" aria-disabled="true">${t('common.loading')}</li>`;
+    else if (st.error) items = html`<li class="cb-state cb-error" role="option" aria-disabled="true">${st.error}</li>`;
+    else if (!st.options.length) items = html`<li class="cb-state" role="option" aria-disabled="true">${t('cf.noMatches')}</li>`;
+    else {
+      const sel = cbSelected(f);
+      items = st.options.map((o, i) => html`<li class="cb-opt${i === st.active ? ' is-active' : ''}" role="option" id="${id}-o${i}" data-i="${i}" aria-selected="${sel.has(o.key) || i === st.active ? 'true' : 'false'}">
+        ${o.avatar ? avatar(o.avatar, 'avatar-xs') : ''}${o.type ? typeIcon(o.type, true) : ''}<span class="cb-opt-main">${o.keyText ? html`<span class="cb-key">${o.keyText}</span>` : ''}<span class="cb-label">${o.label}</span>${o.sub ? html`<span class="cb-sub">${o.sub}</span>` : ''}</span>${o.status ? statusPill(o.status) : ''}</li>`);
+    }
+    setHTML(list, html`${items}`);
+    list.classList.remove('is-flip');
+    const body = list.closest('.cf-body');
+    if (body && list.getBoundingClientRect().right > body.getBoundingClientRect().right - 4) list.classList.add('is-flip');
+    if (st.active >= 0 && st.options[st.active]) { input.setAttribute('aria-activedescendant', `${id}-o${st.active}`); const a = $(`#${CSS.escape(id)}-o${st.active}`); if (a) a.scrollIntoView({ block: 'nearest' }); } else input.removeAttribute('aria-activedescendant');
+  }
+  function cbSearch(fid, query) {
+    const cf = S.cf;
+    const f = cfField(fid);
+    const st = cbState(fid);
+    const seq = ++st.seq;
+    st.open = true;
+    st.error = '';
+    clearTimeout(st.timer);
+    if (CF_LOCAL.has(f.kind)) {
+      const q = query.trim().toLowerCase();
+      const sel = cbSelected(f);
+      st.options = (f.options || []).filter((o) => !sel.has(String(o.id)) && (!q || String(o.name).toLowerCase().includes(q))).map((o) => ({ key: String(o.id), label: o.name, value: String(o.id) }));
+      st.active = st.options.length ? 0 : -1;
+      cbRenderList(fid);
+      return;
+    }
+    st.loading = true;
+    cbRenderList(fid);
+    st.timer = setTimeout(async () => {
+      try {
+        let opts;
+        if (f.kind === 'user' || f.kind === 'users') {
+          const users = await api('searchAssignable', cf.mode === 'edit' ? { key: cf.key, query } : { project: cf.project, query });
+          const sel = cbSelected(f);
+          opts = (users || []).filter((u) => !sel.has(u.name)).map((u) => ({ key: u.name, label: u.displayName || u.name, sub: u.name, avatar: u.displayName || u.name, value: { name: u.name, displayName: u.displayName || u.name } }));
+          if (f.kind === 'user' && !f.required && !query.trim()) opts.unshift({ key: '__none', label: t('issue.unassigned'), value: null });
+        } else {
+          const refs = await api('searchIssuesFor', { purpose: f.kind === 'epic' ? 'epic' : 'parent', project: cf.project, query });
+          opts = (refs || []).map((r) => ({ key: r.key, keyText: r.key, label: r.name || r.summary || '', sub: r.name && r.summary && r.name !== r.summary ? r.summary : '', type: r.type, status: r.status, value: { key: r.key, summary: r.summary || r.name || '' } }));
+        }
+        if (S.cf !== cf || seq !== st.seq) return;
+        st.options = opts;
+        st.active = opts.length ? 0 : -1;
+      } catch (e) {
+        if (S.cf !== cf || seq !== st.seq) return;
+        st.options = [];
+        st.error = errorText(e);
+      }
+      st.loading = false;
+      cbRenderList(fid);
+    }, query ? 220 : 0);
+  }
+  function cbClose(fid, revert) {
+    const st = cbState(fid);
+    st.open = false;
+    clearTimeout(st.timer);
+    st.seq++;
+    cbRenderList(fid);
+    if (revert) {
+      const f = cfField(fid);
+      const input = $(`#${CSS.escape(cfId(fid))}`);
+      const v = S.cf.values[fid];
+      if (input && (f.kind === 'user' || f.kind === 'epic' || f.kind === 'parent')) input.value = v ? (f.kind === 'user' ? v.displayName || v.name : `${v.key}${v.summary ? ' ' + v.summary : ''}`) : '';
+    }
+  }
+  function cbPick(fid, i) {
+    const f = cfField(fid);
+    const st = cbState(fid);
+    const o = st.options[i];
+    if (!o) return;
+    st.open = false;
+    if (CF_MULTI.has(f.kind)) {
+      const cur = Array.isArray(S.cf.values[fid]) ? S.cf.values[fid].slice() : [];
+      cur.push(o.value);
+      cfSetValue(fid, cur, '.cb-input');
+    } else cfSetValue(fid, o.value, '.cb-input');
+    $('#cf-live').textContent = t('cf.picked', { value: o.keyText ? `${o.keyText} ${o.label}` : o.label });
+  }
+  function addLabel(fid, input) {
+    const raw = input.value.replace(/,/g, ' ').trim();
+    if (!raw) return false;
+    const parts = raw.split(/\s+/);
+    if (parts.length > 1 && input.value.includes(' ') && !input.value.includes(',')) { cfSetError(fid, t('cf.labelSpaces')); return true; }
+    const cur = Array.isArray(S.cf.values[fid]) ? S.cf.values[fid].slice() : [];
+    parts.forEach((p) => { if (!cur.includes(p)) cur.push(p); });
+    cfSetValue(fid, cur, '.cb-input');
+    return true;
+  }
+
+  /* --- events --- */
+  function onCfInput(e) {
+    const cf = S.cf;
+    if (!cf) return;
+    const c = e.target;
+    const fid = c.dataset && c.dataset.field;
+    if (c.dataset && c.dataset.mask) autoMask(c, e);
+    if (!fid) return;
+    cf.dirty = true;
+    if (cf.errors[fid]) cfSetError(fid, null);
+    const f0 = cfField(fid);
+    if (f0 && f0.kind === 'estimate') cf.raw[fid] = Object.assign({}, cf.raw[fid] || {}, { [c.dataset.part]: c.value });
+    else if (f0 && ['number', 'storyPoints', 'date', 'datetime'].includes(f0.kind) && c.tagName === 'INPUT') cf.raw[fid] = c.value;
+    if (c.classList.contains('cb-input')) {
+      const f = cfField(fid);
+      if (f.kind !== 'labels') cbSearch(fid, c.value);
+      return;
+    }
+    if (c.classList.contains('cf-wiki-text')) cf.values[fid] = c.value;
+  }
+  function onCfChange(e) {
+    const cf = S.cf;
+    if (!cf) return;
+    const c = e.target;
+    if (c.id === 'cf-another') { cf.createAnother = c.checked; return; }
+    if (c.dataset.cfControl === 'project' && c.value !== cf.project) {
+      const keep = cfKeepValues();
+      cf.project = c.value;
+      cf.fields = [];
+      cf.issueTypes = [];
+      cf.focusAfterLoad = '#cf-project';
+      cfLoad({ keep }).then(() => {
+        if (S.cf === cf && cf.droppedDescription) toast(t('cf.descDropped', { project: cf.project }), { tone: 'warn' });
+      });
+      return;
+    }
+    if (c.dataset.field) { cf.dirty = true; cfCollectRaw(); }
+  }
+  function onCfFocusOut(e) {
+    const cf = S.cf;
+    if (!cf || cf.replacing) return;
+    const c = e.target;
+    const fid = c.dataset && c.dataset.field;
+    const cb = c.closest && c.closest('.cb');
+    if (cb && !cb.contains(e.relatedTarget)) {
+      const f = cfField(cb.dataset.cb);
+      if (f && f.kind === 'labels' && c.value.trim()) addLabel(f.id, c);
+      else if (f) cbClose(f.id, true);
+    }
+    if (!fid) return;
+    const f = cfField(fid);
+    if (!f) return;
+    // on-blur checks with the same rules as submit
+    if (c.dataset.mask === 'date' && c.value.trim()) {
+      const iso = i18n.parseInputDate(c.value.trim());
+      if (iso) c.value = i18n.formatInputDate(iso); else cfSetError(fid, t('settings.dateInvalid'));
+    }
+    if (f.kind === 'estimate') {
+      const v = c.value.trim();
+      if (v && !DURATION.test(v)) cfSetError(fid, t('cf.estimateInvalid'));
+    }
+    if ((f.kind === 'number' || (f.kind === 'storyPoints' && !(f.options && f.options.length))) && c.value.trim() && !/^-?\d+([.,]\d+)?$/.test(c.value.trim())) cfSetError(fid, t('cf.numberInvalid'));
+  }
+  function onCfKey(e) {
+    const cf = S.cf;
+    if (!cf) return;
+    const c = e.target;
+    // issue type radios: arrows
+    const ty = c.closest && c.closest('[data-cf-type]');
+    if (ty && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) {
+      e.preventDefault();
+      const all = $$('#cf-body [data-cf-type]');
+      const i = all.indexOf(ty);
+      const n = e.key === 'Home' ? 0 : e.key === 'End' ? all.length - 1 : (i + (e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1) + all.length) % all.length;
+      cfPickType(all[n].dataset.cfType, true);
+      return;
+    }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); cfSubmit(); return; }
+    if (!c.classList || !c.classList.contains('cb-input')) {
+      if (e.key === 'Enter' && c.tagName === 'INPUT' && c.type !== 'checkbox') e.preventDefault(); // no implicit submit
+      return;
+    }
+    const fid = c.dataset.field;
+    const f = cfField(fid);
+    if (f.kind === 'labels') {
+      if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addLabel(fid, c); }
+      else if (e.key === 'Backspace' && !c.value) { const cur = (cf.values[fid] || []).slice(); if (cur.length) { cur.pop(); cfSetValue(fid, cur, '.cb-input'); } }
+      return;
+    }
+    const st = cbState(fid);
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault();
+        if (!st.open) { cbSearch(fid, CF_MULTI.has(f.kind) ? c.value : ''); return; }
+        st.active = Math.min(st.options.length - 1, st.active + 1); cbRenderList(fid); break;
+      case 'ArrowUp':
+        e.preventDefault();
+        if (st.open) { st.active = Math.max(0, st.active - 1); cbRenderList(fid); } break;
+      case 'Enter':
+        e.preventDefault();
+        if (st.open && st.active >= 0) cbPick(fid, st.active);
+        break;
+      case 'Escape':
+        if (st.open) { e.preventDefault(); e.stopPropagation(); cbClose(fid, true); }
+        break;
+      case 'Backspace':
+        if (CF_MULTI.has(f.kind) && !c.value) { const cur = (cf.values[fid] || []).slice(); if (cur.length) { cur.pop(); cfSetValue(fid, cur, '.cb-input'); } }
+        break;
+      default:
+    }
+  }
+  function cfPickType(typeId, focus) {
+    const cf = S.cf;
+    if (!cf || String(typeId) === String(cf.issueTypeId) || cf.loading) return;
+    const keep = cfKeepValues();
+    cf.issueTypeId = typeId;
+    cf.fields = [];
+    cfLoad({ issueTypeId: typeId, keep }).then(() => {
+      if (focus) { const b = $(`#cf-body [data-cf-type="${CSS.escape(String(typeId))}"]`); if (b) b.focus(); }
+    });
+  }
+  function onCfClick(e) {
+    const cf = S.cf;
+    if (!cf) return;
+    const opt = e.target.closest('.cb-opt');
+    if (opt) { const cb = opt.closest('.cb'); cbPick(cb.dataset.cb, Number(opt.dataset.i)); return; }
+    const ty = e.target.closest('[data-cf-type]');
+    if (ty) { cfPickType(ty.dataset.cfType, true); return; }
+    const a = e.target.closest('[data-cf], [data-action="cf-retry"]');
+    if (!a) {
+      const box = e.target.closest('.cb-box');
+      const inp = box && $('.cb-input', box);
+      if (!inp) return;
+      if (e.target !== inp) inp.focus();
+      const f = cfField(inp.dataset.field);
+      // DR-21: a click shows the choices (the full list; single pickers: the first matches for an empty query)
+      if (f && f.kind !== 'labels' && !cbState(f.id).open) cbSearch(f.id, CF_MULTI.has(f.kind) ? inp.value : '');
+      return;
+    }
+    if (a.dataset.action === 'cf-retry') { cfLoad({ keep: cf.mode === 'create' ? cfKeepValues() : null }); return; }
+    const fid = a.dataset.field;
+    switch (a.dataset.cf) {
+      case 'close': case 'cancel': cfClose(false); break;
+      case 'submit': cfSubmit(); break;
+      case 'reload': cfReloadConflict(); break;
+      case 'open-created': openIssue(a.dataset.key); break;
+      case 'goto': { // DR-24: links in the error summary
+        const target = $(`#${CSS.escape(cfId(fid))}`) || $(`#cf-body [data-field="${CSS.escape(fid)}"]:not(.link-btn):not(.cb-chip-x)`);
+        if (target) { target.focus(); target.scrollIntoView({ block: 'nearest' }); }
+        break;
+      }
+      case 'open-jira': cfOpenInJira(); break;
+      case 'assign-me': { const u = me(); if (u) { cfSetValue(fid, { name: u.name, displayName: u.displayName || u.name }, '.cb-input'); $('#cf-live').textContent = t('cf.picked', { value: u.displayName || u.name }); } break; }
+      case 'unassign': cfSetValue(fid, null, '.cb-input'); break;
+      case 'clear': cfSetValue(fid, null, '.cb-input'); break;
+      case 'chip-remove': {
+        const f = cfField(fid);
+        const cur = (cf.values[fid] || []).filter((x) => (f.kind === 'users' ? x.name : String(x)) !== a.dataset.key);
+        cfSetValue(fid, cur, '.cb-input');
+        $('#cf-live').textContent = t('cf.removed', { value: a.dataset.key });
+        break;
+      }
+      case 'preview': {
+        const ta = $('#cf-body .cf-wiki-text');
+        if (ta) cf.values[ta.dataset.field] = ta.value;
+        cf.wikiPreview = !cf.wikiPreview;
+        cfRerenderField(ta.dataset.field, '[data-cf="preview"]');
+        break;
+      }
+      default:
+    }
   }
 
   /* ================================================================
@@ -2689,7 +3900,7 @@
       const counts = [(n.stories || []).length ? t('epics.storiesCount', { n: n.stories.length }) : '', (n.tasks || []).length ? t('epics.tasksCount', { n: n.tasks.length }) : ''].filter(Boolean).join(' · ') || t('epics.noChildren');
       return html`<li role="treeitem" class="tnode tnode-epic${mineCls(e)}${doneCls(e)}" aria-level="1" ${has ? html`aria-expanded="${open ? 'true' : 'false'}"` : ''} aria-labelledby="${l}" tabindex="-1" data-node="${id}" data-key="${e.key}" data-focus-key="${e.key}" data-epic="${epicTone(e.color, e.key)}">
         <div class="trow">${chev(has)}${typeIcon(e.type || { kind: 'epic' })}<span class="tlabel" id="${l}" data-act="open"><span class="tname" title="${e.summary && e.summary !== e.name ? (e.name || '') + ' · ' + e.summary : e.name || e.summary || ''}">${e.name || e.summary || e.key}</span><span class="tkey">${e.key}</span></span>
-          ${meta(html`<span class="tcount">${counts}</span>`, '', progressBar(n.progress, { size: 'sm' }), e.status)}</div>
+          ${meta(html`<span class="tcount">${counts}</span>`, html`<button type="button" class="icon-btn icon-btn-sm t-add" data-ep-create="${e.key}" tabindex="-1" aria-label="${t('cf.createInEpic', { name: e.name || e.summary || e.key })}" title="${t('cf.createInEpicTitle', { name: e.name || e.summary || e.key })}">${icon('plus')}</button>`, progressBar(n.progress, { size: 'sm' }), e.status)}</div>
         ${open ? kids(id, html`${f.stories.map((s) => storyRow(s, 2, false))}${f.tasks.length && f.stories.length ? html`<li role="none" class="tdivider"><span>${t('epics.directTasks')}</span></li>` : ''}${f.tasks.map((tk) => taskRow(tk, e.key, 2))}`) : ''}</li>`;
     }
     return { epicRow, storyRow };
@@ -3129,13 +4340,22 @@
         if (expanded == null) openTreeIssue(li); else toggleNode(li);
         break;
       default:
-        if (e.code === 'KeyO' && !e.shiftKey) openTreeIssue(li); else handled = false;
+        if (e.code === 'KeyO' && !e.shiftKey) openTreeIssue(li);
+        else if (e.code === 'KeyC' && !e.shiftKey && li.classList.contains('tnode-epic')) createInEpic(li.dataset.key); // "+ issue" in this epic
+        else handled = false;
     }
     if (handled) e.preventDefault();
   }
 
+  function createInEpic(key) {
+    let ref = null;
+    forEachRef(key, (r) => { if (!ref) ref = r; });
+    openCreate({ project: String(key).split('-')[0], epic: { key, summary: (ref && (ref.summary || ref.name)) || '' }, returnSel: `[role="treeitem"][data-key="${CSS.escape(key)}"]` });
+  }
   function onTreeClick(e) {
     if (onDashClick(e)) return;
+    const add = e.target.closest('[data-ep-create]');
+    if (add) { createInEpic(add.dataset.epCreate); return; }
     const a = e.target.closest('[data-action]');
     if (a) {
       if (a.dataset.action === 'ep-retry') loadEpics({ force: true });
@@ -4722,6 +5942,17 @@
     window.addEventListener('resize', () => menu.close(false));
     document.addEventListener('scroll', (e) => { if (!menuEl.contains(e.target)) menu.sync(); }, true);
 
+    // Create / edit issue
+    $('#create-btn').addEventListener('click', () => openCreate());
+    const dlgIssue = $('#dlg-issue');
+    dlgIssue.addEventListener('input', onCfInput);
+    dlgIssue.addEventListener('change', onCfChange);
+    dlgIssue.addEventListener('focusout', onCfFocusOut);
+    dlgIssue.addEventListener('keydown', onCfKey);
+    dlgIssue.addEventListener('click', onCfClick);
+    dlgIssue.addEventListener('mousedown', (e) => { if (e.target.closest('.cb-opt')) e.preventDefault(); }); // keep focus in the picker
+    dlgIssue.addEventListener('submit', (e) => e.preventDefault());
+
     // Drawer / dialogs
     $('#dlg-update').addEventListener('click', onUpdateDialogClick);
     $('#upd-settings').addEventListener('click', onUpdateSettingsClick);
@@ -4821,6 +6052,9 @@
       } else if (e.code === 'KeyR' && !e.shiftKey) {
         e.preventDefault();
         refreshCurrent();
+      } else if (e.code === 'KeyC' && !e.shiftKey && !e.defaultPrevented && canCreate()) {
+        e.preventDefault();
+        openCreate();
       }
     });
 
@@ -4839,6 +6073,7 @@
       renderView(false);
       if (S.drawer) renderDrawer();
       if (S.upd.dlg) { $('#upd-body').dataset.mode = ''; renderUpdateDialog(); }
+      if (S.cf && !S.cf.loading) { if (S.cf.editor && S.cf.editor.isChanged()) S.cf.descForced = true; cfCollectRaw(); cfRender(); }
       renderUpdateSettings();
       menu.close(false);
       if (S.form) renderSettingsDynamic();

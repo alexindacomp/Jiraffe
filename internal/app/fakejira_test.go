@@ -89,6 +89,10 @@ type fakeJira struct {
 	statuses        map[string]string // status id → /status/{id} JSON (absent = 404)
 	paths           []string          // every request path with its query
 
+	// v0.5: handle answers requests first when it returns true (called
+	// with the lock held; it must not call methods of the fake).
+	handle func(r *jira.Request, u *url.URL) (*jira.Response, bool)
+
 	searchHook func()                    // called (unlocked) before answering a search
 	transErr   error                     // returned by issue GETs after a transition POST
 	fail       func(*jira.Request) error // optional transport failure
@@ -118,6 +122,11 @@ func (f *fakeJira) Do(_ context.Context, r *jira.Request) (*jira.Response, error
 		return &jira.Response{StatusCode: 200, Body: []byte(body)}, nil
 	}
 	path := u.Path
+	if f.handle != nil {
+		if resp, handled := f.handle(r, u); handled {
+			return resp, nil
+		}
+	}
 	if resp, handled := f.v2(r, u); handled {
 		return resp, nil
 	}

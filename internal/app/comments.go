@@ -212,6 +212,7 @@ var htmlMarkers = map[string]bool{
 // an optional "/", a name from htmlMarkers ending at a word boundary, and a
 // ">" somewhere after it. (No regexp package: ~100 KB of binary size.)
 func looksLikeHTML(s string) bool {
+	lastGT := strings.LastIndexByte(s, '>') // "a > follows" without rescanning (linear)
 	for i := strings.IndexByte(s, '<'); i >= 0; {
 		rest := s[i+1:]
 		if name, closing, ok := tagName(rest); ok && htmlMarkers[name] {
@@ -219,7 +220,7 @@ func looksLikeHTML(s string) bool {
 			if closing {
 				after = rest[1+len(name):]
 			}
-			if (after == "" || !isWordByte(after[0])) && strings.IndexByte(after, '>') >= 0 {
+			if (after == "" || !isWordByte(after[0])) && lastGT >= len(s)-len(after) {
 				return true
 			}
 		}

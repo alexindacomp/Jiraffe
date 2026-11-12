@@ -144,7 +144,19 @@ func run(args []string) int {
 		winapi.MessageBox(appName, err.Error(), winapi.MBIconError)
 		return 1
 	}
-	html, err := webui.Inline(uiFS, "ui", nonce)
+	uiFS, err := loadUI()
+	if err != nil {
+		log.Printf("ui: %v", err)
+		winapi.MessageBox(appName, "The embedded UI is broken: "+err.Error(), winapi.MBIconError)
+		return 1
+	}
+	scriptNonce, err := webui.NewNonce() // CSP nonce, separate from the binding nonce
+	if err != nil {
+		log.Printf("nonce: %v", err)
+		winapi.MessageBox(appName, err.Error(), winapi.MBIconError)
+		return 1
+	}
+	html, err := webui.Inline(uiFS, ".", nonce, scriptNonce)
 	if err != nil {
 		log.Printf("ui: %v", err)
 		winapi.MessageBox(appName, "The embedded UI is broken: "+err.Error(), winapi.MBIconError)

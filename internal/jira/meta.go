@@ -18,6 +18,8 @@ const (
 // FieldSchema describes the value type of a field.
 type FieldSchema struct {
 	Type   string `json:"type"`
+	Items  string `json:"items"`  // element type of "array" fields
+	System string `json:"system"` // system field name ("labels", "timetracking", …)
 	Custom string `json:"custom"`
 }
 
