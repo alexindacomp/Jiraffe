@@ -622,9 +622,11 @@ Real-Jira facts (checked on the user's Jira):
   `DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE=20, BOOL)` (if that fails, attribute 19 for older
   Windows 10), and when `caption` is given `DWMWA_CAPTION_COLOR=35` (COLORREF 0x00BBGGRR; Windows 11 only, errors
   ignored). Bad params ⇒ `bad_params`. No window ⇒ no-op. Never fails the UI.
-- Before the window is shown (`openWindow`), the backend applies the dark flag from the system app theme
-  (`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme` = 0 ⇒ dark), so there is
-  no light flash; then the page refines it.
+- In `openWindow`, with a dark system app theme (`HKCU\…\Personalize\AppsUseLightTheme` = 0) the backend
+  switches the title bar to dark from the first message dispatched on the UI thread after go-webview2 shows the
+  window (found by class via `EnumThreadWindows`), and again when the call returns; the WebView background is set
+  via `WEBVIEW2_DEFAULT_BACKGROUND_COLOR`. No window hooks (`SetWindowsHookEx`) are used: they did not work for DWM
+  (the window is not ready at HCBT_CREATEWND) and look suspicious to antivirus heuristics. The page refines it.
 - The page calls `setWindowTheme` at startup and on `matchMedia('(prefers-color-scheme: dark)')` change, with
   `caption` = the computed top-bar background colour, so the title bar matches the app (both themes).
 - Non-Windows/test builds: the platform hook is a no-op; the method is covered by an App test with a fake hook.

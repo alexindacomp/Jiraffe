@@ -28,13 +28,15 @@ starts it ([scripts/install.ps1](scripts/install.ps1)). Because PowerShell
 downloads the file itself, Windows SmartScreen does not block the first start.
 Running the command again reinstalls the latest version.
 
-**Option 2 — download the exe.**
-**[⬇ jiraffe.exe](https://github.com/alexindacomp/Jiraffe/releases/latest/download/jiraffe.exe)**,
-put it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\Jiraffe\jiraffe.exe`
-(autostart points to the exe's current location), and run it. The exe is not
-code-signed, so on the first start Windows may say **"Windows protected your
-PC"**: click **More info → Run anyway**. This happens only once — later
-versions are installed by Jiraffe itself and are not checked by SmartScreen.
+**Option 2 — download the archive.**
+**[⬇ Jiraffe-windows.zip](https://github.com/alexindacomp/Jiraffe/releases/latest/download/Jiraffe-windows.zip)**
+(latest release): extract it (right-click → "Extract All") and double-click
+**`Install Jiraffe.cmd`**. It installs Jiraffe to `%LOCALAPPDATA%\Programs\Jiraffe`
+with Start menu and desktop shortcuts and starts it. The files are not
+code-signed, so Windows may say **"Windows protected your PC"** for the
+installer: click **More info → Run anyway**. This happens only once — the
+installed app and its later versions (installed by Jiraffe itself) are not
+checked by SmartScreen.
 
 Then enter your Jira URL and personal access token. Jiraffe updates itself:
 it checks GitHub releases at startup and asks before installing a new version
@@ -52,7 +54,7 @@ git push origin v0.4.0
 
 The workflow builds `jiraffe.exe` with version 0.4.0, signs it and publishes the
 GitHub release `v0.4.0` (assets `jiraffe.exe`, `jiraffe.exe.sha256`,
-`jiraffe.exe.sig`, `install.ps1`) as the latest one, so the download link above serves it and
+`jiraffe.exe.sig`, `install.ps1`, `Jiraffe-windows.zip`) as the latest one, so the download link above serves it and
 installed copies offer the update.
 
 **Release signing.** The release job runs in the GitHub environment `release`

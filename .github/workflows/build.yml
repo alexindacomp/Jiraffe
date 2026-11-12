@@ -96,6 +96,12 @@ jobs:
           test -s dist/jiraffe.exe.sig
           # one-line installer: irm …/releases/latest/download/install.ps1 | iex
           cp scripts/install.ps1 dist/install.ps1
+          # archive for manual installs: jiraffe.exe + "Install Jiraffe.cmd" + install.ps1
+          # (stable name, so …/releases/latest/download/Jiraffe-windows.zip always works)
+          mkdir pkg
+          cp dist/jiraffe.exe scripts/install.ps1 "scripts/Install Jiraffe.cmd" pkg/
+          (cd pkg && zip -9 -X ../dist/Jiraffe-windows.zip jiraffe.exe install.ps1 "Install Jiraffe.cmd")
+          unzip -l dist/Jiraffe-windows.zip
 
       - name: Publish release
         env:
@@ -105,9 +111,9 @@ jobs:
           git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
           if gh release view "$TAG" >/dev/null 2>&1; then
             # re-run of the workflow: replace the binary, keep the notes
-            gh release upload "$TAG" dist/jiraffe.exe dist/jiraffe.exe.sha256 dist/jiraffe.exe.sig dist/install.ps1 --clobber
+            gh release upload "$TAG" dist/jiraffe.exe dist/jiraffe.exe.sha256 dist/jiraffe.exe.sig dist/install.ps1 dist/Jiraffe-windows.zip --clobber
           else
             # release notes = the annotated tag message (git tag -a vX.Y.Z -F notes.md)
-            gh release create "$TAG" dist/jiraffe.exe dist/jiraffe.exe.sha256 dist/jiraffe.exe.sig dist/install.ps1 \
+            gh release create "$TAG" dist/jiraffe.exe dist/jiraffe.exe.sha256 dist/jiraffe.exe.sig dist/install.ps1 dist/Jiraffe-windows.zip \
               --title "Jiraffe $TAG" --notes-from-tag --verify-tag --latest
           fi

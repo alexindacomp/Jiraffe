@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -19,9 +20,8 @@ var (
 	procSetWindowPos        = modUser32.NewProc("SetWindowPos")
 	procGetForegroundWindow = modUser32.NewProc("GetForegroundWindow")
 	procSendMessageW        = modUser32.NewProc("SendMessageW")
-	procSetWindowsHookExW   = modUser32.NewProc("SetWindowsHookExW")
-	procUnhookWindowsHookEx = modUser32.NewProc("UnhookWindowsHookEx")
-	procCallNextHookEx      = modUser32.NewProc("CallNextHookEx")
+	procEnumThreadWindows   = modUser32.NewProc("EnumThreadWindows")
+	procGetClassNameW       = modUser32.NewProc("GetClassNameW")
 )
 
 // DWM window attributes.
@@ -104,78 +104,31 @@ func AppsUseDarkTheme() bool {
 	return err == nil && v == 0
 }
 
-// createHook is the state of OnWindowCreate's CBT hook. A thread hook only
-// runs on the thread that installed it, so it needs no locking.
-var createHook struct {
-	handle  uintptr // installed hook; 0 once removed
-	class   string
-	fn      func(hwnd uintptr)
-	matched bool
-}
+// threadWindowState collects the result of one ThreadWindow call; the
+// EnumThreadWindows callback runs synchronously on the caller's thread.
+var (
+	threadWindowMu    sync.Mutex
+	threadWindowClass string
+	threadWindowFound uintptr
+)
 
-// unhookCreate removes the CBT hook if it is still installed.
-func unhookCreate() {
-	if h := createHook.handle; h != 0 {
-		createHook.handle = 0
-		procUnhookWindowsHookEx.Call(h)
+var enumThreadWindowsProc = windows.NewCallback(func(hwnd, _ uintptr) uintptr {
+	var buf [256]uint16
+	n, _, _ := procGetClassNameW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if n > 0 && strings.EqualFold(windows.UTF16ToString(buf[:n]), threadWindowClass) {
+		threadWindowFound = hwnd
+		return 0 // stop
 	}
-}
+	return 1
+})
 
-var cbtProcPtr = windows.NewCallback(cbtProc)
-
-// Win32 structures of the HCBT_CREATEWND notification.
-type createStruct struct {
-	lpCreateParams uintptr
-	hInstance      uintptr
-	hMenu          uintptr
-	hwndParent     uintptr
-	cy, cx, y, x   int32
-	style          int32
-	lpszName       *uint16
-	lpszClass      *uint16
-	dwExStyle      uint32
-}
-
-type cbtCreateWnd struct {
-	lpcs            *createStruct
-	hwndInsertAfter uintptr
-}
-
-func cbtProc(code, wParam, lParam uintptr) uintptr {
-	const hcbtCreateWnd = 3
-	r, _, _ := procCallNextHookEx.Call(0, code, wParam, lParam)
-	if int32(code) == hcbtCreateWnd && createHook.fn != nil && !createHook.matched && lParam != 0 {
-		// lParam points to system memory (not the Go heap); the indirection
-		// keeps vet's uintptr→pointer check quiet.
-		if cs := (*(**cbtCreateWnd)(unsafe.Pointer(&lParam))).lpcs; cs != nil && cs.hwndParent == 0 &&
-			uintptr(unsafe.Pointer(cs.lpszClass)) > 0xFFFF && // not an atom
-			strings.EqualFold(windows.UTF16PtrToString(cs.lpszClass), createHook.class) {
-			createHook.matched = true
-			createHook.fn(wParam)
-			unhookCreate() // only the first window is wanted
-		}
-	}
-	return r
-}
-
-// OnWindowCreate runs create on the calling thread and calls fn for the
-// first top-level window of class className created meanwhile, before the
-// window is shown (a thread-local WH_CBT hook, removed after that window or
-// when create returns). Used to style a window that a library creates and
-// shows in one call. It reports whether fn ran; if the hook cannot be
-// installed, create still runs and err says why.
-func OnWindowCreate(className string, fn func(hwnd uintptr), create func()) (matched bool, err error) {
-	const whCBT = 5
-	h, _, e := procSetWindowsHookExW.Call(whCBT, cbtProcPtr, 0, uintptr(windows.GetCurrentThreadId()))
-	if h == 0 {
-		create()
-		return false, fmt.Errorf("SetWindowsHookEx: %w", e)
-	}
-	createHook.handle, createHook.class, createHook.fn, createHook.matched = h, className, fn, false
-	defer func() {
-		unhookCreate() // no-op when the hook already removed itself
-		createHook.class, createHook.fn = "", nil
-	}()
-	create()
-	return createHook.matched, nil
+// ThreadWindow returns the first top-level window of class className owned
+// by thread threadID, or 0. Used to style a window that a library creates
+// and shows in one call, as soon as the thread pumps messages again.
+func ThreadWindow(threadID uint32, className string) uintptr {
+	threadWindowMu.Lock()
+	defer threadWindowMu.Unlock()
+	threadWindowClass, threadWindowFound = className, 0
+	procEnumThreadWindows.Call(uintptr(threadID), enumThreadWindowsProc, 0)
+	return threadWindowFound
 }

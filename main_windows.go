@@ -376,21 +376,26 @@ func (u *ui) openWindow() bool {
 			},
 		})
 	}
-	// go-webview2 creates and shows the window in one call: a dark system
-	// app theme is applied to the title bar from a creation hook, before
-	// the window is first shown (no light flash); the page refines it with
-	// setWindowTheme once loaded.
+	// go-webview2 creates and shows the window in one call and then pumps
+	// messages while WebView2 starts. With a dark system app theme the title
+	// bar is switched to dark from the first message dispatched on this
+	// thread (a few milliseconds after the window appears), and again once
+	// the call returns; the page refines it with setWindowTheme once loaded.
 	if dark {
-		matched, err := winapi.OnWindowCreate(webviewClass, func(hwnd uintptr) {
-			if err := winapi.SetDarkTitleBar(hwnd, true); err != nil {
-				log.Printf("dark title bar: %v", err)
+		thread := uint32(windows.GetCurrentThreadId())
+		darken := func() {
+			if hwnd := winapi.ThreadWindow(thread, webviewClass); hwnd != 0 {
+				if err := winapi.SetDarkTitleBar(hwnd, true); err != nil {
+					log.Printf("dark title bar: %v", err)
+					return
+				}
+				winapi.RedrawFrame(hwnd)
 			}
-		}, create)
-		switch {
-		case err != nil:
-			log.Printf("window theme hook: %v", err)
-		case !matched && w != nil:
-			log.Printf("window theme hook: no %q window was created; the title bar stays light until the page sets it", webviewClass)
+		}
+		u.post(darken)
+		create()
+		if w != nil {
+			darken()
 		}
 	} else {
 		create()
