@@ -100,6 +100,11 @@ type IssueDetail struct {
 	Comments     []CommentDTO    `json:"comments"`
 	Changelog    []ChangeDTO     `json:"changelog"`
 	Watchers     *int            `json:"watchers,omitempty"`
+
+	// DevStoryPoints / QAStoryPoints: the "Dev Story Points" / "QA Story
+	// Points" fields (select fields on the real Jira), absent when unset.
+	DevStoryPoints *float64 `json:"devStoryPoints,omitempty"`
+	QAStoryPoints  *float64 `json:"qaStoryPoints,omitempty"`
 }
 
 var detailFields = []string{"summary", "status", "issuetype", "priority", "updated", "created", "assignee",
@@ -121,8 +126,10 @@ func (a *App) getIssue(ctx context.Context, key string) (*IssueDetail, error) {
 		return nil, err
 	}
 	fields := v.fields(detailFields, false)
-	if v.meta.fields.Sprint != "" {
-		fields = append(fields, v.meta.fields.Sprint)
+	for _, id := range []string{v.meta.fields.Sprint, v.meta.fields.DevStoryPoints, v.meta.fields.QAStoryPoints} {
+		if id != "" {
+			fields = append(fields, id)
+		}
 	}
 	is, err := c.IssueDetail(ctx, key, fields)
 	if err != nil {
@@ -189,6 +196,8 @@ func (v *view) detail(is jira.Issue, comments []jira.Comment) *IssueDetail {
 		Comments:    []CommentDTO{},
 		Changelog:   []ChangeDTO{},
 	}
+	d.DevStoryPoints = f.CustomPoints(v.meta.fields.DevStoryPoints)
+	d.QAStoryPoints = f.CustomPoints(v.meta.fields.QAStoryPoints)
 	if f.Resolution != nil {
 		d.Resolution = f.Resolution.Name
 	}

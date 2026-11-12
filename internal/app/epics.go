@@ -18,6 +18,14 @@ const (
 // treeFields are read for every issue of the epic/story tree.
 var treeFields = []string{"summary", "status", "issuetype", "assignee", "project", "issuelinks", "subtasks"}
 
+// timeFields are what EpicNode.time needs: added to getEpics' epic, child
+// and related-issue searches, and read alone for issues known only as
+// embedded copies.
+var timeFields = []string{"aggregatetimespent", "aggregatetimeoriginalestimate", "parent"}
+
+// epicTreeFields are treeFields plus timeFields.
+var epicTreeFields = append(append([]string{}, treeFields...), timeFields...)
+
 // StoryNode is the StoryNode contract type.
 type StoryNode struct {
 	Story       IssueRef    `json:"story"`
@@ -36,6 +44,19 @@ type EpicNode struct {
 	Stories  []StoryNode `json:"stories"`
 	Tasks    []IssueRef  `json:"tasks"`
 	Progress Progress    `json:"progress"`
+	Time     EpicTime    `json:"time"`
+	// counted are the epic and its distinct descendants (Time is summed
+	// over them); only used while the result is built.
+	counted []string
+}
+
+// EpicTime is EpicNode.time: the logged time and original estimate of the
+// epic and every distinct issue of its tree including their sub-tasks
+// (aggregate values), each issue counted once; issues counts the tree.
+type EpicTime struct {
+	SpentSeconds    int64 `json:"spentSeconds"`
+	EstimateSeconds int64 `json:"estimateSeconds"`
+	Issues          int   `json:"issues"`
 }
 
 // EpicsResult is the getEpics result.
@@ -44,6 +65,9 @@ type EpicsResult struct {
 	OrphanStories []StoryNode `json:"orphanStories"`
 	FetchedAt     string      `json:"fetchedAt"`
 	Truncated     bool        `json:"truncated"`
+	// TimePartial: the time of some counted issues could not be read, so
+	// some EpicNode.time totals may be too low.
+	TimePartial bool `json:"timePartial"`
 }
 
 // StoriesResult is the getStories result.
@@ -59,6 +83,9 @@ type treeNode struct {
 	ref      IssueRef
 	epicLink string
 	full     bool // read by a search (not embedded in another issue)
+	// embeddedIn is the key of the issue whose "subtasks" field this
+	// embedded copy came from (its parent); "" otherwise.
+	embeddedIn string
 	// related are the keys of sub-tasks and linked issues that are neither
 	// epics nor stories, in Jira's order (sub-tasks first).
 	related []string
@@ -107,8 +134,15 @@ func (p *treePool) add(is jira.Issue, full bool) *treeNode {
 // lack the assignee) unless they are known already.
 func (p *treePool) addEmbedded(n *treeNode) {
 	for _, st := range n.is.Fields.Subtasks {
-		if _, ok := p.nodes[st.Key]; !ok && st.Key != "" {
-			p.add(st, false)
+		if st.Key == "" {
+			continue
+		}
+		e, ok := p.nodes[st.Key]
+		if !ok {
+			e = p.add(st, false)
+		}
+		if !e.full && e.embeddedIn == "" {
+			e.embeddedIn = n.is.Key
 		}
 	}
 	for _, l := range n.is.Fields.IssueLinks {
@@ -149,9 +183,11 @@ func (p *treePool) epicNode(e *treeNode, children []*treeNode, info epicInfo) (E
 	en := EpicNode{Epic: EpicRefDTO{IssueRef: e.ref, Name: info.name, Color: info.color}, Stories: []StoryNode{}, Tasks: []IssueRef{}}
 	mine := e.ref.Mine
 	counted := map[string]bool{}
+	en.counted = []string{e.ref.Key}
 	count := func(key, category string) {
 		if !counted[key] {
 			counted[key] = true
+			en.counted = append(en.counted, key)
 			en.Progress.add(category)
 		}
 	}
@@ -193,9 +229,10 @@ func sortStories(s []StoryNode) {
 
 // fetchRelated reads the sub-tasks and linked issues of the stories that
 // are not in the pool yet (for their assignee), up to budget issues. Those
-// that cannot be read stay as embedded in the stories. It returns whether
-// the budget cut the list.
-func (p *treePool) fetchRelated(ctx context.Context, stories []*treeNode, budget int) bool {
+// that cannot be read stay as embedded in the stories. base are the fields
+// read (treeFields, or epicTreeFields for epic time). It returns the number
+// of issues read and whether the budget cut the list.
+func (p *treePool) fetchRelated(ctx context.Context, stories []*treeNode, base []string, budget int) (int, bool) {
 	var missing []string
 	for _, s := range stories {
 		for _, k := range s.related {
@@ -209,7 +246,7 @@ func (p *treePool) fetchRelated(ctx context.Context, stories []*treeNode, budget
 	if len(missing) > budget {
 		missing, truncated = missing[:budget], true
 	}
-	issues, cut, err := searchKeys(ctx, p.v.c, missing, p.v.fields(treeFields, false), budget)
+	issues, cut, err := searchKeys(ctx, p.v.c, missing, p.v.fields(base, false), budget)
 	if err != nil {
 		log.Printf("epics: read linked issues: %v", err)
 	}
@@ -219,7 +256,96 @@ func (p *treePool) fetchRelated(ctx context.Context, stories []*treeNode, budget
 	for _, s := range stories {
 		p.addEmbedded(s)
 	}
-	return truncated || cut
+	return len(issues), truncated || cut
+}
+
+// issueTime is the aggregate logged time and original estimate of one
+// issue (its own plus its sub-tasks') and its parent key ("" if none).
+type issueTime struct {
+	spent, estimate int64
+	parent          string
+}
+
+func timeOf(f *jira.Fields) issueTime {
+	var t issueTime
+	if v := f.AggregateTimeSpent; v != nil && *v > 0 {
+		t.spent = *v
+	}
+	if v := f.AggregateTimeOriginalEstimate; v != nil && *v > 0 {
+		t.estimate = *v
+	}
+	if f.Parent != nil {
+		t.parent = f.Parent.Key
+	}
+	return t
+}
+
+// sumTimes fills EpicNode.time of epics from their counted issues, using
+// aggregate values (sub-tasks included). A counted issue whose parent is
+// counted too is skipped: the parent's aggregate already holds its time.
+// Issues read by a tree search carry the time fields; those known only as
+// embedded copies are fetched by key (up to budget issues), except embedded
+// sub-tasks of a counted issue (skipped anyway). It returns whether the time
+// of some counted issue could not be read.
+func (p *treePool) sumTimes(ctx context.Context, epics []EpicNode, budget int) bool {
+	sets := make([]map[string]bool, len(epics))
+	var missing []string
+	for i, en := range epics {
+		sets[i] = make(map[string]bool, len(en.counted))
+		for _, k := range en.counted {
+			sets[i][k] = true
+		}
+		for _, k := range en.counted {
+			if n, ok := p.nodes[k]; !ok || !n.full && !sets[i][n.embeddedIn] {
+				missing = append(missing, k)
+			}
+		}
+	}
+	missing = uniqueKeys(missing)
+	partial := false
+	if budget < 0 {
+		budget = 0
+	}
+	if len(missing) > budget {
+		missing, partial = missing[:budget], true
+	}
+	fetched := map[string]issueTime{}
+	if len(missing) > 0 {
+		issues, cut, err := searchKeys(ctx, p.v.c, missing, timeFields, len(missing))
+		if err != nil {
+			log.Printf("epics: read issue times: %v", err)
+		}
+		partial = partial || cut
+		for _, is := range issues {
+			fetched[is.Key] = timeOf(&is.Fields)
+		}
+	}
+	for i := range epics {
+		en := &epics[i]
+		en.Time = EpicTime{Issues: len(en.counted)}
+		inSet := sets[i]
+		for _, k := range en.counted {
+			var t issueTime
+			n, known := p.nodes[k]
+			if ft, read := fetched[k]; known && n.full {
+				t = timeOf(&n.is.Fields)
+			} else if read {
+				t = ft
+			} else if known && inSet[n.embeddedIn] {
+				continue // a sub-task of a counted issue: in its aggregate
+			} else {
+				partial = true
+				continue
+			}
+			if t.parent != "" && inSet[t.parent] {
+				continue // in the parent's aggregate
+			}
+			en.Time.SpentSeconds += t.spent
+			en.Time.EstimateSeconds += t.estimate
+		}
+		en.counted = nil
+	}
+	return partial
 }
 
 // projectClause is the JQL restriction to the tracked projects.
@@ -283,7 +409,7 @@ func (a *App) getEpics(ctx context.Context, includeDone bool, scope, project str
 	if err != nil {
 		return nil, err
 	}
-	fields := v.fields(treeFields, true)
+	fields := v.fields(epicTreeFields, true)
 	epics, err := c.SearchAll(ctx, "issuetype = Epic AND "+inProjects+notDone(includeDone)+" ORDER BY key DESC",
 		jira.SearchOptions{Fields: fields, Limit: maxTreeTop})
 	if err != nil {
@@ -327,7 +453,7 @@ func (a *App) getEpics(ctx context.Context, includeDone bool, scope, project str
 				end = len(keys)
 			}
 			res, err := c.SearchAll(ctx, link+" in ("+quoteKeys(keys[i:end])+") ORDER BY key DESC",
-				jira.SearchOptions{Fields: v.fields(treeFields, false), Limit: maxTreeChildren - len(children)})
+				jira.SearchOptions{Fields: v.fields(epicTreeFields, false), Limit: maxTreeChildren - len(children)})
 			if err != nil {
 				return nil, err
 			}
@@ -348,9 +474,8 @@ func (a *App) getEpics(ctx context.Context, includeDone bool, scope, project str
 		orphanNodes = append(orphanNodes, n)
 		stories = append(stories, n)
 	}
-	if pool.fetchRelated(ctx, stories, maxTreeChildren-len(children)) {
-		out.Truncated = true
-	}
+	related, cut := pool.fetchRelated(ctx, stories, epicTreeFields, maxTreeChildren-len(children))
+	out.Truncated = out.Truncated || cut
 
 	byEpic := map[string][]*treeNode{}
 	for _, ch := range children {
@@ -375,6 +500,7 @@ func (a *App) getEpics(ctx context.Context, includeDone bool, scope, project str
 		}
 		out.OrphanStories = append(out.OrphanStories, sn)
 	}
+	out.TimePartial = pool.sumTimes(ctx, out.Epics, maxTreeChildren-len(children)-related)
 	sortEpics(out.Epics)
 	sortStories(out.OrphanStories)
 	a.cachePut(key, id, gen, now, out)
@@ -439,7 +565,7 @@ func (a *App) getStories(ctx context.Context, includeDone bool, scope, project s
 		stories = append(stories, n)
 		epicKeys = append(epicKeys, n.epicLink)
 	}
-	if pool.fetchRelated(ctx, stories, maxTreeChildren) {
+	if _, cut := pool.fetchRelated(ctx, stories, treeFields, maxTreeChildren); cut {
 		out.Truncated = true
 	}
 	a.loadEpics(ctx, v, epicKeys)

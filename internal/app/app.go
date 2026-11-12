@@ -15,12 +15,14 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"jiraffe/internal/config"
 	"jiraffe/internal/jira"
 	"jiraffe/internal/scheduler"
 	"jiraffe/internal/state"
+	"jiraffe/internal/update"
 	"jiraffe/internal/worklog"
 )
 
@@ -40,6 +42,9 @@ type Platform interface {
 	Notify(title, text, url string)
 	// SettingsChanged lets the platform refresh e.g. the tray menu language.
 	SettingsChanged(s config.Settings, paused bool)
+	// SetWindowTheme recolours the native frame (title bar) of the app
+	// window. It never fails: no window or no support ⇒ nothing happens.
+	SetWindowTheme(t WindowTheme)
 }
 
 // Emitter pushes an event to the UI (dropped if no window is open).
@@ -187,6 +192,19 @@ type App struct {
 	bgCtx        context.Context
 	bgCancel     context.CancelFunc
 	startOnce    sync.Once
+
+	// updates (see update.go); upd is nil when updates are not enabled
+	upd        *update.Updater
+	updHost    UpdateHost
+	updCheckMu sync.Mutex  // one check at a time
+	updFilesMu sync.Mutex  // held by the install job; cleanup skips its pass meanwhile
+	swapMu     sync.Mutex  // held while the exe is swapped; Stop waits for it (no time limit)
+	updJob     atomic.Bool // an install job is running
+	updExiting atomic.Bool // the new exe was started: no more worklog runs
+	// guarded by mu
+	updLastAuto  time.Time   // last automatic check of this session
+	updAnnounced string      // version announced by balloon this session
+	justUpdated  *UpdatedDTO // set after an update (this session)
 }
 
 // New creates the app. emit may be nil.
@@ -216,12 +234,22 @@ func (a *App) Start() {
 		a.plat.SettingsChanged(s, a.Paused())
 		a.goBackground("refresh user", func(ctx context.Context) { a.refreshUser(ctx) })
 		a.goBackground("scheduler", func(ctx context.Context) { a.sched.Run(ctx, 30*time.Second) })
+		if a.upd != nil {
+			a.goBackground("update cleanup", a.cleanupUpdates)
+			a.goBackground("update check", a.updateLoop)
+		}
 	})
 }
 
 // Stop cancels background work and waits up to timeout for it to finish.
 func (a *App) Stop(timeout time.Duration) {
 	a.bgCancel()
+	// An exe swap in progress always completes (or rolls back) first, so the
+	// process never exits between renaming jiraffe.exe away and putting the
+	// new one in place. It is bounded by the rename retries; a swap that
+	// starts after this sees the cancelled context and does nothing.
+	a.swapMu.Lock()
+	a.swapMu.Unlock() // nothing to protect: only waiting for the swap
 	done := make(chan struct{})
 	go func() { a.bgWG.Wait(); close(done) }()
 	select {
@@ -370,6 +398,30 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 			return nil, err
 		}
 		return nil, a.openURL(p.URL)
+	case "setWindowTheme":
+		var p struct {
+			Dark    *bool   `json:"dark"`
+			Caption *string `json:"caption"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, a.setWindowTheme(p.Dark, p.Caption)
+	case "getUpdateStatus":
+		return a.updateStatus(), nil
+	case "checkForUpdates":
+		return a.checkUpdates(ctx)
+	case "installUpdate", "skipUpdate":
+		var p struct {
+			Version string `json:"version"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		if method == "skipUpdate" {
+			return a.skipUpdate(p.Version)
+		}
+		return nil, a.installUpdate(p.Version)
 	case "worklogPreview":
 		run, err := a.computeWorklog(ctx, worklog.TriggerPreview, time.Time{})
 		if err != nil {
@@ -838,7 +890,8 @@ func URLAllowed(raw, base string) bool {
 }
 
 func (a *App) openURL(raw string) error {
-	if !URLAllowed(raw, a.cfg.Get().JiraURL) {
+	// The only exception to "Jira only": the Jiraffe release pages.
+	if !URLAllowed(raw, a.cfg.Get().JiraURL) && !update.ReleasePageAllowed(raw) {
 		return a.newErr(CodeForbiddenURL, "err_forbidden_url")
 	}
 	if err := a.plat.OpenURL(raw); err != nil {

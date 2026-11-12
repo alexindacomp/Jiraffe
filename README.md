@@ -6,12 +6,12 @@ filter and each project's own columns (from its agile board or workflow), quick
 status changes from a dropdown, issue details (description, comments, history,
 estimates, links, epic and stories), sprints as a backlog-style list grouped by
 sprint, epics & stories, tracked projects and alerts about new comments on my
-issues. One self-contained `jiraffe.exe` (Go, no CGO, WebView2
-UI, about 4.0 MB). The full specification is in [SPEC.md](SPEC.md).
+issues, a per-project epic time dashboard and automatic updates. One
+self-contained `jiraffe.exe` (Go, no CGO, WebView2 UI, about 4.6 MB). The full specification is in [SPEC.md](SPEC.md).
 
 ## Download
 
-**[⬇ jiraffe.exe](https://github.com/alexindacomp/Jiraffe/releases/latest/download/jiraffe.exe)** — latest release, Windows 10/11 x64, about 4.0 MB.
+**[⬇ jiraffe.exe](https://github.com/alexindacomp/Jiraffe/releases/latest/download/jiraffe.exe)** — latest release, Windows 10/11 x64, about 4.6 MB.
 All versions and changes: [Releases](https://github.com/alexindacomp/Jiraffe/releases).
 
 Put it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\Jiraffe\jiraffe.exe`
@@ -29,8 +29,18 @@ git tag -a v0.4.0 -m "Jiraffe v0.4.0" -m "- what changed"   # tag message = rele
 git push origin v0.4.0
 ```
 
-The workflow builds `jiraffe.exe` with version 0.4.0 and publishes the GitHub
-release `v0.4.0` as the latest one, so the download link above serves it.
+The workflow builds `jiraffe.exe` with version 0.4.0, signs it and publishes the
+GitHub release `v0.4.0` (assets `jiraffe.exe`, `jiraffe.exe.sha256`,
+`jiraffe.exe.sig`) as the latest one, so the download link above serves it and
+installed copies offer the update.
+
+**Release signing.** The release job runs in the GitHub environment `release`
+(only `v*` tags may use it), which holds the secret `RELEASE_SIGNING_KEY`
+(base64 ed25519 seed). `tools/sign` signs
+`"jiraffe-release-v1\n" + version + "\n" + sha256(exe) + "\n"`; the app embeds
+the public key (`internal/update/sign.go`) and refuses an exe without a valid
+signature. Keep an offline backup of the seed; the rotation procedure is in
+SPEC.md §5.
 
 ## Build (WSL / Linux)
 
@@ -56,6 +66,7 @@ Requires the Microsoft Edge WebView2 Runtime (preinstalled on Windows 10/11).
 |---|---|
 | `jiraffe.exe` | starts in the tray and opens the window (or shows the running instance) |
 | `jiraffe.exe --minimized` | tray only (used by autostart) |
+| `jiraffe.exe --updated-from X.Y.Z --wait-pid N` | used by the updater for the restart: waits up to 15 s for the old process, then starts normally |
 | `jiraffe.exe --worklog-preview out.json` | headless: computes today's worklog preview, writes `WorklogRun` JSON, exits 0/1; never writes to Jira. `JIRAFFE_URL` / `JIRAFFE_TOKEN` override the saved settings (from WSL pass them with `WSLENV=JIRAFFE_URL:JIRAFFE_TOKEN`) |
 
 Files:
@@ -63,7 +74,8 @@ Files:
 - `%APPDATA%\Jiraffe\config.json` — settings; the token is stored as `tokenEnc`
   (DPAPI, current user, base64), never in plain text
 - `%APPDATA%\Jiraffe\state.json` — last scheduled run date, worklog history (60),
-  notifications (200), seen comment ids (5000)
+  notifications (200), seen comment ids (5000), skipped update version, last update check
+- `%LOCALAPPDATA%\Jiraffe\update` — update downloads (temporary)
 - `%APPDATA%\Jiraffe\jiraffe.log` — log, rotated to `.log.1` at 1 MB; the token is never logged
 - `%LOCALAPPDATA%\Jiraffe\WebView2` — WebView2 user data
 - `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Jiraffe` — autostart
@@ -79,11 +91,13 @@ internal/jira           REST v2 client over a Transport interface
 internal/config         settings, defaults, validation (ru/uk/en messages), DPAPI via Protector
 internal/state          history, notifications, seen comments (atomic JSON writes)
 internal/scheduler      worklog-at-time with catch-up/retry + comment polling, injected clock
-internal/app            JS ↔ Go contract (methods, events, errors), worklog/comment services
+internal/app            JS ↔ Go contract (methods, events, errors), worklog/comment/update services
+internal/update         self-update: GitHub release check, download, verify (sha256 + ed25519), swap
 internal/webui          inlines ui/*.css|*.js into one HTML document, drops mock.js, adds CSP
 internal/winapi         *_windows.go: WinHTTP transport, DPAPI, tray/balloons, autostart, shell
 internal/applog         rotating log writer
 tools/icongen           build-time icon generator
+tools/sign              CI release signer (ed25519, key from env)
 assets/winres.json      go-winres resource definition
 ```
 
@@ -118,5 +132,15 @@ assets/winres.json      go-winres resource definition
   `JIRAFFE_URL` of another origin without `JIRAFFE_TOKEN` is "not configured").
   WinHTTP never follows redirects (they would resend the token); a 3xx is
   reported with the target host. Saving an `http://` URL returns a warning.
+- **Updates.** 30 s after start and then daily the app asks
+  `api.github.com/repos/alexindacomp/Jiraffe/releases/latest` (separate WinHTTP
+  session: no Jira token or headers; redirects followed manually only to the
+  GitHub release-asset hosts). A newer signed release is offered in a dialog
+  (or a tray balloon when the window is closed); "Later" skips that version,
+  Settings → Updates can install it any time or turn the startup check off.
+  Install: download to `%LOCALAPPDATA%\Jiraffe\update`, verify size, SHA-256,
+  `MZ` and the ed25519 signature, rename the running exe to `jiraffe.exe.old`,
+  move the new one in (rollback on any failure), start it with `--updated-from`
+  and exit. `.old` is removed after the new version has run 10 minutes.
 - **Errors** from Jira/WinHTTP become readable messages; every goroutine and
   binding call recovers from panics and logs them.

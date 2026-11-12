@@ -38,12 +38,16 @@ type FieldIDs struct {
 	EpicColor   string
 	Sprint      string
 	StoryPoints string
+	// DevStoryPoints / QAStoryPoints are found by name (any field type; on
+	// the real Jira they are select fields).
+	DevStoryPoints string
+	QAStoryPoints  string
 }
 
 // List returns the ids that exist (for the "fields" query parameter).
 func (f FieldIDs) List() []string {
 	var out []string
-	for _, id := range []string{f.EpicLink, f.EpicName, f.EpicColor, f.Sprint, f.StoryPoints} {
+	for _, id := range []string{f.EpicLink, f.EpicName, f.EpicColor, f.Sprint, f.StoryPoints, f.DevStoryPoints, f.QAStoryPoints} {
 		if id != "" {
 			out = append(out, id)
 		}
@@ -60,9 +64,16 @@ func (c *Client) Fields(ctx context.Context) ([]FieldDef, error) {
 	return out, nil
 }
 
+// Names (or clause names) of the Dev / QA story points fields.
+const (
+	FieldDevStoryPoints = "Dev Story Points"
+	FieldQAStoryPoints  = "QA Story Points"
+)
+
 // DiscoverFields finds the Epic Link / Epic Name / Epic Color / Sprint fields
-// by their schema and Story Points as a number field whose clause names
-// contain "Story Points". The first match wins.
+// by their schema, Story Points as a number field whose clause names
+// contain "Story Points", and Dev / QA Story Points by field name or clause
+// name, any schema (case-insensitive, trimmed). The first match wins.
 func DiscoverFields(defs []FieldDef) FieldIDs {
 	var f FieldIDs
 	set := func(dst *string, id string) {
@@ -71,7 +82,16 @@ func DiscoverFields(defs []FieldDef) FieldIDs {
 		}
 	}
 	for _, d := range defs {
-		if d.ID == "" || d.Schema == nil {
+		if d.ID == "" {
+			continue
+		}
+		if d.named(FieldDevStoryPoints) {
+			set(&f.DevStoryPoints, d.ID)
+		}
+		if d.named(FieldQAStoryPoints) {
+			set(&f.QAStoryPoints, d.ID)
+		}
+		if d.Schema == nil {
 			continue
 		}
 		switch d.Schema.Custom {
@@ -94,6 +114,20 @@ func DiscoverFields(defs []FieldDef) FieldIDs {
 		}
 	}
 	return f
+}
+
+// named reports whether the field's name or one of its clause names is name
+// (case-insensitive, surrounding spaces ignored).
+func (d FieldDef) named(name string) bool {
+	if strings.EqualFold(strings.TrimSpace(d.Name), name) {
+		return true
+	}
+	for _, cn := range d.ClauseNames {
+		if strings.EqualFold(strings.TrimSpace(cn), name) {
+			return true
+		}
+	}
+	return false
 }
 
 // ClauseRef returns the JQL reference of a custom field id

@@ -54,6 +54,8 @@ type Settings struct {
 	// comment alerts are limited to. nil (JSON null) = not initialised yet.
 	// Store.Save never changes it; use Store.UpdateTrackedProjects.
 	TrackedProjects []string `json:"trackedProjects"`
+	// AutoCheckUpdates enables the update check at startup and once a day.
+	AutoCheckUpdates bool `json:"autoCheckUpdates"`
 }
 
 // MaxTrackedProjects bounds the tracked project list (JQL length).
@@ -80,6 +82,7 @@ func Defaults() Settings {
 		CommentPollMinutes: 5,
 		BoardJQL:           DefaultBoardJQL,
 		LoadFactor:         1,
+		AutoCheckUpdates:   true,
 	}
 }
 

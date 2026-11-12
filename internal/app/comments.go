@@ -1,8 +1,10 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"html"
 	"log"
 	"net/url"
 	"sort"
@@ -163,8 +165,13 @@ func commentURL(c *jira.Client, key, id string) string {
 }
 
 // PlainText turns [~user] mentions into @user, collapses whitespace and
-// truncates to max runes (with an ellipsis).
+// truncates to max runes (with an ellipsis). An HTML body (JEditor) is
+// first reduced to its text: tags removed (block tags and <br> become a
+// space), script/style content dropped, entities decoded.
 func PlainText(s string, max int) string {
+	if looksLikeHTML(s) {
+		s = html.UnescapeString(stripTags(s))
+	}
 	var m strings.Builder
 	for {
 		i := strings.Index(s, "[~")
@@ -188,4 +195,172 @@ func PlainText(s string, max int) string {
 	}
 	rs := []rune(out)
 	return strings.TrimSpace(string(rs[:max-1])) + "…"
+}
+
+// htmlMarkers are the element tags that make a body HTML; the same set as
+// the UI's detection (SPEC v0.4 §1, wiki.render).
+var htmlMarkers = map[string]bool{
+	"p": true, "div": true, "br": true, "span": true, "b": true, "strong": true, "i": true, "em": true,
+	"u": true, "s": true, "strike": true, "del": true, "ins": true, "code": true, "pre": true, "ul": true,
+	"ol": true, "li": true, "a": true, "img": true, "table": true, "thead": true, "tbody": true,
+	"tfoot": true, "tr": true, "td": true, "th": true, "h1": true, "h2": true, "h3": true, "h4": true,
+	"h5": true, "h6": true, "hr": true, "blockquote": true, "sub": true, "sup": true, "font": true,
+}
+
+// looksLikeHTML reports whether a Jira text body is HTML rather than wiki
+// markup or plain text. Like the UI's /<\/?(p|div|br|…)\b[^>]*>/i: a "<",
+// an optional "/", a name from htmlMarkers ending at a word boundary, and a
+// ">" somewhere after it. (No regexp package: ~100 KB of binary size.)
+func looksLikeHTML(s string) bool {
+	for i := strings.IndexByte(s, '<'); i >= 0; {
+		rest := s[i+1:]
+		if name, closing, ok := tagName(rest); ok && htmlMarkers[name] {
+			after := rest[len(name):]
+			if closing {
+				after = rest[1+len(name):]
+			}
+			if (after == "" || !isWordByte(after[0])) && strings.IndexByte(after, '>') >= 0 {
+				return true
+			}
+		}
+		j := strings.IndexByte(rest, '<')
+		if j < 0 {
+			return false
+		}
+		i += 1 + j
+	}
+	return false
+}
+
+func isWordByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+
+// inlineTags are removed without a separator; any other tag (block
+// elements, <br>, unknown tags) becomes a space so words do not run together.
+var inlineTags = map[string]bool{
+	"a": true, "abbr": true, "b": true, "bdi": true, "bdo": true, "cite": true, "code": true, "del": true,
+	"dfn": true, "em": true, "font": true, "i": true, "ins": true, "kbd": true, "mark": true, "q": true,
+	"s": true, "samp": true, "small": true, "span": true, "strike": true, "strong": true, "sub": true,
+	"sup": true, "time": true, "u": true, "var": true,
+}
+
+// droppedTags lose their content too (it is not text the user wrote).
+var droppedTags = map[string]bool{
+	"script": true, "style": true, "head": true, "title": true, "template": true, "noscript": true,
+	"textarea": true, "svg": true, "math": true, "iframe": true, "object": true, "select": true,
+}
+
+// stripTags removes HTML tags and comments from s, keeping the text (entities
+// are left encoded). A "<" that does not start a tag is kept as text.
+func stripTags(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c != '<' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		if strings.HasPrefix(s[i:], "<!--") {
+			end := strings.Index(s[i+4:], "-->")
+			if end < 0 {
+				break // unterminated comment: drop the rest
+			}
+			i += 4 + end + 3
+			continue
+		}
+		name, closing, ok := tagName(s[i+1:])
+		if !ok {
+			b.WriteByte(c) // "a < b": not a tag
+			i++
+			continue
+		}
+		end := tagEnd(s, i+1)
+		if end < 0 {
+			break // unterminated tag: drop the rest
+		}
+		i = end + 1
+		switch {
+		case !closing && droppedTags[name]:
+			// A self-closing <svg/> or <math/> (foreign elements) has no
+			// content to drop; <script/> etc. still open an element, as in
+			// browsers.
+			if !((name == "svg" || name == "math") && s[end-1] == '/') {
+				i = skipElement(s, i, name)
+			}
+			b.WriteByte(' ')
+		case !inlineTags[name]:
+			b.WriteByte(' ')
+		}
+	}
+	return b.String()
+}
+
+// tagName reads the tag name after "<" (lower-cased); ok is false when the
+// text does not start a tag. Declarations and processing instructions
+// ("<!DOCTYPE …>", "<?xml …?>") are tags with an empty name.
+func tagName(s string) (name string, closing, ok bool) {
+	if s != "" && (s[0] == '!' || s[0] == '?') {
+		return "", false, true
+	}
+	if s != "" && s[0] == '/' {
+		closing, s = true, s[1:]
+	}
+	n := 0
+	for n < len(s) && (s[n] >= 'a' && s[n] <= 'z' || s[n] >= 'A' && s[n] <= 'Z' || n > 0 && s[n] >= '0' && s[n] <= '9') {
+		n++
+	}
+	if n == 0 {
+		return "", false, false
+	}
+	return strings.ToLower(s[:n]), closing, true
+}
+
+// tagEnd returns the index of the ">" closing the tag that starts before
+// from, skipping quoted attribute values; -1 if there is none.
+func tagEnd(s string, from int) int {
+	var quote byte
+	for j := from; j < len(s); j++ {
+		switch c := s[j]; {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '>':
+			return j
+		}
+	}
+	return -1
+}
+
+// skipElement returns the index after the closing tag of name that follows
+// from (case-insensitive), or len(s) when it is not closed.
+func skipElement(s string, from int, name string) int {
+	// ASCII-only lowering keeps byte offsets equal to those of s.
+	lower := []byte(s[from:])
+	for i, c := range lower {
+		if c >= 'A' && c <= 'Z' {
+			lower[i] = c + 'a' - 'A'
+		}
+	}
+	for k := 0; ; {
+		j := bytes.Index(lower[k:], []byte("</"+name))
+		if j < 0 {
+			return len(s)
+		}
+		k += j
+		rest := lower[k+2+len(name):]
+		if len(rest) == 0 || rest[0] == '>' || rest[0] == '/' || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\n' || rest[0] == '\r' {
+			end := bytes.IndexByte(lower[k:], '>')
+			if end < 0 {
+				return len(s)
+			}
+			return from + k + end + 1
+		}
+		k += 2 // "</scriptx": keep looking
+	}
 }

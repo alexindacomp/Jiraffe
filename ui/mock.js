@@ -5,11 +5,18 @@
    with column configurations (multi-status columns; MB and CMA have several boards; 880 is shared by MB and CMA;
    HR's default board has none of its statuses ⇒ workflow columns with a board picker; EDS/OPS/SEC/DWH have no boards
    ⇒ workflow columns), sprints across projects, backlog, carried-over issues.
+   v0.4 data: a JEditor-style HTML description (EDS-231: panels, list, code, image, table, links, plus a <script>,
+   an onerror and a javascript: link that must stay inert) and an HTML comment; epic time (logged / estimate) in RBI
+   (10 epics ⇒ "Other", RBI-909 without time), CMA, EDS and MB (estimate only ⇒ "No logged time"); Dev / QA story
+   points (RBI-1040 both, CMA-412 Dev only, MB-77 QA only, the rest none).
    URL flags (?mock=a,b): unconfigured | empty | errors (frequent failures) | noerrors | slow | fast (notification every 10 s)
    | warnings (toggling autostart "fails": warning + autostartEffective = previous value)
    | noagile (agile API missing: no boards, workflow columns, sprints unavailable) | truncated (board/epics/sprints report truncated)
    | untracked (trackedProjects = null) | closedfail (getSprintGroups: closed sprints fail ⇒ closedUnavailable)
-   | limit (tracking more than 6 projects fails with a validation error, like the Go limit of 200) | noprefs (no getUiPrefs: older backend). */
+   | limit (tracking more than 6 projects fails with a validation error, like the Go limit of 200) | noprefs (no getUiPrefs: older backend)
+   | timepartial (getEpics reports timePartial: some issues' time could not be read)
+   | update | update-oncheck | update-fail | update-nowrite | update-badsig | update-checkfail | noupdate | devbuild | updated
+   (auto-update, see the "v0.4 auto-update" block below). */
 (function () {
   'use strict';
   if (typeof window.__jiraffe === 'function') return;
@@ -115,45 +122,57 @@
 
   /* ---------- issues ----------
      [key, summary, status, type, priority, assignee, updatedMinutesAgo, extras]
-     extras: epic (key), name/color (for epics), sp, parent, sprints [ids], labels, comps, versions, est [orig, rem, spent] h */
+     extras: epic (key), name/color (for epics), sp, dsp/qsp (Dev / QA story points), parent, sprints [ids], labels, comps,
+     versions, est [orig, rem, spent] h (also the epic dashboard's estimate / logged time) */
   const H = 3600;
   const RAW = [
     // Epics
     ['RBI-900', 'Новый движок отчётов: построение, экспорт, фильтры', 'inprog', 'epic', 'High', 'am', 60 * 30, { name: 'Движок отчётов', color: 'ghx-label-4' }],
     ['RBI-950', 'Единый вход через корпоративный SSO', 'todo', 'epic', 'Medium', 'am', 60 * 50, { name: 'SSO', color: 'ghx-label-9' }],
+    // v0.4: more than 8 RBI epics (dashboard "Other"); time logged on the epics themselves; RBI-909 has none.
+    ['RBI-901', 'Мобильная версия портала отчётов', 'inprog', 'epic', 'Medium', 'is', 60 * 30, { name: 'Мобильные отчёты', color: 'ghx-label-10', est: [30, 12, 21] }],
+    ['RBI-902', 'Планировщик рассылок отчётов по расписанию', 'inprog', 'epic', 'Medium', 'do', 60 * 31, { name: 'Планировщик рассылок', color: 'ghx-label-2', est: [24, 8, 16] }],
+    ['RBI-903', 'Каталог метрик и их владельцев', 'inprog', 'epic', 'Low', 'is', 60 * 32, { name: 'Каталог метрик', color: 'ghx-label-11', est: [16, 6, 11] }],
+    ['RBI-904', 'Дашборды для руководителей подразделений', 'todo', 'epic', 'Medium', 'am', 60 * 33, { name: 'Дашборды руководителя', color: 'ghx-label-12', est: [20, 14, 7] }],
+    ['RBI-905', 'Миграция хранилища отчётов на PostgreSQL 16', 'inprog', 'epic', 'High', 'mh', 60 * 34, { name: 'Миграция на PostgreSQL 16', color: 'ghx-label-13', est: [12, 8, 4.5] }],
+    ['RBI-906', 'Аудит доступа к отчётам', 'todo', 'epic', 'Medium', 'do', 60 * 35, { name: 'Аудит доступа', color: 'ghx-label-5', est: [8, 4, 3] }],
+    ['RBI-907', 'Контроль качества данных в витринах', 'todo', 'epic', 'Low', 'is', 60 * 36, { name: 'Data quality', color: 'ghx-label-14', est: [6, 5, 1.5] }],
+    ['RBI-908', 'Экспорт отчётов в PDF', 'todo', 'epic', 'Low', 'sk', 60 * 37, { name: 'Экспорт в PDF', color: 'ghx-label-7', est: [4, 3.5, 0.5] }],
+    ['RBI-909', 'Архивация устаревших отчётов', 'backlog', 'epic', 'Lowest', null, 60 * 38, { name: 'Архивация отчётов', color: 'ghx-label-3' }],
     ['CMA-300', 'Журнал операций 2.0', 'inprog', 'epic', 'Medium', 'nb', 60 * 70, { name: 'Журнал операций 2.0', color: 'ghx-label-6' }],
+    ['CMA-310', 'Уведомления в кабинете клиента', 'todo', 'epic', 'Medium', 'nb', 60 * 72, { name: 'Уведомления', color: 'ghx-label-1', est: [12, 9, 3.5] }],
     ['MB-50', 'Push-сповіщення для мобільних застосунків', 'inprog', 'epic', 'High', 'sk', 60 * 20, { name: 'Push-сповіщення', color: 'ghx-label-2' }],
     ['EDS-200', 'Интеграция с провайдером ЭДО', 'inprog', 'epic', 'High', 'do', 60 * 40, { name: 'Интеграция с ЭДО', color: 'ghx-label-8' }],
     ['EDS-150', 'Миграция архива документов', 'done', 'epic', 'Low', 'do', 60 * 24 * 20, { name: 'Миграция архива', color: 'ghx-label-11' }],
     // Stories
-    ['RBI-1031', 'Перенести авторизацию на OAuth2 (Keycloak)', 'todo', 'story', 'Medium', 'me', 95, { epic: 'RBI-950', sp: 5, sprints: [6338], labels: ['security', 'backend'], comps: ['Auth'], versions: ['4.2.0'] }],
-    ['RBI-1040', 'Экспорт отчётов в Excel без ограничения по строкам', 'inprog', 'story', 'High', 'is', 180, { epic: 'RBI-900', sp: 8, sprints: [6337, 6338], comps: ['Export'], versions: ['4.2.0'], est: [24, 10, 14] }],
+    ['RBI-1031', 'Перенести авторизацию на OAuth2 (Keycloak)', 'todo', 'story', 'Medium', 'me', 95, { epic: 'RBI-950', sp: 5, est: [20, 20, 0], sprints: [6338], labels: ['security', 'backend'], comps: ['Auth'], versions: ['4.2.0'] }],
+    ['RBI-1040', 'Экспорт отчётов в Excel без ограничения по строкам', 'inprog', 'story', 'High', 'is', 180, { epic: 'RBI-900', sp: 8, dsp: 5, qsp: 3, sprints: [6337, 6338], comps: ['Export'], versions: ['4.2.0'], est: [24, 10, 14] }],
     ['RBI-1041', 'Конструктор фильтров отчёта', 'todo', 'story', 'Medium', 'do', 60 * 8, { epic: 'RBI-900', sp: 5, sprints: [6338] }],
-    ['CMA-412', 'Добавить фильтр по дате в журнал операций', 'inprog', 'story', 'Medium', 'me', 47, { epic: 'CMA-300', sp: 3, labels: ['ux'], sprints: [7101] }],
-    ['CMA-420', 'Выгрузка журнала операций в CSV', 'closed', 'story', 'Low', 'mh', 60 * 24 * 4, { epic: 'CMA-300', sp: 2, sprints: [7200] }],
-    ['MB-77', 'Push-сповіщення для iOS', 'inReview', 'story', 'High', 'me', 300, { epic: 'MB-50', sp: 8, versions: ['3.14'], sprints: [7100, 7101] }],
-    ['MB-90', 'Налаштування сповіщень у профілі', 'todo', 'story', 'Medium', 'sk', 60 * 26, { epic: 'MB-50', sp: 3, sprints: [7102] }],
+    ['CMA-412', 'Добавить фильтр по дате в журнал операций', 'inprog', 'story', 'Medium', 'me', 47, { epic: 'CMA-300', sp: 3, dsp: 2, labels: ['ux'], sprints: [7101], est: [8, 3, 6] }],
+    ['CMA-420', 'Выгрузка журнала операций в CSV', 'closed', 'story', 'Low', 'mh', 60 * 24 * 4, { epic: 'CMA-300', sp: 2, sprints: [7200], est: [4, 0, 4.5] }],
+    ['MB-77', 'Push-сповіщення для iOS', 'inReview', 'story', 'High', 'me', 300, { epic: 'MB-50', sp: 8, qsp: 3, versions: ['3.14'], sprints: [7100, 7101], est: [16, 16, 0] }],
+    ['MB-90', 'Налаштування сповіщень у профілі', 'todo', 'story', 'Medium', 'sk', 60 * 26, { epic: 'MB-50', sp: 3, sprints: [7102], est: [6, 6, 0] }],
     ['EDS-230', 'Интеграция с сервисом электронного документооборота: подписание пакета', 'inprog', 'story', 'Medium', 'me', 5, { epic: 'EDS-200', sp: 8, comps: ['Signing'], est: [36, 12, 20] }],
     ['EDS-240', 'Статусы подписания в карточке документа', 'inprog', 'story', 'Medium', 'nb', 60 * 5, { epic: 'EDS-200', sp: 5 }],
     ['RBI-1050', 'Тёмная тема для портала отчётов', 'backlog', 'story', 'Low', 'mh', 60 * 24 * 9, { sp: 3, sprints: [6339] }],
     ['CMA-430', 'Онбординг новых клиентов в кабинете', 'todo', 'story', 'Medium', null, 60 * 24 * 2, { sp: 5, sprints: [7202] }],
     // Tasks, bugs, sub-tasks
     ['RBI-1028', 'Відділити frontend від backend', 'inprog', 'task', 'High', 'me', 12, { epic: 'RBI-950', sprints: [6338], labels: ['architecture'], est: [16, 6, 9.5] }],
-    ['RBI-1019', 'Помилка 500 при експорті звіту в Excel, якщо в періоді більше 10 000 рядків', 'forReview', 'bug', 'Highest', 'me', 38, { epic: 'RBI-900', sprints: [6338], comps: ['Export'], due: 3 }],
+    ['RBI-1019', 'Помилка 500 при експорті звіту в Excel, якщо в періоді більше 10 000 рядків', 'forReview', 'bug', 'Highest', 'me', 38, { epic: 'RBI-900', sprints: [6338], comps: ['Export'], due: 3, est: [6, 2, 5] }],
     ['RBI-997', 'Оновити залежності Spring Boot до 3.3', 'backlog', 'task', 'Low', 'me', 60 * 26, { epic: 'RBI-900', sprints: [6339], sp: 2 }],
-    ['RBI-1042', 'Индексы для таблицы фактов отчётов', 'inprog', 'task', 'Medium', 'is', 60 * 3, { epic: 'RBI-900', sprints: [6338], sp: 3 }],
+    ['RBI-1042', 'Индексы для таблицы фактов отчётов', 'inprog', 'task', 'Medium', 'is', 60 * 3, { epic: 'RBI-900', sprints: [6338], sp: 3, est: [8, 2, 7.5] }],
     ['RBI-1043', 'Покрыть экспорт интеграционными тестами', 'todo', 'sub', 'Medium', 'do', 60 * 6, { parent: 'RBI-1040', sprints: [6338] }],
     ['RBI-1044', 'Нагрузочное тестирование движка', 'todo', 'task', 'Medium', 'sk', 60 * 30, { epic: 'RBI-900', sprints: [6336, 6337, 6338], sp: 3 }],
-    ['RBI-1045', 'Обновить документацию API отчётов', 'done', 'task', 'Low', 'is', 60 * 24, { epic: 'RBI-900', sprints: [6338], sp: 1 }],
-    ['RBI-1046', 'Метрики времени построения отчёта в Grafana', 'done', 'task', 'Medium', 'me', 60 * 24 * 2, { epic: 'RBI-900', sprints: [6338], sp: 2 }],
-    ['RBI-1029', 'Кэширование справочников', 'done', 'task', 'Medium', 'me', 60 * 24 * 16, { epic: 'RBI-900', sprints: [6337], sp: 3 }],
+    ['RBI-1045', 'Обновить документацию API отчётов', 'done', 'task', 'Low', 'is', 60 * 24, { epic: 'RBI-900', sprints: [6338], sp: 1, est: [4, 0, 3.5] }],
+    ['RBI-1046', 'Метрики времени построения отчёта в Grafana', 'done', 'task', 'Medium', 'me', 60 * 24 * 2, { epic: 'RBI-900', sprints: [6338], sp: 2, est: [6, 0, 6.5] }],
+    ['RBI-1029', 'Кэширование справочников', 'done', 'task', 'Medium', 'me', 60 * 24 * 16, { epic: 'RBI-900', sprints: [6337], sp: 3, est: [10, 0, 12] }],
     ['RBI-1030', 'Логирование запросов к отчётам', 'done', 'task', 'Low', 'is', 60 * 24 * 15, { sprints: [6337], sp: 2 }],
     ['CMA-415', 'Не обновляется счётчик непрочитанных сообщений после перехода по push', 'inReview', 'bug', 'High', 'me', 180, { sprints: [7201], sp: 2 }],
     ['CMA-399', 'Рефакторинг модуля уведомлений', 'backlog', 'task', 'Medium', 'me', 60 * 24 * 6, {}],
-    ['CMA-421', 'API фильтрации журнала по дате', 'closed', 'task', 'Medium', 'nb', 60 * 24, { epic: 'CMA-300', sprints: [7201], sp: 3 }],
-    ['CMA-422', 'UI-компонент выбора периода', 'inprog', 'task', 'Medium', 'mh', 60 * 2, { epic: 'CMA-300', sprints: [7201], sp: 5 }],
+    ['CMA-421', 'API фильтрации журнала по дате', 'closed', 'task', 'Medium', 'nb', 60 * 24, { epic: 'CMA-300', sprints: [7201], sp: 3, est: [6, 0, 7] }],
+    ['CMA-422', 'UI-компонент выбора периода', 'inprog', 'task', 'Medium', 'mh', 60 * 2, { epic: 'CMA-300', sprints: [7201], sp: 5, est: [10, 4, 7.5] }],
     ['CMA-433', 'Падает сборка на CI после обновления Gradle', 'forReview', 'bug', 'High', 'do', 60 * 4, { sprints: [7201] }],
-    ['CMA-441', 'Регресс журнала операций перед релизом', 'forTesting', 'task', 'Medium', 'mh', 60 * 6, { epic: 'CMA-300', sprints: [7201], sp: 2 }],
+    ['CMA-441', 'Регресс журнала операций перед релизом', 'forTesting', 'task', 'Medium', 'mh', 60 * 6, { epic: 'CMA-300', sprints: [7201], sp: 2, est: [5, 3, 2] }],
     ['CMA-442', 'Консультация: выгрузка выписки за 2023 год', 'solved', 'task', 'Low', 'me', 60 * 24 * 2, { sprints: [7201] }],
     ['MB-81', 'Краш при повороті екрана на Android 14', 'todo', 'bug', 'Highest', 'me', 22, { epic: 'MB-50', sprints: [7101] }],
     ['MB-78', 'Сертифікати APNs для продакшну', 'closed', 'task', 'High', 'sk', 60 * 24 * 3, { epic: 'MB-50', sprints: [7100], sp: 2 }],
@@ -163,10 +182,10 @@
     ['MB-97', 'Оновити SDK аналітики', 'backlog', 'task', 'Low', null, 60 * 24 * 8, {}],
     ['EDS-233', 'Описать API загрузки вложений в Swagger', 'forReview', 'task', 'Low', 'me', 60 * 3, { epic: 'EDS-200' }],
     ['EDS-219', 'Таймаут при генерации PDF больше 50 страниц', 'todo', 'bug', 'Medium', 'me', 60 * 50, { epic: 'EDS-200' }],
-    ['EDS-231', 'Подписание пакета: бэкенд и очередь', 'inprog', 'task', 'High', 'am', 60, { epic: 'EDS-200' }],
+    ['EDS-231', 'Подписание пакета: бэкенд и очередь', 'inprog', 'task', 'High', 'am', 60, { epic: 'EDS-200', est: [24, 10, 15] }],
     ['EDS-241', 'Вебхук статусов от провайдера ЭДО', 'todo', 'task', 'Medium', 'is', 60 * 11, { epic: 'EDS-200' }],
-    ['EDS-151', 'Перенос архива за 2019–2022', 'done', 'task', 'Medium', 'do', 60 * 24 * 21, { epic: 'EDS-150' }],
-    ['EDS-152', 'Проверка целостности после миграции', 'done', 'task', 'Low', 'nb', 60 * 24 * 20, { epic: 'EDS-150' }],
+    ['EDS-151', 'Перенос архива за 2019–2022', 'done', 'task', 'Medium', 'do', 60 * 24 * 21, { epic: 'EDS-150', est: [20, 0, 18] }],
+    ['EDS-152', 'Проверка целостности после миграции', 'done', 'task', 'Low', 'nb', 60 * 24 * 20, { epic: 'EDS-150', est: [6, 0, 5] }],
     ['HR-5', 'Шаблон заявки на отпуск', 'todo', 'task', 'Low', 'am', 60 * 24 * 3, {}],
     ['HR-7', 'Синхронизация оргструктуры', 'inprog', 'task', 'Medium', 'is', 60 * 20, {}],
     ['OPS-12', 'Продлить сертификат sd.local', 'todo', 'task', 'High', 'me', 60 * 15, {}],
@@ -193,7 +212,7 @@
         id: String(20000 + i), rank: i, key, summary, status: ST[st], type: TYPES[type], priority: { name: prio },
         assignee: who ? U[who] : null, updated: minutesAgo(ago), created,
         reporter: who === 'me' ? U.am : U.me, epic: x.epic || null, epicName: x.name, epicColor: x.color,
-        storyPoints: x.sp, parent: x.parent || null, sprints: x.sprints || [], labels: x.labels || [], components: x.comps || [],
+        storyPoints: x.sp, devStoryPoints: x.dsp, qaStoryPoints: x.qsp, parent: x.parent || null, sprints: x.sprints || [], labels: x.labels || [], components: x.comps || [],
         fixVersions: x.versions || [], est: x.est || null, dueDate: x.due != null ? isoDay(new Date(Date.now() + x.due * 86400000)) : undefined,
         watchers: 1 + (i % 5), comments: [], changelog: [],
       });
@@ -234,7 +253,7 @@ java.lang.OutOfMemoryError: Java heap space
 
 bq. Воспроизводится на стенде _preprod_ стабильно.
 
-Проверка экранирования: <img src=x onerror=alert(1)> и <script>alert('xss')</script> должны отображаться как текст. Ссылка на чужой сайт: [не наш Jira|https://example.com/evil].`,
+Проверка экранирования: {{<img src=x onerror=alert(1)>}} и <script>alert('xss')</script> должны отображаться как текст (это wiki-разметка: HTML внутри {{…}} не включает HTML-режим). Ссылка на чужой сайт: [не наш Jira|https://example.com/evil].`,
     'EDS-230': `h3. Подписание пакета документов
 Пакет подписывается одной операцией у провайдера ЭДО.
 * до 50 документов в пакете
@@ -245,6 +264,49 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
 {quote}`,
     'MB-77': 'Підтримка push-сповіщень для iOS через APNs. Див. [EDS-230] для схеми підпису payload — _жартую_, це інший проєкт 🙂',
     'CMA-412': 'Фильтр по дате «с — по» в журнале операций. Макет в Figma: [макет|https://sd.local/wiki/CMA/filters].',
+    // v0.4: JEditor HTML. The <script>, onerror / onclick and the javascript: link must never run; inline styles are dropped.
+    'EDS-231': `<div class="userTemplate" style="font-family: Arial; background-color: #ffffff">
+<div class="jePanel_blue" style="border: 1px solid #9cc3e6; background-color: #deebf7; padding: 8px">
+<div class="jePanelHeader" style="font-weight: bold; color: #1f4e79">BRIEF:</div>
+<div class="jePanelContent">
+<p dir="auto">Бэкенд подписания пакета: принимает до <b>50</b> документов, ставит задание в очередь и сразу отдаёт <code>jobId</code>.</p>
+<p dir="auto">&nbsp;</p>
+<p dir="auto">Связано с <a href="https://sd.local/browse/EDS-230">EDS-230</a>, схема в <a href="https://sd.local/wiki/EDS/signing" style="color: red">вики</a>.</p>
+</div>
+</div>
+<p dir="auto">&nbsp;</p>
+<p dir="auto">&nbsp;</p>
+<div class="jePanel_yell" style="background-color: #fff2cc">
+<div class="jePanelHeader_red" style="color: #c00000">ВАЖНО:</div>
+<div class="jePanelContent"><ul><li>Лимит провайдера — <i>10 запросов в секунду</i></li><li>Повтор при <code>429</code> с экспоненциальной задержкой<ul><li>не больше 5 попыток</li></ul></li></ul></div>
+</div>
+<!-- JEditor: служебный комментарий, не должен отображаться -->
+<h1 style="font-size: 32px">Формат задания</h1>
+<pre style="background: #f5f5f5">POST /api/v1/sign-jobs
+{ "documents": ["doc-1", "doc-2"], "callback": "https://sd.local/hooks/eds" }</pre>
+<ol start="3"><li>Шаг 3: проверить подпись</li><li>Шаг 4: <u>сохранить</u> квитанцию</li></ol>
+<table border="1" style="border-collapse: collapse; width: 900px" onclick="alert('XSS via onclick')">
+<thead><tr><th style="background: #ddd">Статус</th><th>Код</th><th>Описание</th></tr></thead>
+<tbody>
+<tr><td>queued</td><td><code>100</code></td><td>Задание принято и ждёт отправки провайдеру</td></tr>
+<tr><td>signing</td><td><code>200</code></td><td rowspan="2" style="background: #fffbe6">Провайдер обрабатывает пакет; статус приходит вебхуком ([EDS-241])</td></tr>
+<tr><td>partially_signed_with_a_very_long_status_name_that_does_not_wrap</td><td><code>206</code></td></tr>
+<tr><td colspan="3"><strike>failed_legacy</strike> — больше не используется</td></tr>
+</tbody></table>
+<p dir="auto">Схема очереди:</p>
+<p dir="auto"><span class="image-wrap" style=""><img src="https://sd.local/plugins/servlet/jeditor_file_provider?imgId=42&amp;fileName=queue.png" alt="queue.png" style="border: 0"></span></p>
+<p dir="auto"><img src="x" onerror="alert('XSS via onerror')"><script>alert('XSS via script')</script><font color="red">Проверка безопасности: скрипт и onerror выше не должны выполниться.</font></p>
+<p dir="auto">Ответственный: <span style="color: #c00">Андрій Мельник</span><br>Ревью: Ірина Шевченко<br><br><br><br>Конец списка.</p>
+<blockquote>Цитата из ТЗ: «пакет подписывается одной операцией».</blockquote>
+<!-- CR-1: a <br> at the edge of an inline element in the middle of a line must stay; CR-2: no <style> text in a link -->
+<p><b>Bold line<br></b>Next line</p>
+<p>first<i><br>second</i></p>
+<p><code>a<br></code>b</p>
+<p>Ссылка без CSS в тексте: <a href="https://sd.local/wiki/EDS/queue">очередь<style>.x{color:red}</style></a></p>
+<hr>
+<p dir="auto"><a href="javascript:alert('XSS via javascript: link')">ссылка javascript:</a> должна остаться текстом. H<sub>2</sub>O, x<sup>2</sup>, <del>удалено</del>, <ins>добавлено</ins>.</p>
+<iframe src="https://example.com"></iframe><form action="https://example.com"><input value="x"><button>Отправить</button></form>
+</div>`,
   };
   const COMMENTS = {
     'RBI-1028': [
@@ -260,6 +322,10 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     'EDS-233': [['do', 60 * 20, 'Swagger посмотрел, ок. Только добавь, пожалуйста, пример ответа с ошибкой *413*.']],
     'MB-77': [['sk', 160, 'Автотести: 42 passed, 1 failed ({{PushPayloadTest.testSilentPush}}). Деталі в [Jenkins|https://sd.local/jenkins/1287].']],
     'EDS-230': [['am', 60 * 3, 'Очередь подняли, см. [EDS-231].']],
+    'EDS-231': [
+      ['is', 60 * 4, '<p dir="auto">Очередь подняли на <b>RabbitMQ</b>, см. <a href="https://sd.local/browse/EDS-230">EDS-230</a>.</p><p dir="auto">&nbsp;</p><ul><li>prefetch = <code>10</code></li><li>DLQ включена</li></ul><table><tr><th>Стенд</th><th>Очередь</th><th>prefetch</th><th>DLQ</th><th>TTL</th><th>Повторы</th><th>Задержка</th><th>Мониторинг</th><th>Владелец</th></tr><tr><td>dev</td><td>eds.sign.dev</td><td>5</td><td>да</td><td>10 мин</td><td>3</td><td>exp</td><td>Grafana</td><td>Андрій Мельник</td></tr><tr><td>prod</td><td>eds.sign</td><td>10</td><td>да</td><td>30 мин</td><td>5</td><td>exp</td><td>Grafana + PagerDuty</td><td>Ірина Шевченко</td></tr></table><p dir="auto"><img src="https://sd.local/plugins/servlet/jeditor_file_provider?imgId=43" onerror="alert(\'XSS in comment\')"></p>'],
+      ['me', 60 * 2, 'Спасибо! Обычный wiki-комментарий: *жирный* и {{mono}}.'],
+    ],
   };
   let commentSeq = 50000;
   recs.forEach((r) => {
@@ -449,7 +515,13 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     const desc = new Map();
     stories.forEach((s) => s._all.forEach((r) => desc.set(r.key, r)));
     tasks.forEach((r) => desc.set(r.key, r));
-    return { epic: toRef(e), stories, tasks: tasks.map((r) => toRef(r)), progress: progressOf([...desc.values()]), _all: [e, ...desc.values()] };
+    const counted = [e, ...desc.values()];
+    // v0.4: own timespent / timeoriginalestimate of the epic and every distinct issue of its tree
+    const time = counted.reduce((a, r) => {
+      if (r.est) { a.estimateSeconds += Math.round(r.est[0] * H); a.spentSeconds += Math.round(r.est[2] * H); }
+      return a;
+    }, { spentSeconds: 0, estimateSeconds: 0, issues: counted.length });
+    return { epic: toRef(e), stories, tasks: tasks.map((r) => toRef(r)), progress: progressOf([...desc.values()]), time, _all: counted };
   }
   const strip = (n) => { const o = Object.assign({}, n); delete o._all; if (o.stories) o.stories = o.stories.map(strip); return o; };
   const keepScope = (node, scope) => scope !== 'mine' || node._all.some(mine);
@@ -473,6 +545,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     notifyComments: true,
     commentPollMinutes: 5,
     boardJql: 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC',
+    autoCheckUpdates: true,
   };
   let token = flags.has('unconfigured') ? '' : 'mock-token';
   const configured = () => !!settings.jiraUrl && !!token;
@@ -589,7 +662,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     return {
       configured: configured(),
       user: configured() ? clone(ME) : undefined,
-      version: '0.3.0-mock',
+      version: (updSupported() ? upd.current : 'dev') + '-mock',
       language: settings.language,
       unread: notifications.filter((n) => !n.read).length,
       nextWorklogAt: nextWorklogAt(),
@@ -644,6 +717,107 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     uk: 'Налаштування збережено, але змінити автозапуск не вдалося: доступ до реєстру заборонено.',
     en: 'Settings saved, but autostart could not be changed: registry access denied.',
   };
+
+  /* ---------- v0.4 auto-update (SPEC §5) ----------
+     Default: up to date (no prompt). update: 0.5.0 available, prompt at startup | update-fail: the first download fails
+     (network), a retry works | update-nowrite: install fails with no_write_access | update-badsig: verify fails with
+     bad_signature | update-checkfail: the last check failed | noupdate: up to date | devbuild: supported = false |
+     updated: justUpdated toast at startup | update-oncheck: 0.5.0 is found only by "Check for updates" (combine with
+     update-fail / -nowrite / -badsig). A successful install "restarts" by reloading the page into the new version. */
+  const UPD_KEY = 'jiraffe.mock.update';
+  const updSaved = (() => { try { const v = JSON.parse(sessionStorage.getItem(UPD_KEY) || '{}'); return v && typeof v === 'object' ? v : {}; } catch { return {}; } })();
+  const saveUpd = (patch) => { Object.assign(updSaved, patch); try { sessionStorage.setItem(UPD_KEY, JSON.stringify(updSaved)); } catch { /* memory only */ } };
+  const UPD_NEWER = ['update', 'update-fail', 'update-nowrite', 'update-badsig', 'update-oncheck'].some((f) => flags.has(f)) && !flags.has('noupdate');
+  const RELEASE_NOTES = `## Что нового
+- Дашборд «Время по эпикам»: доля каждого эпика в списанном времени или оценке по проектам
+- HTML-описания и комментарии (JEditor) отображаются как форматированный текст
+- Тёмный заголовок окна в тёмной теме Windows
+- Dev / QA story points в карточке задачи
+- Автоматические обновления с проверкой подписи
+
+## Исправления
+- Карточки на доске больше не «прыгают» после смены статуса
+- Списание времени учитывает праздники из настроек
+- Ссылки на задачи в комментариях открываются в панели
+
+<img src=x onerror=alert('XSS in release notes')> — заметки выпуска показываются только как текст.
+
+Полный список изменений: https://github.com/alexindacomp/Jiraffe/compare/v0.4.0...v0.5.0`;
+  const upd = {
+    current: updSaved.current || '0.4.0',
+    skipped: updSaved.skipped || '',
+    installing: false,
+    failOnce: flags.has('update-fail') && !updSaved.failedOnce,
+    justUpdated: updSaved.justUpdated || (flags.has('updated') ? { from: '0.3.2', to: updSaved.current || '0.4.0' } : null),
+    found: !flags.has('update-oncheck'), // update-oncheck: the newer release is only found by a manual check
+    lastCheck: flags.has('update-checkfail')
+      ? { at: minutesAgo(40), ok: false, error: { ru: 'Не удалось связаться с GitHub: превышено время ожидания (20 с)', uk: 'Не вдалося зв’язатися з GitHub: перевищено час очікування (20 с)', en: 'Could not reach GitHub: timed out (20 s)' } }
+      : { at: minutesAgo(12), ok: true },
+  };
+  if (updSaved.justUpdated) saveUpd({ justUpdated: null }); // shown once per "restart"
+  const upd050 = { version: '0.5.0', notes: RELEASE_NOTES, publishedAt: daysFromNow(-2, 14), size: 4823449, url: 'https://github.com/alexindacomp/Jiraffe/releases/tag/v0.5.0' };
+  const updLatest = () => ((UPD_NEWER && upd.found) || upd.current === '0.5.0' ? upd050
+    : { version: upd.current, notes: 'Исправления и улучшения.', publishedAt: daysFromNow(-20, 12), size: 4700000, url: `https://github.com/alexindacomp/Jiraffe/releases/tag/v${upd.current}` });
+  const semverGt = (a, b) => {
+    const pa = String(a).replace(/^v/, '').split('.').map(Number); const pb = String(b).replace(/^v/, '').split('.').map(Number);
+    for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+    return false;
+  };
+  const SEMVER = /^v?\d+\.\d+\.\d+$/;
+  const updSupported = () => !flags.has('devbuild');
+  function updStatus() {
+    const supported = updSupported();
+    const latest = updLatest();
+    const available = supported && semverGt(latest.version, upd.current);
+    const out = { currentVersion: supported ? upd.current : 'dev', supported, available, prompt: available && latest.version !== upd.skipped, installing: upd.installing };
+    if (supported) out.latest = clone(latest);
+    if (upd.skipped) out.skippedVersion = upd.skipped;
+    if (supported && upd.lastCheck) {
+      out.lastCheck = { at: upd.lastCheck.at, ok: upd.lastCheck.ok };
+      if (!upd.lastCheck.ok) out.lastCheck.error = upd.lastCheck.error[settings.language] || upd.lastCheck.error.ru;
+    }
+    if (upd.justUpdated) out.justUpdated = clone(upd.justUpdated);
+    return out;
+  }
+  const UPD_MSG = {
+    network: { ru: 'Не удалось скачать обновление: соединение прервано', uk: 'Не вдалося завантажити оновлення: з’єднання перервано', en: 'Could not download the update: the connection was interrupted' },
+    no_write_access: { ru: 'Нет прав на запись в папку C:\\Program Files\\Jiraffe', uk: 'Немає прав на запис у папку C:\\Program Files\\Jiraffe', en: 'No write access to C:\\Program Files\\Jiraffe' },
+    bad_signature: { ru: 'Подпись выпуска не прошла проверку — ничего не установлено', uk: 'Підпис випуску не пройшов перевірку — нічого не встановлено', en: 'The release signature is invalid — nothing was installed' },
+  };
+  function updFail(code) {
+    upd.installing = false;
+    emit('updateFailed', { code, message: UPD_MSG[code][settings.language] || UPD_MSG[code].ru });
+  }
+  /** Download in ~16 steps over ~3 s, then verify / install / restart; failures per flag. */
+  function runInstall(latest) {
+    const total = latest.size;
+    const steps = 16;
+    let i = 0;
+    emit('updateProgress', { phase: 'download', received: 0, total });
+    const tick = setInterval(() => {
+      i++;
+      const received = Math.min(total, Math.round((total * i) / steps));
+      emit('updateProgress', { phase: 'download', received, total });
+      if (upd.failOnce && i === 7) { clearInterval(tick); upd.failOnce = false; saveUpd({ failedOnce: true }); updFail('network'); return; }
+      if (i < steps) return;
+      clearInterval(tick);
+      setTimeout(() => {
+        emit('updateProgress', { phase: 'verify' });
+        setTimeout(() => {
+          if (flags.has('update-badsig')) { updFail('bad_signature'); return; }
+          emit('updateProgress', { phase: 'install' });
+          setTimeout(() => {
+            if (flags.has('update-nowrite')) { updFail('no_write_access'); return; }
+            emit('updateProgress', { phase: 'restart' });
+            setTimeout(() => {
+              saveUpd({ current: latest.version, justUpdated: { from: upd.current, to: latest.version }, skipped: '' });
+              location.reload(); // the "new version" starts
+            }, 1800);
+          }, 900);
+        }, 800);
+      }, 250);
+    }, 190);
+  }
 
   /* ---------- methods ---------- */
   class MockError { constructor(code, message, fields) { this.code = code; this.message = message; if (fields) this.fields = fields; } }
@@ -704,6 +878,8 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     if (r.dueDate) det.dueDate = r.dueDate;
     if (isDone(r)) det.resolution = 'Готово';
     if (r.storyPoints != null) det.storyPoints = r.storyPoints;
+    if (r.devStoryPoints != null) det.devStoryPoints = r.devStoryPoints;
+    if (r.qaStoryPoints != null) det.qaStoryPoints = r.qaStoryPoints;
     if (r.epic) det.epic = toRef(rec(r.epic));
     if (r.parent) det.parent = toRef(rec(r.parent), false);
     return det;
@@ -822,7 +998,9 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
         .map(epicNode).filter((n) => keepScope(n, scope)).map(strip);
       const orphanStories = all().filter((r) => r.type.kind === 'story' && !r.epic && inProject(r) && (p.includeDone || !isDone(r))).sort(treeSort)
         .map(storyNode).filter((n) => keepScope(n, scope)).map(strip);
-      return clone({ epics, orphanStories, fetchedAt: rfc(now()), truncated: flags.has('truncated') });
+      const out = { epics, orphanStories, fetchedAt: rfc(now()), truncated: flags.has('truncated') };
+      if (flags.has('timepartial')) out.timePartial = true;
+      return clone(out);
     },
     getStories(p) {
       requireConfigured();
@@ -832,6 +1010,38 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       const stories = all().filter((r) => r.type.kind === 'story' && inProject(r) && (p.includeDone || !isDone(r))).sort(treeSort)
         .map(storyNode).filter((n) => keepScope(n, scope)).map(strip);
       return clone({ stories, fetchedAt: rfc(now()), truncated: flags.has('truncated') });
+    },
+    getUpdateStatus: () => updStatus(),
+    checkForUpdates() {
+      if (!updSupported()) throw new MockError('update_unsupported', 'updates are not supported in this build');
+      upd.lastCheck = flags.has('update-checkfail') ? Object.assign({}, upd.lastCheck, { at: rfc(now()) }) : { at: rfc(now()), ok: true };
+      upd.found = true;
+      const st = updStatus();
+      if (st.prompt) emit('updateAvailable', st.latest); // like Go: the event comes before the method returns
+      return st;
+    },
+    installUpdate(p) {
+      const v = String((p && p.version) || '').replace(/^v/, '');
+      if (!SEMVER.test(v)) throw new MockError('bad_params', 'version must be X.Y.Z');
+      if (!updSupported()) throw new MockError('update_unsupported', 'updates are not supported in this build');
+      const latest = updLatest();
+      if (v !== latest.version || !semverGt(v, upd.current)) throw new MockError('update_stale', 'not the latest checked version');
+      if (upd.installing) throw new MockError('update_busy', 'an update is already being installed');
+      upd.installing = true;
+      setTimeout(() => runInstall(latest), 60);
+      return null;
+    },
+    skipUpdate(p) {
+      const v = String((p && p.version) || '').replace(/^v/, '');
+      if (!SEMVER.test(v)) throw new MockError('bad_params', 'version must be X.Y.Z');
+      upd.skipped = v;
+      saveUpd({ skipped: v });
+      return updStatus();
+    },
+    setWindowTheme(p) { // v0.4: the native title bar; nothing to paint in a browser
+      if (!p || typeof p.dark !== 'boolean' || (p.caption != null && !/^#[0-9a-f]{6}$/i.test(String(p.caption)))) throw new MockError('bad_params', 'dark must be a boolean, caption "#rrggbb"');
+      console.info('[jiraffe mock] setWindowTheme →', p.dark ? 'dark' : 'light', p.caption || ''); // eslint-disable-line no-console
+      return null;
     },
     openUrl(p) {
       const u = (p && p.url) || '';
@@ -924,5 +1134,5 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     emit('state', state());
   }, flags.has('fast') ? 10000 : 45000);
 
-  console.info('[jiraffe mock] fake backend installed. Flags: ?mock=unconfigured,empty,errors,noerrors,slow,fast,warnings,noagile,truncated,untracked,limit,noprefs,closedfail'); // eslint-disable-line no-console
+  console.info('[jiraffe mock] fake backend installed. Flags: ?mock=unconfigured,empty,errors,noerrors,slow,fast,warnings,noagile,truncated,untracked,limit,noprefs,closedfail,timepartial,update,update-fail,update-nowrite,update-badsig,update-checkfail,noupdate,devbuild,updated'); // eslint-disable-line no-console
 })();

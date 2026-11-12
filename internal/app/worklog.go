@@ -51,6 +51,9 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time)
 	if trigger != worklog.TriggerPreview {
 		a.runMu.Lock()
 		defer a.runMu.Unlock()
+		if a.updExiting.Load() {
+			return worklog.Run{}, errUpdateRestart // the new version runs it
+		}
 	}
 	realNow := a.clock.Now()
 	now := effectiveNow(realNow, due)
@@ -329,6 +332,9 @@ func (a *App) record(run worklog.Run, scheduledOK bool) {
 // ManualWorklog performs a worklog run requested by the user.
 func (a *App) ManualWorklog(ctx context.Context) (worklog.Run, error) {
 	run, err := a.computeWorklog(ctx, worklog.TriggerManual, time.Time{})
+	if errors.Is(err, errUpdateRestart) {
+		return run, a.newErr(CodeConflict, "err_update_restarting")
+	}
 	if run.SkippedReason == worklog.ReasonNotConfigured {
 		return run, errNotConfigured(a.Language())
 	}
@@ -367,6 +373,9 @@ func (a *App) ScheduledWorklog(ctx context.Context) error {
 // reached. It returns an error when the run should be retried.
 func (a *App) ScheduledWorklogAt(ctx context.Context, due time.Time) error {
 	run, err := a.computeWorklog(ctx, worklog.TriggerSchedule, due)
+	if errors.Is(err, errUpdateRestart) {
+		return nil // not recorded: the new version catches up
+	}
 	if run.SkippedReason != "" {
 		return nil // not configured / not a working day: nothing to retry
 	}

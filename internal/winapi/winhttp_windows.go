@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strconv"
 	"strings"
@@ -71,12 +72,51 @@ func (t *Transport) Close() {
 // Do performs one request synchronously; cancelling ctx closes the request
 // handle, which aborts the blocking WinHTTP call.
 func (t *Transport) Do(ctx context.Context, req *jira.Request) (*jira.Response, error) {
-	if err := ctx.Err(); err != nil {
+	var data []byte
+	status, location, err := t.exchange(ctx, req, func(_ int, chunk []byte) error {
+		data = append(data, chunk...)
+		if len(data) > maxResponseBytes {
+			return fmt.Errorf("response from Jira is too large (over %d MB)", maxResponseBytes>>20)
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
+	}
+	return &jira.Response{StatusCode: status, Body: data, Location: location}, nil
+}
+
+// ErrBodyTooLarge is returned by Stream when the body exceeds its limit.
+var ErrBodyTooLarge = errors.New("response body too large")
+
+// Stream performs a GET like Do (redirects are never followed) but writes
+// the body of a 2xx response to w as it arrives, failing with
+// ErrBodyTooLarge beyond limit bytes; other bodies are discarded. It returns
+// the status and, for 3xx, the Location header. Used by the updater with a
+// transport of its own (no Jira credentials).
+func (t *Transport) Stream(ctx context.Context, rawURL string, headers map[string]string, w io.Writer, limit int64) (int, string, error) {
+	var n int64
+	return t.exchange(ctx, &jira.Request{Method: "GET", URL: rawURL, Headers: headers}, func(status int, chunk []byte) error {
+		if status < 200 || status >= 300 {
+			return nil
+		}
+		if n += int64(len(chunk)); n > limit {
+			return ErrBodyTooLarge
+		}
+		_, err := w.Write(chunk)
+		return err
+	})
+}
+
+// exchange sends req and passes the response body to sink in chunks (not
+// called for 3xx responses), while ctx can still abort the transfer.
+func (t *Transport) exchange(ctx context.Context, req *jira.Request, sink func(status int, chunk []byte) error) (int, string, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, "", err
 	}
 	u, err := url.Parse(req.URL)
 	if err != nil || u.Host == "" {
-		return nil, fmt.Errorf("invalid URL")
+		return 0, "", fmt.Errorf("invalid URL")
 	}
 	secure := false
 	switch strings.ToLower(u.Scheme) {
@@ -84,7 +124,7 @@ func (t *Transport) Do(ctx context.Context, req *jira.Request) (*jira.Response, 
 		secure = true
 	case "http":
 	default:
-		return nil, fmt.Errorf("unsupported URL scheme %q", u.Scheme)
+		return 0, "", fmt.Errorf("unsupported URL scheme %q", u.Scheme)
 	}
 	port := 80
 	if secure {
@@ -93,24 +133,24 @@ func (t *Transport) Do(ctx context.Context, req *jira.Request) (*jira.Response, 
 	if p := u.Port(); p != "" {
 		port, err = strconv.Atoi(p)
 		if err != nil || port <= 0 || port > 65535 {
-			return nil, fmt.Errorf("invalid port %q", p)
+			return 0, "", fmt.Errorf("invalid port %q", p)
 		}
 	}
 
 	host16, err := windows.UTF16PtrFromString(u.Hostname())
 	if err != nil {
-		return nil, fmt.Errorf("invalid host")
+		return 0, "", fmt.Errorf("invalid host")
 	}
 	hConnect, _, e := procWinHttpConnect.Call(t.session, uintptr(unsafe.Pointer(host16)), uintptr(port), 0)
 	if hConnect == 0 {
-		return nil, winhttpError(e)
+		return 0, "", winhttpError(e)
 	}
 	defer procWinHttpCloseHandle.Call(hConnect)
 
 	method16, _ := windows.UTF16PtrFromString(req.Method)
 	path16, err := windows.UTF16PtrFromString(u.RequestURI())
 	if err != nil {
-		return nil, fmt.Errorf("invalid path")
+		return 0, "", fmt.Errorf("invalid path")
 	}
 	flags := uintptr(winhttpFlagEscapeDisable)
 	if secure {
@@ -118,7 +158,7 @@ func (t *Transport) Do(ctx context.Context, req *jira.Request) (*jira.Response, 
 	}
 	hReq, _, e := procWinHttpOpenRequest.Call(hConnect, uintptr(unsafe.Pointer(method16)), uintptr(unsafe.Pointer(path16)), 0, 0, 0, flags)
 	if hReq == 0 {
-		return nil, winhttpError(e)
+		return 0, "", winhttpError(e)
 	}
 	var closeOnce sync.Once
 	closeReq := func() { closeOnce.Do(func() { procWinHttpCloseHandle.Call(hReq) }) }
@@ -140,7 +180,7 @@ func (t *Transport) Do(ctx context.Context, req *jira.Request) (*jira.Response, 
 	// to wherever the server points. 3xx is reported to the caller instead.
 	policy := uint32(winhttpRedirectPolicyNever)
 	if r, _, e := procWinHttpSetOption.Call(hReq, winhttpOptionRedirectPolicy, uintptr(unsafe.Pointer(&policy)), 4); r == 0 {
-		return nil, fmt.Errorf("disable redirects: %w", winhttpError(e))
+		return 0, "", fmt.Errorf("disable redirects: %w", winhttpError(e))
 	}
 	dec := uint32(winhttpDecompressionFlagAll)
 	procWinHttpSetOption.Call(hReq, winhttpOptionDecompression, uintptr(unsafe.Pointer(&dec)), 4) // Win 8.1+, best effort
@@ -148,7 +188,7 @@ func (t *Transport) Do(ctx context.Context, req *jira.Request) (*jira.Response, 
 	var hdr strings.Builder
 	for k, v := range req.Headers {
 		if strings.ContainsAny(k+v, "\r\n") {
-			return nil, fmt.Errorf("invalid header %q", k)
+			return 0, "", fmt.Errorf("invalid header %q", k)
 		}
 		hdr.WriteString(k)
 		hdr.WriteString(": ")
@@ -158,11 +198,11 @@ func (t *Transport) Do(ctx context.Context, req *jira.Request) (*jira.Response, 
 	if hdr.Len() > 0 {
 		h16, err := windows.UTF16FromString(hdr.String())
 		if err != nil {
-			return nil, fmt.Errorf("invalid headers")
+			return 0, "", fmt.Errorf("invalid headers")
 		}
 		r, _, e := procWinHttpAddRequestHeaders.Call(hReq, uintptr(unsafe.Pointer(&h16[0])), uintptr(len(h16)-1), winhttpAddreqFlagAdd|winhttpAddreqFlagReplace)
 		if r == 0 {
-			return nil, t.fail(ctx, e)
+			return 0, "", t.fail(ctx, e)
 		}
 	}
 
@@ -172,42 +212,41 @@ func (t *Transport) Do(ctx context.Context, req *jira.Request) (*jira.Response, 
 	}
 	r, _, e := procWinHttpSendRequest.Call(hReq, 0, 0, uintptr(body), uintptr(len(req.Body)), uintptr(len(req.Body)), 0)
 	if r == 0 {
-		return nil, t.fail(ctx, e)
+		return 0, "", t.fail(ctx, e)
 	}
 	r, _, e = procWinHttpReceiveResponse.Call(hReq, 0)
 	if r == 0 {
-		return nil, t.fail(ctx, e)
+		return 0, "", t.fail(ctx, e)
 	}
 
 	var status, size uint32 = 0, 4
 	r, _, e = procWinHttpQueryHeaders.Call(hReq, winhttpQueryStatusCode|winhttpQueryFlagNumber, 0,
 		uintptr(unsafe.Pointer(&status)), uintptr(unsafe.Pointer(&size)), 0)
 	if r == 0 {
-		return nil, t.fail(ctx, e)
+		return 0, "", t.fail(ctx, e)
 	}
 
 	location := ""
 	if status >= 300 && status < 400 {
 		location = queryHeaderString(hReq, winhttpQueryLocation)
+		return int(status), location, nil
 	}
 
-	var data []byte
 	buf := make([]byte, 64<<10)
 	for {
 		var n uint32
 		r, _, e = procWinHttpReadData.Call(hReq, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), uintptr(unsafe.Pointer(&n)))
 		if r == 0 {
-			return nil, t.fail(ctx, e)
+			return 0, "", t.fail(ctx, e)
 		}
 		if n == 0 {
 			break
 		}
-		data = append(data, buf[:n]...)
-		if len(data) > maxResponseBytes {
-			return nil, fmt.Errorf("response from Jira is too large (over %d MB)", maxResponseBytes>>20)
+		if err := sink(int(status), buf[:n]); err != nil {
+			return 0, "", err
 		}
 	}
-	return &jira.Response{StatusCode: int(status), Body: data, Location: location}, nil
+	return int(status), location, nil
 }
 
 // queryHeaderString returns a response header as a string ("" if absent).

@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"jiraffe/internal/config"
+	"jiraffe/internal/update"
 	"jiraffe/internal/worklog"
 )
 
@@ -56,6 +57,21 @@ type Data struct {
 	// UIPrefs is the UI's preferences object, stored as raw JSON (opaque to
 	// Go; independent of the Jira connection).
 	UIPrefs json.RawMessage `json:"uiPrefs,omitempty"`
+	// SkippedVersion is the update the user postponed ("Later"): it is not
+	// offered again; a newer one is.
+	SkippedVersion string `json:"skippedVersion,omitempty"`
+	// UpdateCheck is the result of the last update check.
+	UpdateCheck *UpdateCheck `json:"updateCheck,omitempty"`
+}
+
+// UpdateCheck is the result of an update check.
+type UpdateCheck struct {
+	At     string `json:"at"` // RFC 3339
+	OK     bool   `json:"ok"`
+	Code   string `json:"code,omitempty"`   // update error code when !OK
+	Detail string `json:"detail,omitempty"` // English detail when !OK
+	// Latest is the latest release seen (kept when a later check fails).
+	Latest *update.Release `json:"latest,omitempty"`
 }
 
 // Store keeps Data in memory and writes it to disk on every update.
@@ -107,6 +123,14 @@ func (d Data) clone() Data {
 	c.SeenComments = append([]string{}, d.SeenComments...)
 	if d.UIPrefs != nil {
 		c.UIPrefs = append(json.RawMessage{}, d.UIPrefs...)
+	}
+	if d.UpdateCheck != nil {
+		u := *d.UpdateCheck
+		if u.Latest != nil {
+			l := *u.Latest
+			u.Latest = &l
+		}
+		c.UpdateCheck = &u
 	}
 	return c
 }

@@ -26,6 +26,7 @@ func (p *regPlatform) Transport() jira.Transport             { return nil }
 func (p *regPlatform) OpenURL(string) error                  { return nil }
 func (p *regPlatform) Notify(string, string, string)         {}
 func (p *regPlatform) SettingsChanged(config.Settings, bool) {}
+func (p *regPlatform) SetWindowTheme(WindowTheme)            {}
 func (p *regPlatform) SetAutostart(on bool) error {
 	p.writes++
 	if p.writeErr != nil {
@@ -94,6 +95,7 @@ func (plainPlatform) OpenURL(string) error                  { return nil }
 func (plainPlatform) SetAutostart(bool) error               { return nil }
 func (plainPlatform) Notify(string, string, string)         {}
 func (plainPlatform) SettingsChanged(config.Settings, bool) {}
+func (plainPlatform) SetWindowTheme(WindowTheme)            {}
 
 func TestBadNonceErrorCode(t *testing.T) {
 	e := BadNonceError("uk")

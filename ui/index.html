@@ -52,6 +52,7 @@
     <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l3-3A5 5 0 0 0 13 2.9l-1 1"/><path d="M14 11a5 5 0 0 0-7.1 0l-3 3A5 5 0 0 0 11 21.1l1-1"/></symbol>
     <symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
     <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></symbol>
     <symbol id="t-epic" viewBox="0 0 16 16"><path fill="currentColor" stroke="none" d="M9.2 1.8 4 9h3.6l-1 5.2L12 7H8.3z"/></symbol>
     <symbol id="t-story" viewBox="0 0 16 16"><path fill="currentColor" stroke="none" d="M4.5 2.5h7v11L8 11.2l-3.5 2.3z"/></symbol>
     <symbol id="t-task" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m4.2 8.4 2.6 2.6 5-5.4"/></symbol>
@@ -385,6 +386,17 @@
                     </div>
                   </details>
                 </section>
+
+                <!-- Updates (v0.4): status and actions rendered by app.js; the toggle is a regular setting -->
+                <section class="settings-section" aria-labelledby="sec-upd" hidden>
+                  <p class="sr-only" id="upd-settings-live" aria-live="polite"></p><!-- first: keeps the .setting + .setting borders -->
+                  <h2 class="settings-title" id="sec-upd"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span data-i18n="settings.updates"></span></h2>
+                  <div class="setting setting-update" id="upd-settings"></div>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-autoCheckUpdates" data-i18n="settings.autoCheckUpdates"></label><p class="hint" data-i18n="settings.autoCheckUpdatesHint"></p></div>
+                    <div class="setting-control"><input type="checkbox" role="switch" class="switch" id="s-autoCheckUpdates" name="autoCheckUpdates"></div>
+                  </div>
+                </section>
               </div>
             </div>
           </div>
@@ -463,6 +475,14 @@
     <div class="modal-actions">
       <button type="button" class="btn" data-action="cancel" data-i18n="common.cancel"></button>
     </div>
+  </div>
+</dialog>
+
+<!-- Update prompt / progress / failure (v0.4). Content rendered by app.js; release notes are set as text only. -->
+<dialog class="modal modal-update" id="dlg-update" aria-labelledby="upd-title" aria-describedby="upd-sub">
+  <div class="modal-panel">
+    <div class="upd-body" id="upd-body"></div>
+    <p class="sr-only" id="upd-live" aria-live="polite"></p>
   </div>
 </dialog>
 

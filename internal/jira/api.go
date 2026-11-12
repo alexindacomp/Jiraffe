@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -135,6 +136,10 @@ type Fields struct {
 	Subtasks     []Issue       `json:"subtasks"`
 	Parent       *Issue        `json:"parent"`
 	Watches      *Watches      `json:"watches"`
+	// AggregateTimeSpent / AggregateTimeOriginalEstimate are in seconds and
+	// include the issue's sub-tasks; nil when absent or null.
+	AggregateTimeSpent            *int64 `json:"aggregatetimespent"`
+	AggregateTimeOriginalEstimate *int64 `json:"aggregatetimeoriginalestimate"`
 
 	// Custom holds the raw values of customfield_* fields (ids differ
 	// between Jira instances, see DiscoverFields).
@@ -211,6 +216,66 @@ func (f *Fields) CustomNumber(id string) *float64 {
 		return nil
 	}
 	return n
+}
+
+// CustomPoints reads a points-like custom field tolerantly: a JSON number, a
+// numeric string ("8", " 2.5 ") or an option object whose "value" is one of
+// those ({"value":"8"}, as select fields hold it). Anything else (absent,
+// null, arrays, non-numeric text, non-finite numbers) is nil.
+func (f *Fields) CustomPoints(id string) *float64 {
+	raw, ok := f.Custom[id]
+	if id == "" || !ok {
+		return nil
+	}
+	if n, ok := pointsValue(raw); ok {
+		return &n
+	}
+	var o struct {
+		Value json.RawMessage `json:"value"`
+	}
+	if t := bytes.TrimSpace(raw); len(t) > 0 && t[0] == '{' && json.Unmarshal(raw, &o) == nil && len(o.Value) > 0 {
+		if n, ok := pointsValue(o.Value); ok {
+			return &n
+		}
+	}
+	return nil
+}
+
+// pointsValue parses a JSON number or a JSON string holding a plain decimal
+// number (optional minus sign, digits, at most one dot).
+func pointsValue(raw json.RawMessage) (float64, bool) {
+	var n *float64 // null decodes without an error: it must stay nil
+	if json.Unmarshal(raw, &n) == nil {
+		if n == nil {
+			return 0, false
+		}
+		return *n, true // JSON numbers are always finite
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return 0, false
+	}
+	s = strings.TrimSpace(s)
+	digits, dots := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= '0' && c <= '9':
+			digits++
+		case c == '.':
+			dots++
+		case c == '-' && i == 0:
+		default:
+			return 0, false
+		}
+	}
+	if digits == 0 || dots > 1 || len(s) > 32 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsInf(v, 0) || math.IsNaN(v) {
+		return 0, false
+	}
+	return v, true
 }
 
 // ChangeItem is one changed field of a changelog history entry.

@@ -570,3 +570,272 @@ Cache key includes project.
 4. Epics & stories have the same project filter; selection is shared between the three views and persisted.
 5. Real-Jira facts honoured: shared boards, several boards per project, Rank ordering with fallback.
 6. `go vet`, `go test` pass; `build/jiraffe.exe` ≤ 5 MB; ru/uk/en; light/dark; no network resources.
+
+# v0.4 — HTML descriptions, dark title bar, epic dashboard, Dev/QA story points
+
+Real-Jira facts (checked on the user's Jira):
+- Descriptions and comments of many issues are **HTML** (JEditor plugin), not wiki markup: `<div class="userTemplate">`,
+  panels `<div class="jePanel_blue|jePanel_yell" style=…>` with `<div class="jePanelHeader|jePanelHeader_red">BRIEF:</div>`
+  and `<div class="jePanelContent">`, `<p dir="auto">`, `<br>`, `<b>/<i>/<code>`, `<ul>/<ol>/<li>`, `<hr>`, `&nbsp;`,
+  inline `style` everywhere (light backgrounds), `<span class="image-wrap"><img src="https://<jira>/plugins/servlet/jeditor_file_provider?…">`.
+  Other issues still use wiki markup / plain text.
+- `Dev Story Points` (`customfield_10204`) and `QA Story Points` (`customfield_10205`) are **select** fields:
+  value `{"value": "8"}` (a string). Do not confuse them with the number fields "Dev Points" / "QA Points".
+- The window colours follow the Windows app theme (`prefers-color-scheme`), but the native title bar stays light.
+
+## 1. HTML descriptions and comments (frontend; backend only for plain-text snippets)
+
+- `wiki.render(text)` (description, comment bodies) detects HTML: the text contains an element tag of the known
+  set (`p div br span b strong i em u s strike del ins code pre ul ol li a img table thead tbody tfoot tr td th
+  h1–h6 hr blockquote sub sup font`) — e.g. `/<\/?(p|div|br|…)\b[^>]*>/i`. HTML ⇒ the new safe HTML renderer;
+  otherwise the existing wiki renderer (unchanged).
+- Safe HTML renderer (still **never innerHTML of Jira content into the live document**): parse with
+  `new DOMParser().parseFromString(text, 'text/html')` (inert document: no scripts, no loads), walk the nodes and
+  build fresh elements with `createElement`/`textContent`:
+  - allowed tags rebuilt as the same tag: `p br b strong i em u s del ins sub sup code pre ul ol li table thead
+    tbody tfoot tr td th h1–h6 hr blockquote`; `strike` → `s`; `h1–h6` are demoted to the drawer's heading scale
+    (no huge headings).
+  - **no attributes are copied** (no `style`, `class`, `id`, `on*`), except: `td/th` `colspan`/`rowspan` (integers 1–50),
+    `ol` `start` (integer).
+  - `a href` → the existing wiki link button (issue key ⇒ opens the drawer, http(s) ⇒ `openUrl`); other schemes ⇒ text.
+  - `img` → a small inline button "🖼 Image" (i18n, with the alt text if any) that calls `openUrl(src)` for http(s)
+    sources (the page CSP forbids loading images; `openUrl` itself only allows the Jira origin). No `<img>` is created.
+  - JEditor panels: `div` whose class starts with `jePanel` and is not a header/content ⇒ `div.desc-panel`
+    (variant from the class: `_blue` ⇒ info, `_yell`/`_red` ⇒ warning, else neutral; colours from theme tokens,
+    readable in light and dark); `jePanelHeader*` ⇒ `div.desc-panel-head` (bold, small caps-like label);
+    `jePanelContent` ⇒ `div.desc-panel-body`. The class is only *read* for this mapping.
+  - other `div`/`span`/`font`/unknown elements ⇒ unwrapped (children kept; `div` keeps a block boundary).
+  - dropped with their content: `script style iframe frame object embed form input button select textarea svg
+    math template noscript link meta head title canvas video audio`.
+  - comments/processing instructions dropped; text nodes copied as text; runs of `&nbsp;`-only/empty paragraphs
+    collapsed (no tall blank gaps); a hard cap of 5000 output nodes (rest dropped + "…").
+  - tables scroll horizontally inside the drawer; `pre`/`code` use the existing mono style; long words wrap.
+- Notification / balloon snippets (`PlainText` in `internal/app/comments.go`): HTML-looking bodies get tags stripped
+  (block tags and `<br>` ⇒ space), entities decoded (`html.UnescapeString`), then the existing whitespace folding and
+  length cap.
+- `ui/mock.js`: at least one issue with a JEditor-style HTML description (panels, list, code, image, table, a link,
+  a `<script>` and an `onerror` attribute that must not run) and one HTML comment.
+
+## 2. Dark title bar (Windows)
+
+- New method `setWindowTheme { dark: bool, caption?: "#rrggbb" }` → `null`. Windows: on the app window
+  `DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE=20, BOOL)` (if that fails, attribute 19 for older
+  Windows 10), and when `caption` is given `DWMWA_CAPTION_COLOR=35` (COLORREF 0x00BBGGRR; Windows 11 only, errors
+  ignored). Bad params ⇒ `bad_params`. No window ⇒ no-op. Never fails the UI.
+- Before the window is shown (`openWindow`), the backend applies the dark flag from the system app theme
+  (`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme` = 0 ⇒ dark), so there is
+  no light flash; then the page refines it.
+- The page calls `setWindowTheme` at startup and on `matchMedia('(prefers-color-scheme: dark)')` change, with
+  `caption` = the computed top-bar background colour, so the title bar matches the app (both themes).
+- Non-Windows/test builds: the platform hook is a no-op; the method is covered by an App test with a fake hook.
+
+## 3. Epic dashboard (Epics & stories page, Epics mode)
+
+- `getEpics` result: every `EpicNode` gets `time: { spentSeconds, estimateSeconds, issues }`:
+  - the counted set of an epic = the epic itself + every distinct issue of its tree (the same descendants as its
+    progress: stories, their tasks/linked issues, direct tasks, sub-tasks) — each issue once per epic;
+  - `spentSeconds` = Σ `aggregatetimespent`, `estimateSeconds` = Σ `aggregatetimeoriginalestimate` (both include
+    the issue's sub-tasks, also those outside the counted set) over the counted set, **skipping every counted issue
+    whose `parent` is also in the counted set** (its time is already in the parent's aggregate); null/absent = 0;
+    `issues` = size of the counted set (as progress; skipped sub-tasks still count here);
+  - time fields are read for every counted issue: add `aggregatetimespent`, `aggregatetimeoriginalestimate`,
+    `parent` to the tree search fields; issues known only as embedded copies (links/sub-tasks lack the fields) are
+    fetched by `key in (…)` in batches of ≤100 (fields `aggregatetimespent,aggregatetimeoriginalestimate,parent`),
+    within the call's timeout and the existing caps; issues that could not be read ⇒ `EpicsResult.timePartial: true`
+    (not an error).
+  - cached with the tree (same key; `force` refreshes).
+- UI: in Epics mode, above the epic list, a collapsible **dashboard** (collapsed state remembered in uiPrefs):
+  - one card **per project** of the listed epics (a selected project ⇒ one card; "All projects" ⇒ one per project
+    present, ordered by project key), title = project key + name if known;
+  - a **donut chart** (inline SVG, no libraries) of each epic's share of the project total: slice = epic,
+    colour = the epic colour (fallback: the existing hashed palette), slices ordered by size; epics beyond the top 8
+    and slices < 2 % merged into "Other"; centre label = project total (hours) and the metric name;
+  - a legend/table next to it (stacks under it when narrow): colour dot, epic name/key, hours (`12.5 h`, i18n unit,
+    one decimal), share %, issue count; zero-time epics listed last, muted, without a slice;
+  - metric toggle **Logged / Estimate** (`spentSeconds` / `estimateSeconds`), default Logged, remembered in uiPrefs;
+  - hover/focus on a slice or legend row highlights both and shows a tooltip (name, hours, %); click ⇒ opens the
+    epic in the drawer; keyboard reachable via the legend rows; the SVG has `role="img"` + an `aria-label` summary;
+  - follows "Show done" and the project filter (same data as the list); `timePartial` ⇒ a small note
+    "Some issues could not be read; totals may be incomplete"; project total 0 ⇒ "No logged time (estimate) in
+    these epics" instead of the chart;
+  - Stories mode: no dashboard.
+- `ui/mock.js`: epics with logged and estimated time in two projects, one epic with no time, more than 8 epics in one
+  project (to show "Other").
+
+## 4. Dev / QA story points in issue details
+
+- Field discovery: `Dev Story Points` / `QA Story Points` by field name or clause name (case-insensitive, trimmed),
+  any schema type. Values: number, numeric string, or option object `{ "value": "8" }` ⇒ number; anything else ⇒ absent.
+- `IssueDetail` gets `devStoryPoints?: number`, `qaStoryPoints?: number` (read only in `getIssue`).
+- Drawer, estimates block: "Story points", "Dev story points", "QA story points" shown together (each only when
+  present). i18n ru/uk/en. Mock: issues with both, one, none.
+
+## Contract additions (v0.4)
+
+Types:
+```
+EpicTime    { spentSeconds: number, estimateSeconds: number, issues: number }   // integers; aggregate time incl. sub-tasks, each issue once; 0 when nothing logged/estimated
+EpicNode    + { time: EpicTime }                    // always present
+EpicsResult + { timePartial: bool }                 // always present (false unless some counted issue could not be read)
+IssueDetail + { devStoryPoints?: number, qaStoryPoints?: number }               // omitted when the field is missing or not numeric
+```
+Methods:
+| method | params | result |
+|---|---|---|
+| `setWindowTheme` | `{ dark: bool, caption?: "#rrggbb" }` — `dark` required; `caption` hex, either case; `null` = absent | `null`; `bad_params` otherwise. Works without a Jira configuration. `caption` absent ⇒ the caption colour is reset to the system default |
+
+## 5. Automatic updates (from GitHub releases)
+
+Source of truth: the GitHub releases of `alexindacomp/Jiraffe` (public). CI publishes every release with
+`jiraffe.exe`, `jiraffe.exe.sha256` and `jiraffe.exe.sig` (`<64 hex>  jiraffe.exe`); the workflow is updated accordingly.
+
+**Release signature (ed25519)** — the sha256 file only protects against corruption; authenticity comes from a signature:
+- CI (release job only, environment `release` that only `v*` tags may use; secret `RELEASE_SIGNING_KEY` = base64 of the 32-byte ed25519 seed) runs
+  `go run ./tools/sign -version X.Y.Z -file dist/jiraffe.exe > dist/jiraffe.exe.sig` and publishes
+  `jiraffe.exe.sig` as a third asset. The tool reads the key from env `RELEASE_SIGNING_KEY`, never from a file
+  in the repo, and prints one line: base64 of the 64-byte signature.
+- Signed message (exact bytes): `"jiraffe-release-v1\n" + version + "\n" + lowercase hex SHA-256 of the exe + "\n"`
+  (binds the version, so an old signed exe can't be served under a newer tag).
+- The app embeds the public key `H/tsEqhxPOKjmI14VJl9r7sUOG3mWQXHsQKY/Xp0ZEk=` (base64, 32 bytes) in
+  `internal/update`, and verification requires: the `.sig` asset present (≤ 1 KB), a valid signature over the message
+  built from the release version and the hash computed from the **downloaded bytes**, plus the existing
+  size/sha256/MZ checks. A `.sig` that cannot be used (HTTP error status, over 1 KB, malformed) or does not verify ⇒
+  `updateFailed { code: "bad_signature" }`, nothing installed; a transport failure while fetching it is `network`
+  (retryable).
+  A release without `.sig` is not offered as an update.
+- Private key backup: `~/.config/jiraffe/release-signing.key` on the maintainer's WSL (0600), never committed.
+- Key rotation (if the private key ever leaks or is replaced): publish a bridge release signed with the old key whose
+  `internal/update` accepts both the old and the new public key, then release with the new key only and drop the old
+  key one release later. Keep an offline copy of the seed.
+
+**Check**
+- At startup (30 s after start, so it never slows the launch; also when the app has been running > 24 h, once a day)
+  and on demand from Settings: `GET https://api.github.com/repos/alexindacomp/Jiraffe/releases/latest`
+  (`Accept: application/vnd.github+json`, `User-Agent: Jiraffe/<version>`), timeout 20 s.
+- **Network isolation**: updater requests use a separate transport **without** the Jira token or any Jira
+  header; they may follow redirects only to `https://` hosts `api.github.com`, `github.com`,
+  `objects.githubusercontent.com`, `release-assets.githubusercontent.com` (max 5 hops). The Jira transport keeps
+  its no-redirect rule. Certificate checks are never disabled; the system proxy is used.
+- Newer = the tag `vX.Y.Z` is semver-greater than `app.Version`. Builds with version `dev` or `0.0.0` never offer
+  updates. Drafts/prereleases are ignored (the `latest` endpoint already does that). The release must have all three assets
+  (`jiraffe.exe`, `jiraffe.exe.sha256`, `jiraffe.exe.sig`; see "Contract additions (v0.4 updates)").
+- Failures are logged and shown only in Settings ("Could not check: …"); no balloons for failed background checks.
+
+**Prompt**
+- Settings `autoCheckUpdates` (default `true`). State keeps `skippedVersion`.
+- A newer version that is not `skippedVersion` ⇒ event `updateAvailable { version, notes, publishedAt, size }`:
+  - window open ⇒ an in-app dialog "Jiraffe X.Y.Z is available" with the release notes (plain text, scrollable,
+    rendered safely), buttons **Update now** (primary) and **Later**;
+  - window closed (e.g. autostart minimized) ⇒ one tray balloon "Update X.Y.Z available — click to install";
+    clicking it opens the window with the dialog.
+  - **Later** ⇒ `skippedVersion = X.Y.Z`: no more prompts for that version; a newer one prompts again.
+- Settings, new **Updates** section: current version, latest known version + date, "Check for updates" button,
+  "Update to X.Y.Z" button when newer (works also for the skipped version), toggle "Check for updates at startup",
+  last check time/result, link "What's new" (opens the release page via the shell, allowed for this exact URL only).
+
+**Install (within the session, then automatic restart)**
+- Method `installUpdate { version }` → starts the job; progress via events
+  `updateProgress { phase: "download"|"verify"|"install"|"restart", received?, total? }`, failure via
+  `updateFailed { code, message }` (localized). Only one job at a time; `version` must equal the latest checked one.
+- Download the asset to `%LOCALAPPDATA%\Jiraffe\update\jiraffe-X.Y.Z.exe.part` (streamed, size limit 20 MB,
+  timeout 5 min, cancellable on app exit), then verify: size equals the API asset size, SHA-256 equals the
+  `.sha256` asset, the file starts with `MZ`, the `.sig` signature is valid. Any mismatch ⇒ delete, `updateFailed`.
+- Swap: rename the running exe `jiraffe.exe` → `jiraffe.exe.old` (allowed for a running image), move the new file to
+  the original path; on any failure roll back (rename `.old` back) and report (a failed rollback is reported as
+  `install_failed` naming where the previous exe is). The swap is never cut short by quitting. No write access to the exe folder
+  ⇒ `updateFailed { code: "no_write_access" }` with a hint to download manually (button opens the release page).
+- Restart: start the new exe with `--updated-from <oldVersion> --wait-pid <pid>` (plus `--minimized` if the window
+  is closed), then the current process exits cleanly (tray icon removed, state saved, scheduler stopped). The new
+  process waits up to 15 s for the old PID to exit before taking the single-instance mutex; if the PID is still
+  alive (or cannot be waited for) it logs that and the single-instance mutex decides (never two instances; a
+  reused PID never blocks the start).
+- The new instance deletes stale `update\*` files and `jiraffe.exe.new` at start, and `jiraffe.exe.old*` only after it
+  has run for 10 minutes (retry later if locked),
+  shows a balloon/toast "Updated to X.Y.Z", and clears `skippedVersion`. Autostart keeps working (same path).
+- If the new exe fails to start (CreateProcess error) ⇒ roll back the swap, keep running, report.
+- Worklog safety: an update never starts while a worklog run is in progress (it waits for it to finish).
+
+**Mock / tests**
+- `ui/mock.js`: flags to simulate "update available", download progress, failure, and no-update.
+- Go tests (pure logic behind interfaces): semver compare (incl. `dev`), release JSON parsing and asset selection,
+  redirect allow-list, sha256 file parsing, verification (size/hash/MZ), swap + rollback on a temp dir,
+  skippedVersion rules, prompt/event logic with a fake clock and fake HTTP.
+
+## Contract additions (v0.4 updates)
+
+Settings: `+ autoCheckUpdates: bool` (default `true`; a non-boolean ⇒ `bad_params`, like the other booleans).
+
+Types:
+```
+UpdateRelease  { version: "X.Y.Z", notes: string (plain text, CRLF→LF, ≤ 20000 chars), publishedAt: string (RFC 3339 from GitHub, may be ""),
+                 size: number (bytes of jiraffe.exe), url: string (release page https://github.com/alexindacomp/Jiraffe/releases/tag/vX.Y.Z) }
+UpdateStatus   {
+  currentVersion: string,           // app version ("dev" for development builds)
+  supported: bool,                  // false: development build (dev / 0.0.0) or no updater (then hide/disable the Updates actions)
+  latest?: UpdateRelease,           // latest release seen by the last successful check (persisted; kept when a later check fails)
+  available: bool,                  // supported && latest is newer than currentVersion ("Update to X.Y.Z" button; also when skipped)
+  prompt: bool,                     // available && latest.version != skippedVersion ⇒ show the dialog (on load and on updateAvailable)
+  skippedVersion?: string,          // set by skipUpdate ("Later")
+  lastCheck?: { at: string (RFC 3339), ok: bool, error?: string (localized, only when !ok) },
+  installing: bool,                 // an install job runs (stays true while the app restarts)
+  justUpdated?: { from: string, to: string }   // this session started right after an update
+}
+UpdateProgress { phase: "download"|"verify"|"install"|"restart", received?: number, total?: number }   // received/total only for "download"
+UpdateFailed   { code: string, message: string (localized) }
+```
+`UpdateFailed.code` (and the stored check error): `network` (incl. the updater's own 20 s / 5 min timeouts),
+`http_status`, `bad_redirect`, `too_large`, `bad_release`, `bad_checksum`, `size_mismatch`, `hash_mismatch`, `not_exe`,
+`bad_signature` (the `.sig` download returns an HTTP error status, is over 1 KB or malformed, or the signature is not valid
+for this exe and version; a transport failure while fetching it is `network`, retryable; a release that does not list
+`jiraffe.exe.sig` at all is not offered — `bad_release`),
+`release_changed` (`installUpdate` re-reads the latest release; another version was published since the check),
+`no_write_access` (show "Download manually" → `openUrl(latest.url)`), `install_failed`, `start_failed`, `file_error`,
+`cancelled` (the app is quitting; a finished swap is rolled back, no restart). For every code the running version is unchanged.
+
+Release requirements (else the release is not offered: `bad_release` on check): tag `vX.Y.Z` (canonical), not draft/prerelease,
+assets exactly `https://github.com/alexindacomp/Jiraffe/releases/download/vX.Y.Z/<name>` for `jiraffe.exe` (1 B…20 MB),
+`jiraffe.exe.sha256` (≤ 4 KB) and `jiraffe.exe.sig` (≤ 1 KB). Redirects: the API request stays on `api.github.com`;
+asset requests start at that download URL and may then only go to `objects.githubusercontent.com` /
+`release-assets.githubusercontent.com` (max 5). A release stored in state.json is re-validated before it is shown and only
+selects the version: `installUpdate` always installs the freshly read latest release.
+
+Install details: the download is copied to `jiraffe.exe.new` while hashing the written bytes (must equal the verified hash) and
+hashed again right before it is renamed into place. Residual risk: a process of the same user with write access to the exe folder
+could replace `jiraffe.exe.new` in the microseconds between that last hash and the rename — such a process could replace
+`jiraffe.exe` itself anyway. Renames are retried (≈ 1.4 s backoff) before `install_failed`. A stale `jiraffe.exe.old` is removed,
+or moved aside to `jiraffe.exe.old.<n>` when locked. The new version keeps `jiraffe.exe.old` (manual rollback) and deletes
+`jiraffe.exe.old*` only after running 10 minutes; stale downloads/`jiraffe.exe.new` are deleted at start (never while an
+install runs). `--updated-from` is used only if it is a version; `--wait-pid` values ≤ 0 or absurd are ignored, and if waiting is
+impossible the single-instance check decides.
+
+Methods:
+| method | params | result |
+|---|---|---|
+| `getUpdateStatus` | – | `UpdateStatus` (no network) |
+| `checkForUpdates` | – | `UpdateStatus` after a check; a failed check is **not** an error (see `lastCheck.error`). Error `update_unsupported` when `!supported` |
+| `installUpdate` | `{ version: "X.Y.Z" }` (a leading `v` is accepted) | `null` once the job started; then `updateProgress`… (the job first re-reads the latest release: `release_changed` if it is no longer `version`) and either the app restarts or `updateFailed`. Errors: `bad_params` (no/invalid version), `update_unsupported`, `update_stale` (not the `latest.version` of the last check, or not newer), `update_busy` (a job runs) |
+| `skipUpdate` | `{ version: "X.Y.Z" }` | `UpdateStatus` (`skippedVersion` set); `bad_params` for an invalid version |
+| `openUrl` | `{ url }` | additionally allows exactly `https://github.com/alexindacomp/Jiraffe/releases/tag/vX.Y.Z` (canonical version) and `https://github.com/alexindacomp/Jiraffe/releases/latest` — nothing else outside Jira |
+
+Events:
+| event | payload | when |
+|---|---|---|
+| `updateAvailable` | `UpdateRelease` | a check (automatic or manual) found a newer version that is not `skippedVersion`. Window closed ⇒ additionally one tray balloon per version and session (not while notifications are paused); clicking it opens the window, whose `getUpdateStatus().prompt` is then `true` |
+| `updateProgress` | `UpdateProgress` | during `installUpdate`: `download` (from `received: 0`, at most ~100 events), `verify`, `install` (waits for a running worklog), `restart` |
+| `updateFailed` | `UpdateFailed` | the install job failed (the job is already over when the event arrives: `installUpdate` may be called again at once) |
+| `updated` | `{ from, to }` | at startup after an update (usually before the page listens: use `UpdateStatus.justUpdated`); also a tray balloon "Updated to X.Y.Z" |
+
+Startup: the first automatic check runs 30 s after start, then at most once per 24 h of uptime (checked every 15 min),
+only while `autoCheckUpdates` is on. While the new version is being started, worklog runs are refused
+(`worklogRun` ⇒ `conflict`, "Jiraffe is restarting to finish an update"; scheduled runs are left to the new version).
+
+## Acceptance criteria v0.4
+
+1. A JEditor HTML description renders as formatted text (panels, paragraphs, lists, bold/code, tables, links) in
+   both themes; no raw tags; no Jira HTML attribute/script reaches the live DOM; wiki-markup descriptions unchanged.
+2. The window title bar is dark when the app is dark (and light when light), switching live with the Windows theme.
+3. Epics page shows per-project donut charts of epic shares of logged time (toggle: estimate) with legend, %, hours.
+4. Issue details show Dev and QA story points.
+5. At startup a newer GitHub release is detected; the user can update now (download, verify, swap, automatic
+   restart into the new version) or postpone (Later ⇒ not asked again for that version; update from Settings).
+6. `go vet`, `go test` pass (incl. GOOS=windows vet); `build/jiraffe.exe` ≤ 5 MB; ru/uk/en; light/dark; no network resources in the page.

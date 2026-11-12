@@ -207,7 +207,9 @@
 
     ep: { mode: 'epics', includeDone: false, mine: false,
           cache: new Map(), cacheGen: 0, data: null, loading: false, error: null, seq: 0, reqKey: null, stale: false,
-          expanded: new Set(), overrides: new Map(), opening: null, focusNode: null },
+          expanded: new Set(), overrides: new Map(), opening: null, focusNode: null,
+          // Epic dashboard (SPEC v0.4 §3): el/sig = the built element, reused across tree re-renders.
+          dash: { collapsed: false, metric: 'spent', otherOpen: new Set(), el: null, sig: '', data: null, shownMetric: null, wasCollapsed: false } },
 
     pj: { list: null, loading: false, error: null, seq: 0, busy: new Set(), bulk: false, restoreFocus: null },
 
@@ -216,6 +218,10 @@
           history: null, historyLoading: false, historyError: null },
 
     notif: { list: null, loading: false, error: null, markingAll: false },
+
+    // Updates (SPEC v0.4 §5): status = UpdateStatus; dlg = { mode: prompt|progress|failed, release, progress, error }
+    // job: an install is known to run (started here, or `installing` at startup); progress events without it are ignored
+    upd: { status: null, checking: false, dlg: null, toasted: false, job: false },
 
     form: null,              // settings form working copy for list editors
     formLoading: false,
@@ -239,6 +245,8 @@
     S.ep.mine = prefs.get('epics.mine', false) === true;
     const exp = prefs.get('epics.expanded', []);
     S.ep.expanded = new Set((Array.isArray(exp) ? exp : []).map(String));
+    S.ep.dash.collapsed = prefs.get('epics.dash.collapsed', false) === true;
+    S.ep.dash.metric = prefs.get('epics.dash.metric', 'spent') === 'estimate' ? 'estimate' : 'spent';
   }
 
   /* ================================================================
@@ -272,7 +280,12 @@
       if (restore && document.contains(restore) && typeof restore.focus === 'function') restore.focus({ preventScroll: true });
     },
     top() { return this.stack[this.stack.length - 1] || null; },
-    closeTop() { const top = this.top(); if (top) this.close(top.el); },
+    /** Esc / scrim. A layer with opts.onDismiss decides itself (e.g. the update dialog: "Later", or nothing while installing). */
+    closeTop(source) {
+      const top = this.top();
+      if (!top) return;
+      if (top.opts.onDismiss) top.opts.onDismiss(source || 'esc'); else this.close(top.el);
+    },
   };
 
   function confirmDialog({ title, body, okLabel }) {
@@ -773,10 +786,11 @@
     };
   }
 
-  function spBadge(points) {
+  /** name: the field the points belong to (default "Story points"), e.g. "Dev story points" (DR-3). */
+  function spBadge(points, name) {
     if (points == null || points === '') return '';
     const n = Number.isFinite(Number(points)) ? fmtNum(points) : String(points); // sums are floats: 0.1 + 0.2 → "0.3"
-    const label = t('issue.storyPointsValue', { n });
+    const label = name ? `${name}: ${n}` : t('issue.storyPointsValue', { n });
     return html`<span class="sp-badge" title="${label}"><span aria-hidden="true">${n}</span><span class="sr-only">${label}</span></span>`;
   }
 
@@ -1926,14 +1940,19 @@
       const bar = inner.lastIndexOf('|');
       const label = (bar >= 0 ? inner.slice(0, bar) : inner).trim();
       const target = (bar >= 0 ? inner.slice(bar + 1) : inner).trim();
+      const b = linkButton(target, label);
+      parent.append(b || document.createTextNode(raw));
+    }
+    /** Link button: issue key ⇒ opens the drawer, http(s) ⇒ openUrl; anything else ⇒ null (caller shows text). */
+    function linkButton(target, label) {
       let b = null;
       if (ISSUE_KEY.test(target)) { b = mk('button', 'wiki-link'); b.dataset.openKey = target; }
       else if (HTTP_URL.test(target)) { b = mk('button', 'wiki-link'); b.dataset.url = target; }
-      if (!b) { parent.append(document.createTextNode(raw)); return; }
+      if (!b) return null;
       b.type = 'button';
       b.title = target;
       b.textContent = label || target;
-      parent.append(b);
+      return b;
     }
     function inline(parent, s) {
       let last = 0;
@@ -2041,7 +2060,168 @@
       }
       return root;
     }
-    return { render };
+
+    /* ---- HTML bodies (JEditor plugin; SPEC v0.4 §1) ----
+       Parsed into an inert DOMParser document (no scripts run, nothing loads) and rebuilt node by node with
+       createElement / text nodes. Only the tag name is kept; no attribute is copied except td/th colspan/rowspan
+       and ol start. The JEditor panel classes are only read to pick a .desc-panel variant. */
+    const HTML_TAG = /<\/?(?:p|div|br|span|b|strong|i|em|u|s|strike|del|ins|code|pre|ul|ol|li|a|img|table|thead|tbody|tfoot|tr|td|th|h[1-6]|hr|blockquote|sub|sup|font)\b[^>]*>/i;
+    // Wiki code samples may legitimately contain HTML: they must not switch the whole body to the HTML renderer.
+    const WIKI_LITERAL = /\{(code|noformat)(?::[^}\n]*)?\}[\s\S]*?\{\1\}|\{\{[^\n]*?\}\}/g;
+    const isHtml = (s) => HTML_TAG.test(String(s).replace(WIKI_LITERAL, ''));
+    const KEEP = new Set(['p', 'br', 'b', 'strong', 'i', 'em', 'u', 's', 'del', 'ins', 'sub', 'sup', 'code', 'pre', 'ul', 'ol', 'li',
+      'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'hr', 'blockquote']);
+    const DROP = new Set(['script', 'style', 'iframe', 'frame', 'frameset', 'object', 'embed', 'form', 'input', 'button', 'select',
+      'textarea', 'svg', 'math', 'template', 'noscript', 'link', 'meta', 'head', 'title', 'canvas', 'video', 'audio',
+      'colgroup', 'col', 'caption', 'option', 'datalist', 'base', 'param', 'source', 'track', 'picture', 'map', 'area']);
+    // Table structure: elements allowed directly inside each part (whitespace text and other elements are dropped there).
+    const TABLE_KIDS = { table: ['thead', 'tbody', 'tfoot', 'tr'], thead: ['tr'], tbody: ['tr'], tfoot: ['tr'], tr: ['td', 'th'] };
+    const MAX_NODES = 5000;
+    const MAX_DEPTH = 64;
+    const INT_ATTR = /^\s*\d{1,6}\s*$/;
+    const blank = (el) => !el.querySelector('img, .desc-img, hr, table, li, pre') && !/[^\s\u00a0\u200b]/.test(el.textContent);
+
+    function panelVariant(cls) {
+      if (/_blue\b/i.test(cls)) return 'info';
+      if (/_(yell|red)\w*\b/i.test(cls)) return 'warning';
+      return 'neutral';
+    }
+    function imageButton(src, alt) {
+      const label = alt ? t('drawer.imageAlt', { alt }) : t('drawer.image');
+      const http = HTTP_URL.test(src);
+      const b = mk(http ? 'button' : 'span', 'desc-img');
+      if (http) { b.type = 'button'; b.dataset.url = src; b.title = src; }
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('class', 'icon icon-sm');
+      svg.setAttribute('aria-hidden', 'true');
+      const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+      use.setAttribute('href', '#i-image');
+      svg.append(use);
+      const span = mk('span');
+      span.textContent = label;
+      b.append(svg, span);
+      return b;
+    }
+
+    const XHTML = 'http://www.w3.org/1999/xhtml';
+    /** Visible text of a parsed subtree: skips dropped elements (script, style, …) and SVG / MathML (CR-2). */
+    function plainText(node) {
+      let out = '';
+      for (let n = node.firstChild; n; n = n.nextSibling) {
+        if (n.nodeType === Node.TEXT_NODE) out += n.data;
+        else if (n.nodeType === Node.ELEMENT_NODE && n.namespaceURI === XHTML && !DROP.has(n.localName)) out += plainText(n);
+      }
+      return out;
+    }
+
+    function renderHtml(src) {
+      const root = mk('div', 'wiki wiki-html');
+      const doc = new DOMParser().parseFromString(String(src), 'text/html');
+      let count = 0;
+      let full = false;
+      const room = () => { if (count >= MAX_NODES) full = true; return !full; };
+      const add = (parent, node) => { count++; parent.append(node); return node; };
+
+      /** Copies the children of `from` into `to` (an element we created). */
+      function kids(from, to, depth, inPre) {
+        for (let n = from.firstChild; n && room(); n = n.nextSibling) walk(n, to, depth, inPre);
+      }
+      function walk(n, out, depth, inPre) {
+        const structure = TABLE_KIDS[out.tagName.toLowerCase()];
+        if (n.nodeType === Node.TEXT_NODE) {
+          if (structure && !/\S/.test(n.data)) return; // whitespace between table rows / cells
+          add(out, document.createTextNode(n.data));
+          return;
+        }
+        if (n.nodeType !== Node.ELEMENT_NODE) return; // comments, processing instructions, CDATA
+        const tag = n.localName;
+        if (DROP.has(tag) || n.namespaceURI !== XHTML) return;
+        if (structure && !structure.includes(tag)) {
+          // A stray element inside the table structure: keep the rows / cells under it, drop the rest.
+          if (!KEEP.has(tag) && depth < MAX_DEPTH) kids(n, out, depth + 1, inPre);
+          return;
+        }
+        if (depth >= MAX_DEPTH) { add(out, document.createTextNode(plainText(n))); return; } // pathological nesting
+        if (tag === 'br') { add(out, mk('br')); return; }
+        if (tag === 'hr') { add(out, mk('hr')); return; }
+        if (tag === 'img') { add(out, imageButton(String(n.getAttribute('src') || '').trim(), String(n.getAttribute('alt') || '').trim().slice(0, 80))); return; }
+        if (tag === 'a') {
+          const href = String(n.getAttribute('href') || '').trim();
+          const label = plainText(n).replace(/\s+/g, ' ').trim();
+          const b = href && (label || !n.querySelector('img')) ? linkButton(href, label) : null;
+          if (b) { add(out, b); return; }
+          kids(n, out, depth + 1, inPre); // other schemes, anchors, linked images: the content only
+          return;
+        }
+        if (/^h[1-6]$/.test(tag)) {
+          // Demoted to the drawer scale: h1 → 16 px, h2 → 14 px bold, h3–h6 → 13 px (same classes as wiki h2.–h4.).
+          const level = Number(tag[1]);
+          const h = add(out, mk('h' + Math.min(6, level + 2), 'wiki-h wiki-h' + Math.min(4, level + 1)));
+          kids(n, h, depth + 1, inPre);
+          return;
+        }
+        if (tag === 'div') {
+          const cls = String(n.getAttribute('class') || '');
+          let el;
+          if (/(^|\s)jePanelHeader/.test(cls)) {
+            el = mk('div', 'desc-panel-head');
+            if (/(^|\s)jePanelHeader_red\b/.test(cls)) el.dataset.tone = 'danger';
+          }
+          else if (/(^|\s)jePanelContent/.test(cls)) el = mk('div', 'desc-panel-body');
+          else if (/(^|\s)jePanel/.test(cls)) { el = mk('div', 'desc-panel'); el.dataset.variant = panelVariant(cls); }
+          else el = mk('div'); // unwrapped: no attributes, only the block boundary is kept
+          add(out, el);
+          kids(n, el, depth + 1, inPre);
+          if (blank(el)) { el.remove(); count--; } // empty wrappers and "&nbsp;" blocks
+          return;
+        }
+        if (!KEEP.has(tag) && tag !== 'strike') { kids(n, out, depth + 1, inPre); return; } // span, font, unknown: unwrapped
+        const el = mk(tag === 'strike' ? 's' : tag);
+        if (tag === 'ul' || tag === 'ol') el.className = 'wiki-list';
+        else if (tag === 'pre') el.className = 'wiki-pre';
+        else if (tag === 'code' && !inPre) el.className = 'wiki-mono';
+        else if (tag === 'blockquote') el.className = 'wiki-quote';
+        if (tag === 'ol' && INT_ATTR.test(n.getAttribute('start') || '')) el.setAttribute('start', String(Number(n.getAttribute('start'))));
+        if (tag === 'td' || tag === 'th') {
+          ['colspan', 'rowspan'].forEach((a) => {
+            const v = n.getAttribute(a);
+            if (v != null && INT_ATTR.test(v) && Number(v) >= 1 && Number(v) <= 50) el.setAttribute(a, String(Number(v)));
+          });
+        }
+        if (tag === 'table') {
+          const wrap = add(out, mk('div', 'desc-table-wrap')); // made focusable by syncTableScroll() when it scrolls
+          add(wrap, el);
+        } else add(out, el);
+        kids(n, el, depth + 1, inPre || tag === 'pre');
+        // JEditor separates blocks with "&nbsp;" paragraphs: drop empty ones (spacing comes from CSS).
+        if (tag === 'p' && blank(el)) { el.remove(); count--; }
+      }
+
+      kids(doc.body, root, 0, false);
+      // Collapse <br> runs (max two in a row) and trim <br> at the edges of every block (no tall blank gaps).
+      // "Edge" is judged at the nearest block (CR-1): <b>line<br></b>next keeps its break.
+      const BLOCK = /^(DIV|P|UL|OL|LI|TD|TH|TABLE|PRE|BLOCKQUOTE|HR|H\d)$/;
+      const sib = (node, dir) => { let x = node[dir]; while (x && x.nodeType === Node.TEXT_NODE && !/[^\s\u00a0]/.test(x.data)) x = x[dir]; return x; };
+      /** The nearest non-blank node in `dir` within the same block, climbing out of inline parents; null at a block edge. */
+      const near = (node, dir) => {
+        for (let x = node; x && x !== root; x = x.parentNode) {
+          const y = sib(x, dir);
+          if (y) return y;
+          if (x.parentNode === root || BLOCK.test(x.parentNode.nodeName)) return null;
+        }
+        return null;
+      };
+      root.querySelectorAll('br').forEach((br) => {
+        const prev = near(br, 'previousSibling');
+        const next = near(br, 'nextSibling');
+        const before = prev && prev.nodeName === 'BR' ? sib(prev, 'previousSibling') : null;
+        if (!prev || !next || BLOCK.test(prev.nodeName) || BLOCK.test(next.nodeName) || (before && before.nodeName === 'BR')) br.remove();
+      });
+      if (full) { const more = mk('p', 'desc-more'); more.textContent = '…'; root.append(more); }
+      return root;
+    }
+
+    return { render: (src) => (isHtml(src || '') ? renderHtml(src) : render(src)), isHtml };
   })();
 
   /* ================================================================
@@ -2069,7 +2249,8 @@
     return out;
   }
 
-  function openIssue(key, seed, { push = false } = {}) {
+  /** returnFocus: optional () => Element to focus when the drawer closes (default: the issue's row in the view). */
+  function openIssue(key, seed, { push = false, returnFocus = null } = {}) {
     if (!key) return;
     menu.close(false);
     const d = S.drawer;
@@ -2086,7 +2267,7 @@
     layers.open($('#drawer'), {
       focus: '#drawer-title',
       onClose: () => { S.drawer = null; detailCache.clear(); menu.close(false); },
-      restoreFocus: () => $(`#${activeSectionId()} [data-focus-key="${CSS.escape(key)}"]`),
+      restoreFocus: () => (returnFocus && returnFocus()) || $(`#${activeSectionId()} [data-focus-key="${CSS.escape(key)}"]`),
     });
     loadDetail();
   }
@@ -2148,7 +2329,9 @@
     const num = (v) => (v == null || v === '' ? null : Number(v));
     const orig = num(tt.originalSeconds); const rem = num(tt.remainingSeconds); const spent = num(tt.spentSeconds);
     const sp = det.storyPoints != null ? det.storyPoints : det.issue.storyPoints;
-    if (orig == null && rem == null && spent == null && sp == null) return '';
+    const points = [['drawer.storyPoints', sp], ['drawer.devStoryPoints', det.devStoryPoints], ['drawer.qaStoryPoints', det.qaStoryPoints]]
+      .filter(([, v]) => v != null && v !== '' && Number.isFinite(Number(v)));
+    if (orig == null && rem == null && spent == null && !points.length) return '';
     const max = Math.max(orig || 0, (spent || 0) + (rem || 0), 1);
     const row = (cls, label, sec, str) => (sec == null && !str ? '' : html`<div class="est-row ${cls}">
       <span class="est-label">${label}</span>
@@ -2159,7 +2342,7 @@
         ${row('est-orig', t('drawer.estOriginal'), orig, tt.original)}
         ${row('est-spent', t('drawer.estSpent'), spent, tt.spent)}
         ${row('est-rem', t('drawer.estRemaining'), rem, tt.remaining)}
-        ${sp != null ? html`<div class="est-row est-sp"><span class="est-label">${t('drawer.storyPoints')}</span><span class="est-sp-val">${spBadge(sp)}</span></div>` : ''}
+        ${points.map(([key, v]) => html`<div class="est-row est-sp"><span class="est-label">${t(key)}</span><span class="est-sp-val">${spBadge(Number(v), t(key))}</span></div>`)}
       </div></section>`;
   }
 
@@ -2247,6 +2430,22 @@
     $$('[data-wiki^="c"]', el).forEach((slot) => {
       const c = det.comments[Number(slot.dataset.wiki.slice(1))];
       slot.replaceWith(wiki.render(c ? c.body : ''));
+    });
+    syncTableScroll(el);
+  }
+
+  /** DR-4: a description table is a focusable, labelled region only while it scrolls horizontally. */
+  function syncTableScroll(root) {
+    $$('.desc-table-wrap', root).forEach((w) => {
+      if (w.scrollWidth > w.clientWidth + 1) {
+        w.tabIndex = 0;
+        w.setAttribute('role', 'region');
+        w.setAttribute('aria-label', t('drawer.table'));
+      } else {
+        w.removeAttribute('tabindex');
+        w.removeAttribute('role');
+        w.removeAttribute('aria-label');
+      }
     });
   }
 
@@ -2406,7 +2605,7 @@
       const res = await api(mode === 'stories' ? 'getStories' : 'getEpics', params);
       const data = mode === 'stories'
         ? { key, mode, stories: (res && res.stories) || [], fetchedAt: res && res.fetchedAt, truncated: !!(res && res.truncated) }
-        : { key, mode, epics: (res && res.epics) || [], orphanStories: (res && res.orphanStories) || [], fetchedAt: res && res.fetchedAt, truncated: !!(res && res.truncated) };
+        : { key, mode, epics: (res && res.epics) || [], orphanStories: (res && res.orphanStories) || [], fetchedAt: res && res.fetchedAt, truncated: !!(res && res.truncated), timePartial: !!(res && res.timePartial) };
       if (gen === S.ep.cacheGen) S.ep.cache.set(key, data);
       if (seq !== S.ep.seq) return;
       S.ep.data = data;
@@ -2500,6 +2699,286 @@
     return html`<div class="tree-skeleton" role="status" aria-label="${t('common.loading')}">${[70, 55, 80, 62, 48, 74].map((w) => html`<div class="sk-row"><span class="skeleton sk-dot"></span><span class="skeleton sk-line" style="width:${w}%"></span><span class="skeleton sk-bar"></span></div>`)}</div>`;
   }
 
+  /* ================================================================
+   * EPIC DASHBOARD (SPEC v0.4 §3): per project, a donut of each epic's share of the logged time
+   * (or the estimate) with a legend. Same data as the tree (Show done, Only mine, project filter;
+   * not the search). Built once per data + options and reused across tree re-renders, so hover and
+   * focus survive expanding tree rows.
+   * ================================================================ */
+  const DASH_SLICES = 8;          // epics with their own slice; the rest go to "Other"
+  const DASH_MIN_SHARE = 0.02;    // so do slices under 2 %
+  const DONUT = { c: 60, r: 43 }; // viewBox 0 0 120 120; ring width is .epd-slice stroke-width
+  const nfCache = new Map();
+  function nf(opts) {
+    const k = i18n.locale + JSON.stringify(opts);
+    if (!nfCache.has(k)) nfCache.set(k, new Intl.NumberFormat(i18n.locale, opts));
+    return nfCache.get(k);
+  }
+  const fmtHours = (sec) => t('epics.dash.hours', { n: nf({ minimumFractionDigits: 1, maximumFractionDigits: 1 }).format((Number(sec) || 0) / 3600) });
+  /** pct: whole percent when already rounded (top-level rows), else rounded here; non-zero below 1 % ⇒ "<1 %". */
+  function fmtShare(part, total, pct) {
+    const f = nf({ style: 'percent', maximumFractionDigits: 0 });
+    const p = pct != null ? pct : Math.round(total > 0 ? (part / total) * 100 : 0);
+    return part > 0 && p < 1 ? '<' + f.format(0.01) : f.format(p / 100);
+  }
+  /** CR-3: whole percents that add up to exactly 100 (largest remainder). */
+  function roundShares(values, total) {
+    if (!(total > 0)) return values.map(() => 0);
+    const raw = values.map((v) => (v / total) * 100);
+    const out = raw.map(Math.floor);
+    let left = 100 - out.reduce((a, v) => a + v, 0);
+    raw.map((v, i) => [v - out[i], i]).sort((a, b) => b[0] - a[0]).forEach(([, i]) => { if (left > 0) { out[i]++; left--; } });
+    return out;
+  }
+  const dashMetricName = (m) => t(m === 'estimate' ? 'epics.dash.estimate' : 'epics.dash.logged');
+
+  /** Cards by project key: top slices, "Other" (beyond the top 8 or < 2 %) and zero-time epics. */
+  function dashModel(data, metric) {
+    const field = metric === 'estimate' ? 'estimateSeconds' : 'spentSeconds';
+    const groups = new Map();
+    (data.epics || []).forEach((n) => {
+      const e = n && n.epic;
+      if (!e || !e.key) return;
+      const tm = n.time || {};
+      const pk = projectOf(e);
+      if (!groups.has(pk)) groups.set(pk, []);
+      groups.get(pk).push({ key: e.key, name: e.name || e.summary || e.key, tone: epicTone(e.color, e.key),
+        sec: Math.max(0, Number(tm[field]) || 0), issues: Math.max(0, Number(tm.issues) || 0) });
+    });
+    const byKey = (a, b) => a.key.localeCompare(b.key, undefined, { numeric: true });
+    return [...groups].sort((a, b) => a[0].localeCompare(b[0])).map(([key, items]) => {
+      const total = items.reduce((a, x) => a + x.sec, 0);
+      const timed = items.filter((x) => x.sec > 0).sort((a, b) => b.sec - a.sec || byKey(a, b));
+      const slices = timed.filter((x, i) => i < DASH_SLICES && x.sec / total >= DASH_MIN_SHARE); // a prefix: sorted by size
+      const other = timed.slice(slices.length);
+      const otherSec = other.reduce((a, x) => a + x.sec, 0);
+      const pcts = roundShares([...slices.map((x) => x.sec), otherSec], total);
+      slices.forEach((x, i) => { x.pct = pcts[i]; });
+      return { key, name: projectName(key), total, epics: items.length, slices, other, otherPct: pcts[slices.length],
+        otherSec, otherIssues: other.reduce((a, x) => a + x.issues, 0),
+        zero: items.filter((x) => x.sec <= 0).sort(byKey) };
+    });
+  }
+
+  function donutSVG(c, label) {
+    const parts = c.slices.map((x, i) => ({ id: String(i), sec: x.sec, tone: x.tone }));
+    if (c.otherSec > 0) parts.push({ id: 'other', sec: c.otherSec, tone: null });
+    const { c: C, r: R } = DONUT;
+    const pt = (a) => `${(C + R * Math.sin(a)).toFixed(2)} ${(C - R * Math.cos(a)).toFixed(2)}`; // 0 = top, clockwise
+    const gap = parts.length > 1 ? 0.03 : 0; // thin gap between slices (radians)
+    const MIN_ARC = 0.02;                    // CR-5: drawn length of the tiniest part, taken from the largest one
+    const sweeps = parts.map((p) => (p.sec / c.total) * 2 * Math.PI);
+    if (parts.length > 1) {
+      let need = 0;
+      sweeps.forEach((v, i) => { if (v < MIN_ARC + gap) { need += MIN_ARC + gap - v; sweeps[i] = MIN_ARC + gap; } });
+      const big = sweeps.indexOf(Math.max(...sweeps));
+      sweeps[big] -= need;
+    }
+    let start = 0;
+    const shapes = parts.map((p, i) => {
+      const sweep = sweeps[i];
+      const a0 = start + gap / 2;
+      const a1 = start + sweep - gap / 2;
+      start += sweep;
+      const attrs = html`class="epd-slice${p.tone ? '' : ' is-other'}" data-slice="${p.id}"${p.tone ? html` data-epic="${p.tone}"` : ''} data-mid="${((a0 + a1) / 2).toFixed(4)}"`;
+      return parts.length === 1
+        ? html`<circle cx="${C}" cy="${C}" r="${R}" ${attrs}></circle>`
+        : html`<path d="M${pt(a0)}A${R} ${R} 0 ${a1 - a0 > Math.PI ? 1 : 0} 1 ${pt(a1)}" ${attrs}></path>`;
+    });
+    return html`<svg class="epd-donut" viewBox="0 0 120 120" role="img" aria-label="${label}">${shapes}</svg>`;
+  }
+
+  function dashCard(c, metric) {
+    const id = 'epd-' + domId(c.key);
+    const metricName = dashMetricName(metric);
+    const row = (x, slice, cls) => {
+      const hours = fmtHours(x.sec);
+      const share = fmtShare(x.sec, c.total, slice != null && slice !== 'other' ? x.pct : null);
+      const label = t('epics.dash.rowLabel', { name: x.name, key: x.key, hours, share, issues: t('board.count', { n: x.issues }) });
+      return html`<li><button type="button" class="epd-row${cls ? ' ' + cls : ''}" tabindex="-1" data-dash-open="${x.key}" data-dfocus="row:${x.key}"${cls === 'is-other' ? '' : html` data-epic="${x.tone}"`}${slice != null ? html` data-slice="${slice}" data-tip="${x.name}" data-tip-val="${hours} · ${share}"` : ''} aria-label="${label}">
+        <span class="epd-dot" aria-hidden="true"></span><span class="epd-name" aria-hidden="true"><span class="epd-ename">${x.name}</span><span class="epd-key">${x.key}</span></span><span class="epd-num" aria-hidden="true">${hours}</span><span class="epd-num" aria-hidden="true">${share}</span><span class="epd-num" aria-hidden="true">${x.issues}</span></button></li>`;
+    };
+    let otherRow = '';
+    if (c.other.length) {
+      const open = S.ep.dash.otherOpen.has(c.key);
+      const name = `${t('epics.dash.other')} · ${t('epics.epicsTotal', { n: c.other.length })}`;
+      const hours = fmtHours(c.otherSec);
+      const share = fmtShare(c.otherSec, c.total, c.otherPct);
+      otherRow = html`<li><button type="button" class="epd-row is-other is-group" tabindex="-1" data-dash-other="${c.key}" data-dfocus="other:${c.key}" data-slice="other" data-tip="${name}" data-tip-val="${hours} · ${share}" aria-expanded="${open ? 'true' : 'false'}" aria-controls="${id}-other" aria-label="${t('epics.dash.otherLabel', { name, hours, share, issues: t('board.count', { n: c.otherIssues }) })}">
+          <span class="epd-dot" aria-hidden="true"></span><span class="epd-name" aria-hidden="true"><span class="epd-ename">${name}</span>${icon('chevron-down', 'epd-chev')}</span><span class="epd-num" aria-hidden="true">${hours}</span><span class="epd-num" aria-hidden="true">${share}</span><span class="epd-num" aria-hidden="true">${c.otherIssues}</span></button>
+        <ul class="epd-rows epd-subrows" role="list" id="${id}-other"${open ? '' : html` hidden`}>${c.other.map((x) => row(x, 'other', 'is-other'))}</ul></li>`;
+    }
+    const sliceNames = [...c.slices.map((x) => `${x.name} ${fmtShare(x.sec, c.total, x.pct)}`), ...(c.otherSec > 0 ? [`${t('epics.dash.other')} ${fmtShare(c.otherSec, c.total, c.otherPct)}`] : [])];
+    const chartLabel = t('epics.dash.chartLabel', { metric: metricName, project: c.key, total: fmtHours(c.total), list: sliceNames.join(', ') });
+    const total = fmtHours(c.total);
+    const body = c.total > 0
+      ? html`<div class="epd-card-body">
+          <div class="epd-chart">${donutSVG(c, chartLabel)}<div class="epd-center" aria-hidden="true"><span class="epd-total${total.length > 8 ? ' is-long' : ''}">${total}</span><span class="epd-metric">${metricName}</span></div></div>
+          <div class="epd-legend">
+            <div class="epd-lhead" aria-hidden="true"><span></span><span>${t('epics.dash.colEpic')}</span><span>${t('epics.dash.colHours')}</span><span>${t('epics.dash.colShare')}</span><span>${t('epics.dash.colIssues')}</span></div>
+            <ul class="epd-rows" role="list" aria-label="${t('epics.dash.legendLabel', { project: c.key })}">${c.slices.map((x, i) => row(x, i))}${otherRow}${c.zero.map((x) => row(x, null, 'is-zero'))}</ul>
+          </div>
+        </div>
+        <div class="epd-tip" aria-hidden="true" hidden></div>`
+      : html`<p class="epd-empty">${icon('clock')}<span>${t(metric === 'estimate' ? 'epics.dash.noEstimate' : 'epics.dash.noLogged')}</span></p>`;
+    return html`<article class="epd-card" aria-labelledby="${id}-t">
+      <header class="epd-card-head">${c.name ? html`<span class="sp-pkey">${c.key}</span>` : ''}<h3 class="epd-card-title" id="${id}-t">${c.name || c.key}</h3><span class="epd-card-meta">${t('epics.epicsTotal', { n: c.epics })}</span></header>
+      ${body}
+    </article>`;
+  }
+
+  function dashHTML(data, entering) {
+    const d = S.ep.dash;
+    const cards = dashModel(data, d.metric);
+    const total = cards.reduce((a, c) => a + c.total, 0);
+    const seg = html`<div class="segmented segmented-sm" role="radiogroup" aria-label="${t('epics.dash.metricLabel')}">${['spent', 'estimate'].map((m) => html`<button type="button" role="radio" class="seg-btn" data-dash-metric="${m}" data-dfocus="metric:${m}" aria-checked="${d.metric === m ? 'true' : 'false'}" tabindex="${d.metric === m ? '0' : '-1'}">${dashMetricName(m)}</button>`)}</div>`;
+    return html`<section class="epd${d.collapsed ? '' : ' is-open'}" aria-labelledby="epd-toggle">
+      <div class="epd-head">
+        <h2 class="epd-title"><button type="button" class="epd-toggle" id="epd-toggle" data-dash-toggle data-dfocus="toggle" aria-expanded="${d.collapsed ? 'false' : 'true'}" aria-controls="epd-body">${icon('chevron-right', 'epd-chev')}<span>${t('epics.dash.title')}</span></button></h2>
+        <span class="epd-sum">${t('epics.dash.summary', { metric: dashMetricName(d.metric), total: fmtHours(total) })}</span>
+        ${d.collapsed ? '' : seg}
+      </div>
+      <div class="epd-body" id="epd-body"${d.collapsed ? html` hidden` : ''}>
+        ${data.timePartial ? html`<div class="notice notice-tip" role="note">${icon('info')}<span>${t('epics.dash.partial')}</span></div>` : ''}
+        <div class="epd-cards${entering ? ' is-entering' : ''}">${cards.map((c) => dashCard(c, d.metric))}</div>
+      </div>
+    </section>`;
+  }
+
+  /** The dashboard element for this data (cached), or null: no epics, or an older backend without `time`. */
+  function epicDashboard(data) {
+    const d = S.ep.dash;
+    const epics = data.epics || [];
+    if (!epics.some((n) => n && n.time)) return null;
+    const names = [...new Set(epics.map((n) => projectOf(n.epic || {})))].map(projectName).join(',');
+    const sig = [d.metric, d.collapsed, [...d.otherOpen].join(','), i18n.lang, names].join('|');
+    if (d.el && d.data === data && d.sig === sig) return d.el;
+    // CR-4: animate when the view changes (options / project), not on a silent reload of the same view.
+    const entering = !d.data || d.data.key !== data.key || d.shownMetric !== d.metric || (d.wasCollapsed && !d.collapsed);
+    const box = document.createElement('div');
+    setHTML(box, dashHTML(data, entering));
+    const el = box.firstElementChild;
+    // Roving tabindex: one tab stop per legend (top-level rows; "Other" members join when shown).
+    $$('.epd-legend > .epd-rows', el).forEach((list) => { const first = $('.epd-row', list); if (first) first.tabIndex = 0; });
+    const cards = $('.epd-cards', el);
+    if (entering) setTimeout(() => cards.classList.remove('is-entering'), 600); // re-inserting must not replay it
+    el.addEventListener('pointerover', (e) => dashHighlight(e.target.closest('.epd-slice, .epd-row')));
+    el.addEventListener('pointerleave', () => dashHighlight(el.contains(document.activeElement) ? document.activeElement.closest('.epd-row') : null));
+    el.addEventListener('focusin', (e) => dashHighlight(e.target.closest('.epd-row')));
+    el.addEventListener('focusout', (e) => { if (!el.contains(e.relatedTarget)) dashHighlight(null); });
+    Object.assign(d, { el, data, sig, shownMetric: d.metric, wasCollapsed: d.collapsed });
+    return el;
+  }
+
+  /** Highlights a slice and its legend row(s) and shows the tooltip at the slice; null clears. */
+  function dashHighlight(target) {
+    const root = S.ep.dash.el;
+    if (!root) return;
+    $$('.epd-card.has-hl', root).forEach((card) => {
+      card.classList.remove('has-hl');
+      $$('.is-hl', card).forEach((x) => x.classList.remove('is-hl'));
+      const tip = $('.epd-tip', card);
+      if (tip) tip.hidden = true;
+    });
+    const card = target && target.closest('.epd-card');
+    const slice = target && target.dataset.slice;
+    if (!card || slice == null) return;
+    const path = $(`.epd-slice[data-slice="${slice}"]`, card);
+    const main = $(`.epd-row[data-slice="${slice}"]`, card);
+    if (!path || !main) return;
+    card.classList.add('has-hl');
+    [path, main, target].forEach((x) => x.classList.add('is-hl'));
+    const from = target.classList.contains('epd-row') ? target : main;
+    const tip = $('.epd-tip', card);
+    setHTML(tip, html`<strong>${from.dataset.tip}</strong><span>${from.dataset.tipVal}</span>`);
+    tip.hidden = false;
+    // Anchor: the middle of the slice on the ring, clamped to the card.
+    const box = path.ownerSVGElement.getBoundingClientRect();
+    const cr = card.getBoundingClientRect();
+    const k = box.width / 120;
+    const a = Number(path.dataset.mid) || 0;
+    // DR-5: anchored just outside the ring and pushed away from it (right / left, above / below), so the centre
+    // total and the card title stay visible; clamped to the card.
+    const w = tip.offsetWidth;
+    const h = tip.offsetHeight;
+    const R = DONUT.r + 12; // ring radius + half the highlighted stroke + a little air
+    const x = box.left - cr.left + (DONUT.c + R * Math.sin(a)) * k;
+    const y = box.top - cr.top + (DONUT.c - R * Math.cos(a)) * k;
+    const left = Math.sin(a) > 0 ? x + 4 : x - w - 4;
+    const top = Math.cos(a) < 0 ? y + 4 : y - h - 4;
+    tip.style.left = Math.max(4, Math.min(cr.width - w - 4, left)) + 'px';
+    tip.style.top = Math.max(4, Math.min(cr.height - h - 4, top)) + 'px';
+  }
+
+  function openDashEpic(key, row) {
+    let seed = null;
+    forEachRef(key, (r) => { if (!seed) seed = r; });
+    const focusKey = row && row.dataset.dfocus;
+    openIssue(key, seed, { returnFocus: () => {
+      const el = focusKey && S.ep.dash.el ? S.ep.dash.el.querySelector(`[data-dfocus="${CSS.escape(focusKey)}"]`) : null;
+      return el && el.isConnected ? el : null;
+    } });
+  }
+
+  function setDashMetric(m, focus) {
+    const d = S.ep.dash;
+    if (m !== 'spent' && m !== 'estimate') return;
+    if (m !== d.metric) { d.metric = m; prefs.set('epics.dash.metric', m); renderEpics(); }
+    if (focus && d.el) { const b = $(`[data-dash-metric="${m}"]`, d.el); if (b) b.focus(); }
+  }
+
+  /** Clicks inside the dashboard (delegated from #ep-list); true when handled. */
+  function onDashClick(e) {
+    const d = S.ep.dash;
+    if (!d.el || !d.el.contains(e.target)) return false;
+    if (e.target.closest('[data-dash-toggle]')) {
+      d.collapsed = !d.collapsed;
+      prefs.set('epics.dash.collapsed', d.collapsed);
+      renderEpics();
+      return true;
+    }
+    const metric = e.target.closest('[data-dash-metric]');
+    if (metric) { setDashMetric(metric.dataset.dashMetric, false); return true; }
+    const slice = e.target.closest('.epd-slice');
+    const row = slice ? $(`.epd-row[data-slice="${slice.dataset.slice}"]`, slice.closest('.epd-card')) : e.target.closest('.epd-row');
+    if (!row) return true;
+    if (row.dataset.dashOther) {
+      const key = row.dataset.dashOther;
+      if (d.otherOpen.has(key)) d.otherOpen.delete(key); else d.otherOpen.add(key);
+      renderEpics();
+    } else if (row.dataset.dashOpen) openDashEpic(row.dataset.dashOpen, row);
+    return true;
+  }
+
+  function focusDashRow(b, opts) {
+    if (!b) return;
+    $$('.epd-row', b.closest('.epd-legend')).forEach((x) => { x.tabIndex = -1; });
+    b.tabIndex = 0;
+    b.focus(opts);
+  }
+
+  /** Keys inside the dashboard: arrows in the metric switch and between legend rows; true when handled. */
+  function onDashKey(e) {
+    const d = S.ep.dash;
+    if (!d.el || !d.el.contains(e.target) || e.ctrlKey || e.metaKey || e.altKey) return false;
+    const seg = e.target.closest('[data-dash-metric]');
+    if (seg) {
+      if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return false;
+      e.preventDefault();
+      setDashMetric(e.key === 'Home' ? 'spent' : e.key === 'End' ? 'estimate' : seg.dataset.dashMetric === 'spent' ? 'estimate' : 'spent', true);
+      return true;
+    }
+    const row = e.target.closest('.epd-row');
+    if (!row) return false;
+    const rows = $$('.epd-row', row.closest('.epd-legend')).filter((b) => !b.closest('[hidden]'));
+    const i = rows.indexOf(row);
+    const go = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: rows.length - 1 }[e.key];
+    if (go == null) return false;
+    e.preventDefault();
+    focusDashRow(rows[Math.max(0, Math.min(rows.length - 1, go))]);
+    return true;
+  }
+
   function renderEpics() {
     if (S.view !== 'epics' || activeSectionId() !== 'view-epics') return;
     $$('#ep-mode [data-mode]').forEach((b) => {
@@ -2521,7 +3000,19 @@
     const b = treeBuilder();
     const active = document.activeElement;
     const focusNode = active && el.contains(active) && active.dataset.node ? active.dataset.node : S.ep.focusNode;
-    const hadFocus = active && el.contains(active);
+    const inDash = !!(S.ep.dash.el && S.ep.dash.el.contains(active));
+    const dashFocus = inDash ? active.dataset.dfocus || 'toggle' : null;
+    const hadFocus = active && el.contains(active) && !inDash;
+    const dash = S.ep.mode === 'epics' ? epicDashboard(data) : null;
+    const slot = dash ? html`<div data-slot="dash"></div>` : '';
+    /** Puts the (reused) dashboard element back in place and returns focus to it if it had it. */
+    const placeDash = () => {
+      if (!dash) return;
+      $('[data-slot="dash"]', el).replaceWith(dash);
+      if (!dashFocus) return;
+      const f = dash.querySelector(`[data-dfocus="${CSS.escape(dashFocus)}"]`) || $('#epd-toggle', dash);
+      if (f.classList.contains('epd-row')) focusDashRow(f, { preventScroll: true }); else f.focus({ preventScroll: true });
+    };
     const scroller = $('#ep-scroll');
     const scrollTop = scroller.scrollTop;
 
@@ -2548,11 +3039,13 @@
         : stateBlock({ iconName: 'layers', fill: true, title: S.ep.mode === 'stories' ? t('epics.emptyStoriesTitle') : t('epics.emptyTitle'),
           text: S.ep.mine ? t('epics.emptyMineText') : effProject() ? t('epics.emptyProjectText', { key: effProject() }) : t('epics.emptyText'),
           action: S.ep.mine || effProject() ? null : { id: 'go-projects', label: t('board.goProjects') } });
-      setHTML(el, empty);
+      setHTML(el, html`${slot}${empty}`);
+      placeDash();
       return;
     }
     const trunc = data.truncated ? html`<div class="notice" role="note">${icon('info')}<span>${t('epics.truncated')}</span></div>` : '';
-    setHTML(el, html`${trunc}${sections}<p class="tree-hint" aria-hidden="true">${t('epics.keyboardHint')}</p>`);
+    setHTML(el, html`${slot}${trunc}${sections}<p class="tree-hint" aria-hidden="true">${t('epics.keyboardHint')}</p>`);
+    placeDash();
     scroller.scrollTop = scrollTop;
     // Roving tabindex: one tab stop per tree, on the remembered node when present.
     $$('.tree', el).forEach((tree) => {
@@ -2608,6 +3101,7 @@
   }
 
   function onTreeKey(e) {
+    if (onDashKey(e)) return;
     const li = e.target.closest && e.target.closest('[role="treeitem"]');
     if (!li || e.target !== li || e.ctrlKey || e.metaKey || e.altKey) return;
     const tree = li.closest('[role="tree"]');
@@ -2641,6 +3135,7 @@
   }
 
   function onTreeClick(e) {
+    if (onDashClick(e)) return;
     const a = e.target.closest('[data-action]');
     if (a) {
       if (a.dataset.action === 'ep-retry') loadEpics({ force: true });
@@ -3269,11 +3764,12 @@
    * SETTINGS
    * ================================================================ */
   const FORM_SCALARS = ['jiraUrl', 'language', 'worklogTime', 'workdayStart', 'workdayEnd', 'lunchStart', 'lunchEnd', 'boardJql'];
-  const FORM_BOOLS = ['autostart', 'worklogEnabled', 'notifyComments'];
+  const FORM_BOOLS = ['autostart', 'worklogEnabled', 'notifyComments', 'autoCheckUpdates'];
   const FORM_NUMS = ['dailyCapHours', 'loadFactor', 'hoursPerDay', 'commentPollMinutes'];
   const form = () => $('#settings-form');
 
   async function enterSettings(forceReload) {
+    loadUpdateStatus(false); // no network; the Updates block re-renders when it arrives
     if (S.form && formDirty() && !forceReload) { renderSettingsDynamic(); return; }
     S.formLoading = true;
     S.formError = null;
@@ -3410,6 +3906,7 @@
     const today = i18n.isoDate(new Date());
     renderTagList($('#s-holidays'), S.form.holidays, 'holiday', (v) => i18n.date(v + 'T12:00:00', { day: 'numeric', month: 'short', year: 'numeric' }), (v) => v < today);
     renderVacations();
+    renderUpdateSettings();
     renderSavebar();
   }
 
@@ -3584,6 +4081,7 @@
     delete out.autostartEffective;
     out.autostart = effective;
     if (out.loadFactor == null) out.loadFactor = 1; // v0.1 backends do not send it
+    if (typeof out.autoCheckUpdates !== 'boolean') out.autoCheckUpdates = true; // SPEC default; older backends do not send it
     S.autostartMismatch = asked !== effective;
     return out;
   }
@@ -3785,6 +4283,326 @@
   }
 
   /* ================================================================
+   * UPDATES (SPEC v0.4 §5): prompt dialog with release notes, install progress, Settings → Updates,
+   * "Updated to X.Y.Z" toast. Release notes are untrusted plain text: textContent only (no markup, no wiki).
+   * ================================================================ */
+  const UPD_PHASES = ['download', 'verify', 'install', 'restart'];
+  const fmtMB = (bytes) => t('update.mb', { n: nf({ minimumFractionDigits: 1, maximumFractionDigits: 1 }).format((Number(bytes) || 0) / 1048576) });
+  const updRelease = () => (S.upd.dlg && S.upd.dlg.release) || (S.upd.status && S.upd.status.latest) || null;
+
+  /** getUpdateStatus (no network). startup: "Updated to" toast, prompt or a running install. */
+  async function loadUpdateStatus(startup) {
+    let st;
+    try { st = await api('getUpdateStatus'); } catch { return; } // older backend: no updater UI
+    applyUpdateStatus(st);
+    if (!startup || !st) return;
+    if (st.justUpdated && st.justUpdated.to) showUpdated(st.justUpdated.to);
+    if (st.installing) { S.upd.job = true; openUpdateDialog(st.latest, 'progress'); }
+    else if (st.prompt && st.latest) openUpdateDialog(st.latest);
+  }
+  function applyUpdateStatus(st) {
+    if (!st || typeof st !== 'object') return;
+    S.upd.status = st;
+    renderUpdateSettings();
+  }
+  function showUpdated(version) {
+    if (S.upd.toasted) return; // once per session (status at startup and the `updated` event say the same)
+    S.upd.toasted = true;
+    toast(t('update.updatedTo', { version }), { tone: 'success' });
+  }
+
+  /* --- dialog --- */
+  /** trigger: data-upd-act of the Settings button that opened it (focus returns there). Without one, a dialog that
+      opens while a manual check runs or while focus is in Settings → Updates (Go emits updateAvailable inside
+      checkForUpdates, before it returns) takes that button; otherwise it is unasked (startup / background check). */
+  function openUpdateDialog(release, mode = 'prompt', trigger = null) {
+    const d = S.upd.dlg;
+    if (!d && !trigger) {
+      const a = document.activeElement;
+      trigger = S.upd.checking ? 'check' : $('#upd-settings').contains(a) && a.dataset.updAct ? a.dataset.updAct : null;
+    }
+    if (d) {
+      if (release && d.mode !== 'progress') d.release = release;
+      if (mode === 'progress' && d.mode !== 'progress') { d.mode = 'progress'; d.progress = { phase: 'download' }; }
+      renderUpdateDialog();
+      return;
+    }
+    const rel = release || (S.upd.status && S.upd.status.latest);
+    if (!rel) return;
+    // Only "Update to X" starts on "Update now"; a prompt found by a manual check starts on the title like an unasked one.
+    S.upd.dlg = { mode, release: rel, progress: mode === 'progress' ? { phase: 'download' } : null, error: null, said: '', userOpened: trigger === 'install' };
+    renderUpdateDialog();
+    layers.open($('#dlg-update'), {
+      // DR-7: an unasked prompt starts on the title, so a stray Enter / Space can't install and restart.
+      focus: mode === 'prompt' && trigger === 'install' ? '[data-upd="install"]' : '#upd-title',
+      // DR-8: the scrim does nothing here. Esc: "Later" in the prompt (the hint says so), close after a failure,
+      // nothing while installing.
+      onDismiss: (source) => {
+        const m = S.upd.dlg && S.upd.dlg.mode;
+        if (source === 'scrim') return;
+        if (m === 'prompt') skipUpdate(); else if (m === 'failed') closeUpdateDialog();
+      },
+      onClose: () => { S.upd.dlg = null; $('#upd-live').textContent = ''; },
+      // CR-7: back to the Settings button that opened it (the box is re-rendered meanwhile, so look it up again).
+      restoreFocus: () => {
+        if (!trigger) return null;
+        const el = $(`#upd-settings [data-upd-act="${trigger}"]`) || $('#upd-settings [data-upd-act="check"]');
+        return el && el.isConnected ? el : null;
+      },
+    });
+  }
+  function closeUpdateDialog() { if (S.upd.dlg) layers.close($('#dlg-update')); }
+
+  /** DR-12: release notes (Markdown from GitHub) shown as text only: "## x" lines become bold paragraphs, leading
+      "- " / "* " become "• ". Built with createElement / textContent; no markup is interpreted. */
+  function fillReleaseNotes(box, notes) {
+    box.textContent = '';
+    const text = String(notes || '').replace(/\r\n?/g, '\n').trim();
+    box.classList.toggle('is-empty', !text);
+    if (!text) { box.textContent = t('update.noNotes'); return; }
+    let run = [];
+    const flush = () => {
+      const body = run.join('\n').replace(/^\n+|\s+$/g, '');
+      run = [];
+      if (!body) return;
+      const p = document.createElement('p');
+      p.className = 'upd-notes-text';
+      p.textContent = body;
+      box.append(p);
+    };
+    text.split('\n').forEach((line) => {
+      const h = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/.exec(line);
+      if (!h) { run.push(line.replace(/^(\s*)[-*]\s+/, '$1• ')); return; }
+      flush();
+      const p = document.createElement('p');
+      p.className = 'upd-notes-h';
+      p.textContent = h[1];
+      box.append(p);
+    });
+    flush();
+  }
+
+  function updProgressHTML(d) {
+    const r = d.release || {};
+    const p = d.progress || { phase: 'download' };
+    const i = Math.max(0, UPD_PHASES.indexOf(p.phase));
+    return html`<h2 class="modal-title" id="upd-title" tabindex="-1">${t('update.installing', { version: r.version })}</h2>
+      <p class="upd-meta" id="upd-sub"></p>
+      <div class="upd-progress" role="progressbar" aria-labelledby="upd-sub" aria-valuemin="0" aria-valuemax="100"><span class="upd-progress-fill"></span></div>
+      <p class="upd-detail" id="upd-detail"></p>
+      <ol class="upd-steps" aria-hidden="true">${UPD_PHASES.map((ph, k) => html`<li data-step="${ph}" data-state="${k < i ? 'done' : k === i ? 'current' : 'todo'}"><span class="upd-step-mark">${icon('check')}</span>${t('update.step.' + ph)}</li>`)}</ol>`;
+  }
+  /** Progress is updated in place (up to ~100 events): the bar keeps its transition and focus stays put. */
+  function syncUpdateProgress(body, d) {
+    const r = d.release || {};
+    const p = d.progress || { phase: 'download' };
+    const total = Number(p.total) || Number(r.size) || 0;
+    const pct = p.phase === 'download' && total > 0 && p.received != null ? Math.min(100, (Number(p.received) / total) * 100) : null;
+    const bar = $('.upd-progress', body);
+    const detail = pct != null ? t('update.received', { received: fmtMB(p.received), total: fmtMB(total) })
+      : p.phase === 'install' ? t('update.installWait') : p.phase === 'restart' ? t('update.restartHint') : '';
+    $('#upd-sub', body).textContent = t('update.phase.' + (UPD_PHASES.includes(p.phase) ? p.phase : 'download'));
+    $('#upd-detail', body).textContent = detail;
+    bar.classList.toggle('is-indeterminate', pct == null && p.phase !== 'restart');
+    bar.style.setProperty('--w', (pct == null ? (p.phase === 'restart' ? 100 : 0) : pct).toFixed(1) + '%');
+    if (pct != null) { bar.setAttribute('aria-valuenow', String(Math.round(pct))); bar.setAttribute('aria-valuetext', detail); } else { bar.removeAttribute('aria-valuenow'); bar.removeAttribute('aria-valuetext'); }
+    const i = Math.max(0, UPD_PHASES.indexOf(p.phase));
+    $$('[data-step]', body).forEach((li, k) => { li.dataset.state = k < i ? 'done' : k === i ? 'current' : 'todo'; });
+    // Live region: phase changes and download quarters only, not every event.
+    const say = pct != null && pct > 0 ? t('update.liveDownload', { pct: nf({ style: 'percent', maximumFractionDigits: 0 }).format(Math.floor(pct / 25) / 4) }) : $('#upd-sub', body).textContent;
+    if (say !== d.said) { d.said = say; $('#upd-live').textContent = say; }
+  }
+
+  function renderUpdateDialog() {
+    const d = S.upd.dlg;
+    if (!d) return;
+    const body = $('#upd-body');
+    if (d.mode === 'progress' && body.dataset.mode === 'progress') { syncUpdateProgress(body, d); return; }
+    const r = d.release || {};
+    const st = S.upd.status || {};
+    const active = document.activeElement;
+    const hadFocus = $('#dlg-update').contains(active);
+    const focusKey = hadFocus && active.dataset ? active.dataset.upd : null;
+    let content;
+    if (d.mode === 'progress') content = updProgressHTML(d);
+    else if (d.mode === 'failed') {
+      const e = d.error || {};
+      const noWrite = e.code === 'no_write_access' && r.url;
+      const badSig = e.code === 'bad_signature'; // DR-9: retrying the same release won't help; Close is the main action
+      const btn = (act, label, primary) => html`<button type="button" class="btn${primary ? ' btn-primary' : ''}" data-upd="${act}">${label}</button>`;
+      content = html`<h2 class="modal-title" id="upd-title" tabindex="-1">${t('update.failedTitle')}</h2>
+        <p class="upd-meta" id="upd-sub">${t('update.failedSub', { version: st.currentVersion || '' })}</p>
+        <div class="inline-error upd-error" role="alert">${icon('alert')}<span data-text="error"></span></div>
+        ${noWrite ? html`<p class="upd-hint">${t('update.noWriteHint')}</p>` : ''}
+        <div class="modal-actions">
+          ${noWrite ? html`${btn('close', t('common.close'))}${btn('retry', t('common.retry'))}<button type="button" class="btn btn-primary" data-upd="manual">${icon('external')}<span>${t('update.manual')}</span></button>`
+            : badSig ? html`${btn('retry', t('common.retry'))}${btn('close', t('common.close'), true)}`
+              : html`${btn('close', t('common.close'))}${btn('retry', t('common.retry'), true)}`}
+        </div>`;
+    } else {
+      const from = st.currentVersion && st.currentVersion !== r.version ? st.currentVersion : '';
+      const meta = [from ? `${from} → ${r.version}` : r.version, r.publishedAt ? i18n.date(r.publishedAt) : '', Number(r.size) > 0 ? fmtMB(r.size) : ''].filter(Boolean).join(' · ');
+      content = html`<h2 class="modal-title" id="upd-title" tabindex="-1">${t('update.title', { version: r.version })}</h2>
+        <p class="upd-meta" id="upd-sub">${meta}</p>
+        <div class="upd-notes-head"><span id="upd-notes-label">${t('update.notes')}</span>${r.url ? html`<button type="button" class="link-btn" data-upd="page">${t('update.whatsNew')}${icon('external', 'icon-sm')}</button>` : ''}</div>
+        <div class="upd-notes" id="upd-notes" tabindex="0" role="region" aria-labelledby="upd-notes-label"></div>
+        <div class="modal-actions">
+          <button type="button" class="btn" data-upd="later" aria-describedby="upd-later-hint">${t('update.later')}</button>
+          <button type="button" class="btn btn-primary" data-upd="install">${t('update.now')}</button>
+        </div>
+        <p class="upd-later-hint" id="upd-later-hint">${t('update.laterHint', { version: r.version })}</p>`;
+    }
+    setHTML(body, content);
+    body.dataset.mode = d.mode;
+    if (d.mode === 'progress') syncUpdateProgress(body, d);
+    const notes = $('#upd-notes', body);
+    if (notes) fillReleaseNotes(notes, r.notes); // untrusted: text only
+    const errText = $('[data-text="error"]', body);
+    if (errText) errText.textContent = (d.error && d.error.message) || t('update.failedGeneric'); // CR-10: text, not markup
+    if (!hadFocus) return;
+    const target = (focusKey && $(`[data-upd="${focusKey}"]`, body))
+      || (d.mode === 'failed' ? $('.btn-primary[data-upd]', body) : d.mode === 'prompt' && d.userOpened ? $('[data-upd="install"]', body) : $('#upd-title', body));
+    if (target) target.focus({ preventScroll: true });
+  }
+
+  async function startUpdate() {
+    const d = S.upd.dlg;
+    if (!d || !d.release || d.mode === 'progress') return;
+    const version = d.release.version;
+    Object.assign(d, { mode: 'progress', progress: { phase: 'download', received: 0, total: d.release.size }, error: null, said: '' });
+    S.upd.job = true;
+    renderUpdateDialog();
+    $('#upd-title').focus({ preventScroll: true });
+    if (S.upd.status) { S.upd.status.installing = true; renderUpdateSettings(); }
+    try {
+      await api('installUpdate', { version });
+    } catch (e) {
+      if (e.code === 'update_busy') return; // a job runs already: its events drive the dialog
+      S.upd.job = false;
+      if (S.upd.status) S.upd.status.installing = false;
+      if (S.upd.dlg === d) { Object.assign(d, { mode: 'failed', error: { code: e.code, message: errorText(e) } }); renderUpdateDialog(); }
+      loadUpdateStatus(false);
+    }
+  }
+
+  async function skipUpdate() {
+    const d = S.upd.dlg;
+    const version = d && d.release && d.release.version;
+    closeUpdateDialog();
+    if (!version) return;
+    try { applyUpdateStatus(await api('skipUpdate', { version })); } catch (e) { toastError(t('update.skipFailed'), e); }
+  }
+
+  function onUpdateDialogClick(e) {
+    const b = e.target.closest('[data-upd]');
+    if (!b) return;
+    const r = updRelease();
+    switch (b.dataset.upd) {
+      case 'install': case 'retry': startUpdate(); break;
+      case 'later': skipUpdate(); break;
+      case 'close': closeUpdateDialog(); break;
+      case 'page': case 'manual': if (r && r.url) openUrl(r.url); break;
+    }
+  }
+
+  /* --- events --- */
+  function onUpdateAvailable(rel) {
+    if (rel && rel.version) openUpdateDialog(rel);
+    loadUpdateStatus(false);
+  }
+  function onUpdateProgress(p) {
+    if (!p || !p.phase) return;
+    // CR-8: late events after a failure don't reopen the (undismissable) progress view; Retry switches to it itself.
+    if (S.upd.dlg ? S.upd.dlg.mode === 'failed' : !S.upd.job) return;
+    if (!S.upd.dlg) openUpdateDialog(null, 'progress');
+    const d = S.upd.dlg;
+    if (!d) return;
+    d.mode = 'progress';
+    d.progress = Object.assign({ total: d.progress && d.progress.total }, p);
+    renderUpdateDialog();
+    if (S.upd.status && !S.upd.status.installing) { S.upd.status.installing = true; renderUpdateSettings(); }
+  }
+  function onUpdateFailed(f) {
+    S.upd.job = false;
+    if (!S.upd.dlg) openUpdateDialog(null, 'failed');
+    const d = S.upd.dlg;
+    if (d) { Object.assign(d, { mode: 'failed', error: { code: f && f.code, message: f && f.message } }); renderUpdateDialog(); }
+    if (S.upd.status) S.upd.status.installing = false;
+    loadUpdateStatus(false);
+  }
+
+  /* --- Settings → Updates --- */
+  function renderUpdateSettings() {
+    const box = $('#upd-settings');
+    if (!box) return;
+    const st = S.upd.status;
+    const section = $('#sec-upd').closest('.settings-section');
+    section.hidden = !st; // older backend: no updater
+    if (!st) return;
+    const active = document.activeElement;
+    const focusKey = box.contains(active) ? active.dataset.updAct : null;
+    const r = st.latest;
+    const lc = st.lastCheck;
+    const busy = S.upd.checking;
+    const installing = !!st.installing;
+    let badge = '';
+    if (st.supported && st.available && r) badge = html`<span class="chip chip-accent">${t('settings.updAvailable', { version: r.version })}</span>`;
+    else if (st.supported && lc && lc.ok) badge = html`<span class="chip chip-good">${icon('check')}${t('settings.updUpToDate')}</span>`;
+    const latestLine = r ? html`<p class="hint upd-line">${r.publishedAt ? t('settings.updLatest', { version: r.version, date: i18n.date(r.publishedAt) }) : t('settings.updLatestNoDate', { version: r.version })}${r.url ? html`<button type="button" class="link-btn" data-upd-act="page">${t('update.whatsNew')}</button>` : ''}</p>` : '';
+    const checkLine = !st.supported ? html`<p class="hint upd-line">${icon('info', 'icon-sm')}<span>${t('settings.updDev')}</span></p>`
+      : !lc ? html`<p class="hint upd-line">${t('settings.updNever')}</p>`
+        : lc.ok ? html`<p class="hint upd-line">${relSpan(lc.at, 'settings.updChecked')}</p>`
+          : html`<p class="hint upd-line upd-check-error">${icon('alert', 'icon-sm')}<span data-text="check-error"></span></p>`;
+    const skipped = st.supported && st.available && r && st.skippedVersion === r.version ? html`<p class="hint upd-line">${t('settings.updSkippedHint')}</p>` : '';
+    setHTML(box, html`<div class="setting-text">
+        <span class="label upd-current">${t('settings.updCurrent', { version: st.currentVersion || '—' })}${badge}</span>
+        ${latestLine}${checkLine}${skipped}
+      </div>
+      <div class="setting-control upd-actions">
+        <button type="button" class="btn" data-upd-act="check"${!st.supported ? html` disabled` : busy || installing ? html` aria-disabled="true"` : ''}${busy ? html` aria-busy="true"` : ''}>${icon('refresh')}<span>${t('settings.updCheck')}</span></button>
+        ${st.supported && st.available && r ? html`<button type="button" class="btn btn-primary" data-upd-act="install"${installing ? html` aria-disabled="true"` : ''}>${installing ? t('settings.updInstalling') : t('settings.updInstall', { version: r.version })}</button>` : ''}
+      </div>`);
+    const err = $('[data-text="check-error"]', box);
+    if (err) err.textContent = t('settings.updCheckFailed', { rel: relText(lc.at) || '—', error: lc.error || t('update.failedGeneric') }); // CR-10
+    // CR-7: busy / installing buttons are aria-disabled (not disabled), so they keep keyboard focus across re-renders.
+    if (focusKey) {
+      const f = $(`[data-upd-act="${focusKey}"]`, box);
+      if (f) f.focus({ preventScroll: true });
+    }
+  }
+
+  async function checkUpdatesNow() {
+    if (S.upd.checking) return;
+    S.upd.checking = true;
+    renderUpdateSettings();
+    const live = $('#upd-settings-live');
+    live.textContent = '';
+    try {
+      const st = await api('checkForUpdates');
+      applyUpdateStatus(st);
+      const lc = st && st.lastCheck;
+      live.textContent = lc && !lc.ok ? t('settings.updLiveFailed', { error: lc.error || t('update.failedGeneric') })
+        : st && st.available && st.latest ? t('settings.updLiveAvailable', { version: st.latest.version }) : t('settings.updLiveUpToDate');
+    } catch (e) {
+      toastError(t('settings.updCheck'), e);
+    } finally {
+      S.upd.checking = false;
+      renderUpdateSettings();
+    }
+  }
+
+  function onUpdateSettingsClick(e) {
+    const b = e.target.closest('[data-upd-act]');
+    if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') return; // busy: ignored, focus stays
+    const r = S.upd.status && S.upd.status.latest;
+    switch (b.dataset.updAct) {
+      case 'check': checkUpdatesNow(); break;
+      case 'page': if (r && r.url) openUrl(r.url); break;
+      case 'install': if (r) { openUpdateDialog(r, 'prompt', 'install'); startUpdate(); } break;
+    }
+  }
+
+  /* ================================================================
    * Events from Go
    * ================================================================ */
   window.addEventListener('jiraffe', (e) => {
@@ -3792,6 +4610,10 @@
     const payload = parsePayload(detail.payload);
     switch (detail.type) {
       case 'notification': onNotificationEvent(payload); break;
+      case 'updateAvailable': onUpdateAvailable(payload); break;
+      case 'updateProgress': onUpdateProgress(payload); break;
+      case 'updateFailed': onUpdateFailed(payload); break;
+      case 'updated': if (payload && payload.to) showUpdated(payload.to); loadUpdateStatus(false); break;
       case 'state': S.stateError = null; applyState(payload); break;
       case 'board': {
         // Board data, tracked projects or issues changed on the Go side: everything issue-based may be stale.
@@ -3873,6 +4695,11 @@
     $('#ep-done').addEventListener('change', (e) => setEpicsOption({ includeDone: e.target.checked }));
     $('#ep-list').addEventListener('click', onTreeClick);
     $('#ep-list').addEventListener('keydown', onTreeKey);
+    window.addEventListener('resize', () => syncTableScroll($('#drawer')));
+    window.addEventListener('resize', () => { // the tooltip is placed once: re-place it for the focused row, drop a hover one
+      const a = document.activeElement;
+      dashHighlight(S.ep.dash.el && S.ep.dash.el.contains(a) ? a.closest('.epd-row') : null);
+    });
 
     // Projects
     $('#pj-bulk').addEventListener('click', trackOnlyMine);
@@ -3896,9 +4723,11 @@
     document.addEventListener('scroll', (e) => { if (!menuEl.contains(e.target)) menu.sync(); }, true);
 
     // Drawer / dialogs
+    $('#dlg-update').addEventListener('click', onUpdateDialogClick);
+    $('#upd-settings').addEventListener('click', onUpdateSettingsClick);
     $('#drawer').addEventListener('click', onDrawerClick);
     $('#drawer').addEventListener('keydown', onDrawerKey);
-    $('#scrim').addEventListener('click', () => layers.closeTop());
+    $('#scrim').addEventListener('click', () => layers.closeTop('scrim'));
 
     // Status view
     $('#view-status').addEventListener('click', (e) => { if (e.target.closest('[data-action="retry-state"]')) loadState(); });
@@ -4009,20 +4838,48 @@
       renderChrome();
       renderView(false);
       if (S.drawer) renderDrawer();
+      if (S.upd.dlg) { $('#upd-body').dataset.mode = ''; renderUpdateDialog(); }
+      renderUpdateSettings();
       menu.close(false);
       if (S.form) renderSettingsDynamic();
     });
   }
 
+  /* Native title bar (SPEC v0.4 §2): dark flag + caption colour = the top bar background. Best effort. */
+  const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+  /** "rgb(30, 31, 34)" / "rgb(30 31 34 / 1)" / "color(srgb 0.1 0.2 0.3)" → "#1e1f22"; null if not opaque or unknown. */
+  function cssColorHex(value) {
+    const s = String(value || '').trim();
+    let m = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/i.exec(s);
+    let rgb = m && [m[1], m[2], m[3]].map(Number);
+    if (!m) {
+      m = /^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+%?))?\s*\)$/i.exec(s);
+      rgb = m && [m[1], m[2], m[3]].map((v) => Number(v) * 255);
+    }
+    if (!m) return null;
+    const alpha = m[4] == null ? 1 : m[4].endsWith('%') ? parseFloat(m[4]) / 100 : Number(m[4]);
+    if (!(alpha >= 0.99)) return null;
+    return '#' + rgb.map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
+  }
+  function syncWindowTheme() {
+    const params = { dark: darkQuery.matches };
+    const caption = cssColorHex(getComputedStyle($('.topbar')).backgroundColor);
+    if (caption) params.caption = caption;
+    api('setWindowTheme', params).catch(() => { /* older backend / not Windows: the title bar keeps its colour */ });
+  }
+
   async function init() {
     i18n.apply();
     bind();
+    syncWindowTheme();
+    darkQuery.addEventListener('change', syncWindowTheme);
     renderChrome();
     await prefs.load(); // before the first render, so remembered choices apply from the start
     applyPrefs();
     window.addEventListener('pagehide', () => prefs.flushNow());
     showView('board');
     loadState();
+    loadUpdateStatus(true); // "Updated to" toast, prompt dialog
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

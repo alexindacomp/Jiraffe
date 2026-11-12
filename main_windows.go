@@ -27,6 +27,7 @@ import (
 	"jiraffe/internal/jira"
 	"jiraffe/internal/scheduler"
 	"jiraffe/internal/state"
+	"jiraffe/internal/update"
 	"jiraffe/internal/webui"
 	"jiraffe/internal/winapi"
 )
@@ -40,6 +41,19 @@ const (
 	// the tray callback uses WM_APP+1).
 	msgDispatch = winapi.WMApp + 2 // run queued closures on the UI thread
 	msgShow     = winapi.WMApp + 3 // another instance asks us to show the window
+
+	// maxPid bounds --wait-pid (Windows process ids are DWORDs, in practice
+	// far below this).
+	maxPid = 1 << 30
+
+	// webviewClass is the window class go-webview2 registers.
+	webviewClass = "webview"
+
+	// Background of the webview before the page paints, as the
+	// WEBVIEW2_DEFAULT_BACKGROUND_COLOR value (0xAARRGGBB): the --bg token of
+	// ui/app.css (light #f7f5ef, dark #1e1f22), so opening never flashes white.
+	webviewBgLight = "0xFFF7F5EF"
+	webviewBgDark  = "0xFF1E1F22"
 )
 
 func init() {
@@ -53,6 +67,8 @@ func run(args []string) int {
 	fs.SetOutput(io.Discard)
 	minimized := fs.Bool("minimized", false, "start in the tray without a window")
 	previewOut := fs.String("worklog-preview", "", "write today's worklog preview JSON to this file and exit")
+	updatedFrom := fs.String("updated-from", "", "started by the updater of this version")
+	waitPid := fs.Int("wait-pid", 0, "wait up to 15 s for this process (the updated instance) to exit")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -65,10 +81,33 @@ func run(args []string) int {
 		log.SetOutput(io.Discard)
 	}
 	log.SetFlags(log.LstdFlags)
-	log.Printf("Jiraffe %s starting (minimized=%v, preview=%v)", app.Version, *minimized, *previewOut != "")
+	log.Printf("Jiraffe %s starting (minimized=%v, preview=%v, updatedFrom=%q)", app.Version, *minimized, *previewOut != "", *updatedFrom)
 
 	if *previewOut != "" {
 		return headlessPreview(dataDir, *previewOut)
+	}
+
+	// --updated-from is only trusted as a version; anything else is ignored.
+	if *updatedFrom != "" {
+		if v, ok := update.ParseVersion(*updatedFrom); ok {
+			*updatedFrom = v.String()
+		} else {
+			log.Printf("ignoring --updated-from %q: not a version", *updatedFrom)
+			*updatedFrom = ""
+		}
+	}
+	// After an update the previous instance is still exiting: wait for it.
+	// The single-instance mutex below decides in any case, so a PID that
+	// was reused by another process never blocks the start.
+	if pid := *waitPid; pid > 0 && pid <= maxPid && pid != os.Getpid() {
+		switch err := winapi.WaitProcessExit(uint32(pid), 15*time.Second); {
+		case errors.Is(err, winapi.ErrWaitTimeout):
+			log.Printf("the previous instance (pid %d) is still running after 15 s; relying on the single-instance check", pid)
+		case err != nil:
+			log.Printf("cannot wait for the previous instance: %v; relying on the single-instance check", err)
+		}
+	} else if pid != 0 {
+		log.Printf("ignoring --wait-pid %d", pid)
 	}
 
 	first, err := winapi.AcquireSingleInstance(mutexName)
@@ -113,8 +152,12 @@ func run(args []string) int {
 	}
 
 	u := &ui{html: html, nonce: nonce, dataDir: dataDir, mainThread: windows.GetCurrentThreadId()}
-	a := app.New(cfg, st, &platform{u: u, t: transport}, scheduler.SystemClock{}, u.emit)
+	plat := &platform{u: u, t: transport}
+	a := app.New(cfg, st, plat, scheduler.SystemClock{}, u.emit)
 	u.app = a
+	if updTransport := enableUpdates(a, plat); updTransport != nil {
+		defer updTransport.Close()
+	}
 
 	tray, err := winapi.NewTray(trayClass, appName, winapi.TrayHandlers{
 		OnOpen:         u.show,
@@ -133,6 +176,9 @@ func run(args []string) int {
 	u.tray = tray
 
 	a.Start()
+	if *updatedFrom != "" {
+		a.UpdatedFrom(*updatedFrom)
+	}
 	u.wantShow = !*minimized
 	u.loop()
 
@@ -140,6 +186,43 @@ func run(args []string) int {
 	tray.Remove()
 	a.Stop(5 * time.Second)
 	return 0
+}
+
+// enableUpdates gives the app its updater: a WinHTTP session of its own
+// (no Jira token or headers; redirects are followed by the update package
+// only to allow-listed GitHub hosts), the real file system and process
+// start. It returns the transport to close at exit (nil = not enabled).
+func enableUpdates(a *app.App, plat *platform) *winapi.Transport {
+	exe, err := os.Executable()
+	local := os.Getenv("LOCALAPPDATA")
+	if err != nil || local == "" {
+		log.Printf("updates disabled: exe %q (%v), LOCALAPPDATA %q", exe, err, local)
+		return nil
+	}
+	t, err := winapi.NewTransport(appName + "/" + app.Version)
+	if err != nil {
+		log.Printf("updates disabled: %v", err)
+		return nil
+	}
+	a.EnableUpdates(update.New(update.Config{
+		Getter:  updateGetter{t},
+		FS:      update.OSFS{},
+		Starter: update.OSStarter{},
+		Exe:     exe,
+		Dir:     filepath.Join(local, appName, "update"),
+	}), plat)
+	return t
+}
+
+// updateGetter adapts the WinHTTP transport to update.Getter.
+type updateGetter struct{ t *winapi.Transport }
+
+func (g updateGetter) Get(ctx context.Context, url string, headers map[string]string, w io.Writer, limit int64) (int, string, error) {
+	status, loc, err := g.t.Stream(ctx, url, headers, w, limit)
+	if errors.Is(err, winapi.ErrBodyTooLarge) {
+		err = update.ErrTooLarge
+	}
+	return status, loc, err
 }
 
 // ui owns the main-thread state: the tray, the (optional) webview window and
@@ -151,6 +234,9 @@ type ui struct {
 	mainThread uint32
 	app        *app.App
 	tray       *winapi.Tray
+
+	// shown mirrors "a window is open" for other goroutines (WindowOpen).
+	shown atomic.Bool
 
 	// main thread only
 	w          webview2.WebView
@@ -216,6 +302,7 @@ func (u *ui) loop() {
 			}
 			u.w.Run() // returns when the window is closed (PostQuitMessage)
 			u.w, u.hwnd = nil, 0
+			u.shown.Store(false)
 			continue
 		}
 		winapi.Pump(func() bool { return u.quit || u.wantShow })
@@ -255,17 +342,47 @@ func (u *ui) openWindow() bool {
 		lang = "en"
 	}
 	_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--lang="+lang)
-	w := webview2.NewWithOptions(webview2.WebViewOptions{
-		DataPath:  filepath.Join(os.Getenv("LOCALAPPDATA"), appName, "WebView2", lang),
-		AutoFocus: true,
-		WindowOptions: webview2.WindowOptions{
-			Title:  appName,
-			Width:  uint(width),
-			Height: uint(height),
-			IconId: winapi.AppIconID,
-			Center: true,
-		},
-	})
+	// The webview's background before the page paints; WebView2 reads it
+	// when the controller is created.
+	dark := winapi.AppsUseDarkTheme()
+	bg := webviewBgLight
+	if dark {
+		bg = webviewBgDark
+	}
+	_ = os.Setenv("WEBVIEW2_DEFAULT_BACKGROUND_COLOR", bg)
+	var w webview2.WebView
+	create := func() {
+		w = webview2.NewWithOptions(webview2.WebViewOptions{
+			DataPath:  filepath.Join(os.Getenv("LOCALAPPDATA"), appName, "WebView2", lang),
+			AutoFocus: true,
+			WindowOptions: webview2.WindowOptions{
+				Title:  appName,
+				Width:  uint(width),
+				Height: uint(height),
+				IconId: winapi.AppIconID,
+				Center: true,
+			},
+		})
+	}
+	// go-webview2 creates and shows the window in one call: a dark system
+	// app theme is applied to the title bar from a creation hook, before
+	// the window is first shown (no light flash); the page refines it with
+	// setWindowTheme once loaded.
+	if dark {
+		matched, err := winapi.OnWindowCreate(webviewClass, func(hwnd uintptr) {
+			if err := winapi.SetDarkTitleBar(hwnd, true); err != nil {
+				log.Printf("dark title bar: %v", err)
+			}
+		}, create)
+		switch {
+		case err != nil:
+			log.Printf("window theme hook: %v", err)
+		case !matched && w != nil:
+			log.Printf("window theme hook: no %q window was created; the title bar stays light until the page sets it", webviewClass)
+		}
+	} else {
+		create()
+	}
 	if w == nil {
 		log.Printf("WebView2 runtime is not available")
 		winapi.MessageBox(appName, app.T(u.app.Language(), "noWebView2"), winapi.MBIconError)
@@ -283,6 +400,7 @@ func (u *ui) openWindow() bool {
 	w.Init(dropGuardJS)
 	w.SetHtml(u.html)
 	u.w, u.hwnd = w, uintptr(w.Window())
+	u.shown.Store(true)
 	winapi.BringToFront(u.hwnd)
 	return true
 }
@@ -444,6 +562,18 @@ func (p *platform) OpenURL(u string) error {
 
 func (p *platform) SetAutostart(enabled bool) error { return winapi.SetAutostart(appName, enabled) }
 
+// WindowOpen implements app.UpdateHost.
+func (p *platform) WindowOpen() bool { return p.u.shown.Load() }
+
+// Quit implements app.UpdateHost: the main loop ends, then run() removes
+// the tray icon and stops the app (scheduler, background work); the state
+// is saved on every change.
+func (p *platform) Quit() {
+	if !p.u.post(p.u.requestQuit) {
+		log.Printf("quit: UI thread is not available")
+	}
+}
+
 // AutostartEnabled implements app.AutostartReader.
 func (p *platform) AutostartEnabled() (bool, error) { return winapi.AutostartEnabled(appName) }
 
@@ -454,6 +584,27 @@ func (p *platform) Notify(title, text, url string) {
 		// without a URL it opens the main window.
 		p.u.balloonURL = url
 		p.u.tray.ShowBalloon(title, text)
+	})
+}
+
+// SetWindowTheme recolours the title bar of the open window on the UI
+// thread (the window handle is owned there); errors are logged, never
+// returned. Without a window nothing happens.
+func (p *platform) SetWindowTheme(t app.WindowTheme) {
+	p.u.post(func() {
+		if !p.u.windowOpen() {
+			return
+		}
+		hwnd := p.u.hwnd
+		if err := winapi.SetDarkTitleBar(hwnd, t.Dark); err != nil {
+			log.Printf("dark title bar: %v", err)
+		}
+		caption := winapi.CaptionColorDefault
+		if c := t.Caption; c != nil {
+			caption = winapi.ColorRef(c.R, c.G, c.B)
+		}
+		_ = winapi.SetCaptionColor(hwnd, caption) // Windows 11 only
+		winapi.RedrawFrame(hwnd)
 	})
 }
 
@@ -473,6 +624,7 @@ func (headlessPlatform) OpenURL(string) error                  { return nil }
 func (headlessPlatform) SetAutostart(bool) error               { return nil }
 func (headlessPlatform) Notify(string, string, string)         {}
 func (headlessPlatform) SettingsChanged(config.Settings, bool) {}
+func (headlessPlatform) SetWindowTheme(app.WindowTheme)        {}
 
 // headlessPreview computes today's worklog preview and writes it as JSON to
 // out. JIRAFFE_URL / JIRAFFE_TOKEN override the saved configuration.

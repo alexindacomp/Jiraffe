@@ -39,6 +39,7 @@ type fakePlatform struct {
 	notices      []notice
 	opened       []string
 	autostartErr error
+	themes       []WindowTheme
 }
 
 func (p *fakePlatform) Transport() jira.Transport { return p.t }
@@ -50,6 +51,11 @@ func (p *fakePlatform) Notify(title, text, u string) {
 	p.mu.Unlock()
 }
 func (p *fakePlatform) SettingsChanged(config.Settings, bool) {}
+func (p *fakePlatform) SetWindowTheme(t WindowTheme) {
+	p.mu.Lock()
+	p.themes = append(p.themes, t)
+	p.mu.Unlock()
+}
 
 const worklogIssues = `[
  {"key":"A-1","fields":{"summary":"All day","status":{"id":"3","name":"In Progress","statusCategory":{"key":"indeterminate"}},

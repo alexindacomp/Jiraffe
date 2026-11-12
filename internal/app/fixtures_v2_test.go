@@ -38,6 +38,9 @@ type fx struct {
 	name, color             string   // epic name / colour
 	links                   []string // "out|in:relation:KEY:typ:cat"
 	subtasks                []string // "KEY:cat"
+	spent, estimate         int64    // own timespent / timeoriginalestimate in seconds (0 = null)
+	aggSpent, aggEstimate   int64    // aggregate (with sub-tasks) values; 0 = same as the own value
+	parent                  string   // parent issue key (sub-tasks)
 }
 
 func embedded(key, typ, cat string) string {
@@ -72,6 +75,23 @@ func (x fx) json() string {
 	if x.sp != 0 {
 		f = append(f, fmt.Sprintf(`"customfield_10130":%v`, x.sp))
 	}
+	orOwn := func(agg, own int64) int64 {
+		if agg != 0 {
+			return agg
+		}
+		return own
+	}
+	for _, t := range []struct {
+		name string
+		v    int64
+	}{{"timespent", x.spent}, {"timeoriginalestimate", x.estimate},
+		{"aggregatetimespent", orOwn(x.aggSpent, x.spent)}, {"aggregatetimeoriginalestimate", orOwn(x.aggEstimate, x.estimate)}} {
+		if t.v != 0 {
+			f = append(f, fmt.Sprintf(`%q:%d`, t.name, t.v))
+		} else {
+			f = append(f, fmt.Sprintf(`%q:null`, t.name))
+		}
+	}
 	if x.name != "" {
 		f = append(f, fmt.Sprintf(`"customfield_10105":%q,"customfield_10106":%q`, x.name, x.color))
 	}
@@ -92,6 +112,9 @@ func (x fx) json() string {
 		subs = append(subs, embedded(p[0], "sub", p[1]))
 	}
 	f = append(f, `"subtasks":[`+strings.Join(subs, ",")+`]`)
+	if x.parent != "" {
+		f = append(f, `"parent":`+embedded(x.parent, "task", "new"))
+	}
 	return fmt.Sprintf(`{"id":"%d","key":%q,"fields":{%s}}`, fxID(x.key), x.key, strings.Join(f, ","))
 }
 
