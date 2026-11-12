@@ -10,15 +10,35 @@ issues, creating and editing issues (rich-text editor for HTML descriptions),
 a per-project epic time dashboard and automatic updates. One
 self-contained `jiraffe.exe` (Go, no CGO, WebView2 UI, about 4.6 MB). The full specification is in [SPEC.md](SPEC.md).
 
-## Download
+## Install
 
-**[⬇ jiraffe.exe](https://github.com/alexindacomp/Jiraffe/releases/latest/download/jiraffe.exe)** — latest release, Windows 10/11 x64, about 4.6 MB.
-All versions and changes: [Releases](https://github.com/alexindacomp/Jiraffe/releases).
+Windows 10/11 x64, about 4.5 MB. Requires the Microsoft Edge WebView2 Runtime
+(preinstalled on Windows 10/11). No admin rights needed.
 
-Put it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\Jiraffe\jiraffe.exe`
-(autostart points to the exe's current location), run it and enter your Jira URL
-and personal access token. Requires the Microsoft Edge WebView2 Runtime
-(preinstalled on Windows 10/11).
+**Option 1 — one command (recommended).** Open PowerShell (Win+X → Terminal)
+and run:
+
+```powershell
+irm https://github.com/alexindacomp/Jiraffe/releases/latest/download/install.ps1 | iex
+```
+
+It downloads the latest `jiraffe.exe`, checks its SHA-256, installs it to
+`%LOCALAPPDATA%\Programs\Jiraffe`, adds Start menu and desktop shortcuts and
+starts it ([scripts/install.ps1](scripts/install.ps1)). Because PowerShell
+downloads the file itself, Windows SmartScreen does not block the first start.
+Running the command again reinstalls the latest version.
+
+**Option 2 — download the exe.**
+**[⬇ jiraffe.exe](https://github.com/alexindacomp/Jiraffe/releases/latest/download/jiraffe.exe)**,
+put it somewhere permanent, e.g. `%LOCALAPPDATA%\Programs\Jiraffe\jiraffe.exe`
+(autostart points to the exe's current location), and run it. The exe is not
+code-signed, so on the first start Windows may say **"Windows protected your
+PC"**: click **More info → Run anyway**. This happens only once — later
+versions are installed by Jiraffe itself and are not checked by SmartScreen.
+
+Then enter your Jira URL and personal access token. Jiraffe updates itself:
+it checks GitHub releases at startup and asks before installing a new version
+(Settings → Updates). All versions and changes: [Releases](https://github.com/alexindacomp/Jiraffe/releases).
 
 Binaries are built by GitHub Actions ([.github/workflows/build.yml](.github/workflows/build.yml)),
 not committed to the repo. Every push to `master` and every pull request runs
@@ -32,7 +52,7 @@ git push origin v0.4.0
 
 The workflow builds `jiraffe.exe` with version 0.4.0, signs it and publishes the
 GitHub release `v0.4.0` (assets `jiraffe.exe`, `jiraffe.exe.sha256`,
-`jiraffe.exe.sig`) as the latest one, so the download link above serves it and
+`jiraffe.exe.sig`, `install.ps1`) as the latest one, so the download link above serves it and
 installed copies offer the update.
 
 **Release signing.** The release job runs in the GitHub environment `release`
