@@ -197,13 +197,16 @@
     ['RBI-1061', 'Аудит медленных запросов к отчётам', 'todo', 'task', 'Medium', 'me', 60 * 24, { sp: 3 }],
   ];
   // [from, link type, to]; type: [name, outward, inward]
-  const LT = { rel: ['Relates', 'relates to', 'relates to'], blocks: ['Blocks', 'blocks', 'is blocked by'], dup: ['Duplicate', 'duplicates', 'is duplicated by'] };
+  const LT = { rel: ['Relates', 'relates to', 'relates to'], blocks: ['Blocks', 'blocks', 'is blocked by'], dup: ['Duplicate', 'duplicates', 'is duplicated by'], clone: ['Cloners', 'clones', 'is cloned by'] };
+  const LT_IDS = { blocks: '10000', dup: '10002', rel: '10003', clone: '10100' }; // v0.6 getLinkTypes ids
   const LINKS = [
     ['RBI-1028', 'rel', 'RBI-1031'], ['RBI-1019', 'blocks', 'RBI-1040'], ['RBI-1042', 'rel', 'RBI-1040'],
     ['CMA-421', 'rel', 'CMA-412'], ['CMA-422', 'rel', 'CMA-412'], ['CMA-422', 'rel', 'CMA-420'],
     ['MB-78', 'blocks', 'MB-77'], ['MB-81', 'rel', 'MB-95'], ['EDS-233', 'rel', 'EDS-230'], ['EDS-231', 'rel', 'EDS-230'],
     ['EDS-241', 'blocks', 'EDS-240'], ['CMA-415', 'dup', 'CMA-399'], ['OPS-12', 'rel', 'RBI-1031'],
   ];
+  let linkSeq = 70000;
+  LINKS.forEach((l) => l.push(String(linkSeq++))); // [from, type, to, id]
 
   const recs = new Map();
   if (!flags.has('empty')) {
@@ -363,8 +366,8 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     if (r.type.kind === 'epic') { out.name = r.epicName || r.summary; out.color = r.epicColor; }
     return out;
   }
-  const linksOf = (key) => LINKS.filter(([a, , b]) => a === key || b === key).map(([a, t, b]) => ({
-    relation: a === key ? LT[t][1] : LT[t][2], other: a === key ? b : a,
+  const linksOf = (key) => LINKS.filter(([a, , b]) => a === key || b === key).map(([a, t, b, id]) => ({
+    id, relation: a === key ? LT[t][1] : LT[t][2], other: a === key ? b : a,
   })).filter((l) => recs.has(l.other));
 
   /* ---------- sprints / boards ---------- */
@@ -831,6 +834,33 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
      (field error + form-level errorMessages). */
   const HTML_PROJECTS = ['RBI', 'EDS'];
   const NO_EDIT = ['HR-7'];
+  /* v0.6 issue panel: Developer / Reviewer / QA Engineer (multi-user, "неназначено" placeholder when empty) and
+     Merge_requests / Branches (textarea, CRLF, the "Не заполнено" default) in RBI, EDS, MB and CMA (not epics).
+     EDS: Reviewer is not on the edit screen (read-only in the panel). RBI-1028: several MRs / branches, a URL token
+     with a trailing comma (linked without it, DR-37) and a "prefix:https://…" token (plain text). HR-7: no comment permission (forbidden_comment).
+     EDS-230: the first save (form or inline) gets edit_conflict. */
+  const DEV_PROJECTS = ['RBI', 'EDS', 'MB', 'CMA'];
+  const DEV_IDS = { developer: 'customfield_10410', qa: 'customfield_10411', reviewer: 'customfield_10412', mr: 'customfield_13619', branches: 'customfield_13702' };
+  const NO_COMMENT = ['HR-7'];
+  const PLACEHOLDER = { name: 'jira.unassigned', displayName: 'неназначено' };
+  const isPlaceholder = (u) => !!u && ['неназначено', 'не назначено', 'unassigned'].includes(String(u.displayName || u.name || '').trim().toLowerCase());
+  const realUsers = (list) => (list || []).filter((u) => u && u.name && !isPlaceholder(u)).map((u) => ({ name: u.name, displayName: u.displayName || u.name }));
+  const fieldText = (v) => { const x = String(v || '').replace(/\r\n?/g, '\n').trim(); return x.toLowerCase() === 'не заполнено' ? '' : x; };
+  const hasDev = (r) => DEV_PROJECTS.includes(r.key.split('-')[0]) && r.type.kind !== 'epic';
+  const DEV_DATA = {
+    'RBI-1028': {
+      developer: ['me', 'do'], reviewer: ['am'], qa: [],
+      mr: 'https://gitlab.rozetka.company/marketplace/front/-/merge_requests/6224\r\nhttps://gitlab.rozetka.company/marketplace/api/-/merge_requests/311 — ревью у Андрея\r\nсм. https://gitlab.rozetka.company/warranty/warranty-service-api/-/merge_requests/57, там миграции\r\nprefix:https://gitlab.rozetka.company/x/y/-/merge_requests/1',
+      branches: 'front: MF-8026/moderation-stages-chips-filters\r\nwarranty-service-api:WS-131\r\nhotfix/RBI-1028-cors',
+    },
+    'EDS-230': { developer: ['me'], reviewer: ['do'], qa: ['nb'], mr: 'https://gitlab.rozetka.company/eds/signing/-/merge_requests/88', branches: 'signing: EDS-230/sign-package\r\n' },
+    'MB-77': { developer: ['me'], reviewer: ['sk'], qa: ['nb', 'is'], mr: 'Не заполнено', branches: 'mobile-ios: MB-77/push' },
+  };
+  function commentFormatOf(r) {
+    const last = r.comments.slice(-10).filter((c) => String(c.body || '').trim());
+    if (!last.length) return HTML_PROJECTS.includes(r.key.split('-')[0]) ? 'html' : 'wiki';
+    return last.filter((c) => looksHtml(c.body)).length * 2 > last.length ? 'html' : 'wiki';
+  }
   const CONFLICT_KEY = 'EDS-230';
   let conflictDone = false;
   let createBusy = false; // a duplicate createIssue while one is in flight ⇒ busy
@@ -847,7 +877,11 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     components: 'Компоненты', fixVersions: 'Исправить в версиях', duedate: 'Срок исполнения', timetracking: 'Учёт времени',
     env: 'Среда', region: 'Регион и филиал', steps: 'Шаги воспроизведения', reporter: 'Автор',
     budget: 'Бюджет, ч', risk: 'Коэффициент риска', start: 'Начало работ',
+    developer: 'Developer', reviewer: 'Reviewer', qa: 'QA Engineer', mr: 'Merge_requests', branches: 'Branches',
   };
+  /** v0.6 FieldMeta.role (create and edit meta; other fields have none). */
+  const ROLES = { description: 'description', assignee: 'assignee', reporter: 'reporter', sp: 'storyPoints', devSp: 'devStoryPoints', qaSp: 'qaStoryPoints',
+    developer: 'developer', reviewer: 'reviewer', qa: 'qa', mr: 'mergeRequests', branches: 'branches' };
   const looksHtml = (s) => /<\/?(?:p|div|br|span|b|strong|i|em|u|s|code|pre|ul|ol|li|a|img|table|tr|td|th|h[1-6]|hr|blockquote|font)\b[^>]*>/i
     .test(String(s || '').replace(/\{(code|noformat)(?::[^}\n]*)?\}[\s\S]*?\{\1\}|\{\{[^\n]*?\}\}/g, ''));
   const projectTypes = (project) => {
@@ -860,11 +894,11 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       .map((sp) => ({ id: String(sp.id), name: sp.name, state: sp.state }));
   }
   /** FieldMeta list for a project / type (main fields in SPEC order, then the required extras). */
-  function metaFields(project, typeId) {
+  function metaFields(project, typeId, edit) {
     const ty = projectTypes(project).find((x) => x.id === typeId) || projectTypes(project)[0];
     const kind = ty.kind;
     const html = HTML_PROJECTS.includes(project);
-    const f = (key, id, k, extra) => Object.assign({ id, name: NAMES[key], kind: k, required: false, main: true }, extra || {});
+    const f = (key, id, k, extra) => Object.assign({ id, name: NAMES[key], kind: k, required: false, main: true }, ROLES[key] ? { role: ROLES[key] } : {}, extra || {});
     const out = [f('summary', 'summary', 'summary', { required: true, max: 255 }), f('description', 'description', 'description'),
       f('assignee', 'assignee', 'user'), f('priority', 'priority', 'priority', { options: PRIOS, default: { id: '3' } })];
     if (kind !== 'epic' && kind !== 'subtask') out.push(f('epic', 'customfield_10103', 'epic'));
@@ -885,6 +919,18 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     if (project === 'CMA' && ty.id === '10004') out.push(f('region', 'customfield_10400', 'unsupported', { required: true, main: false }));
     if (project === 'CMA' && ty.id === '10004') out.push(f('steps', 'customfield_10500', 'textarea', { required: true, main: false }));
     if (project === 'CMA' && ty.id === '10001') out.push(f('reporter', 'reporter', 'user', { required: true, main: false, default: { name: ME.name, displayName: ME.displayName } }));
+    if (edit) { // v0.6: the edit screen also has the reporter and, in DEV_PROJECTS, the development fields
+      const extra = [];
+      const rep0 = out.findIndex((x) => x.id === 'reporter');
+      extra.push(rep0 >= 0 ? out.splice(rep0, 1)[0] : f('reporter', 'reporter', 'user', { required: true }));
+      if (DEV_PROJECTS.includes(project) && kind !== 'epic') {
+        extra.push(f('developer', DEV_IDS.developer, 'users'));
+        if (project !== 'EDS') extra.push(f('reviewer', DEV_IDS.reviewer, 'users')); // EDS: read-only in the panel
+        extra.push(f('qa', DEV_IDS.qa, 'users'), f('mr', DEV_IDS.mr, 'textarea', { max: 32000 }), f('branches', DEV_IDS.branches, 'textarea', { max: 32000 }));
+      }
+      const at = out.findIndex((x) => x.main === false);
+      out.splice(at < 0 ? out.length : at, 0, ...extra);
+    }
     return { type: ty, fields: out, descriptionFormat: html ? 'html' : 'wiki' };
   }
   const hpd = () => settings.hoursPerDay || 8;
@@ -925,6 +971,12 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
         case 'customfield_900': v[f.id] = r.budget != null ? r.budget : 1234; break;
         case 'customfield_902': v[f.id] = r.risk != null ? r.risk : 0.25; break;
         case 'customfield_903': v[f.id] = r.start || '2026-11-20T09:30:15+02:00'; break;
+        case 'reporter': v[f.id] = r.reporter ? { name: r.reporter.name, displayName: r.reporter.displayName } : null; break;
+        case DEV_IDS.developer: v[f.id] = realUsers(r.developer); break;
+        case DEV_IDS.reviewer: v[f.id] = realUsers(r.reviewer); break;
+        case DEV_IDS.qa: v[f.id] = realUsers(r.qa); break;
+        case DEV_IDS.mr: v[f.id] = fieldText(r.mr); break;
+        case DEV_IDS.branches: v[f.id] = fieldText(r.branches); break;
         default:
       }
     });
@@ -988,6 +1040,14 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
         case 'customfield_902': r.risk = v == null ? null : Number(v); break;
         case 'customfield_903': r.start = v || null; break;
         case 'reporter': r.reporter = v ? Object.values(U).find((u) => u.name === (v.name || v)) || r.reporter : r.reporter; break;
+        // v0.6: an empty people field gets Jira's placeholder back; an empty text field its default
+        case DEV_IDS.developer: case DEV_IDS.reviewer: case DEV_IDS.qa: {
+          const list = (v || []).map((u) => Object.values(U).find((x) => x.name === u.name) || { name: u.name, displayName: u.displayName || u.name });
+          r[{ [DEV_IDS.developer]: 'developer', [DEV_IDS.reviewer]: 'reviewer', [DEV_IDS.qa]: 'qa' }[id]] = list.length ? list : [PLACEHOLDER];
+          break;
+        }
+        case DEV_IDS.mr: r.mr = v ? String(v).replace(/\n/g, '\r\n') : 'Не заполнено'; break;
+        case DEV_IDS.branches: r.branches = v ? String(v).replace(/\n/g, '\r\n') : 'Не заполнено'; break;
         default:
       }
       items.push({ field: f ? f.name : id, from: '', to: typeof v === 'string' ? v.slice(0, 60) : Array.isArray(v) ? v.map((x) => (typeof x === 'object' ? x.name || x.key || x.id : x)).join(', ') : v && typeof v === 'object' ? v.displayName || v.key || v.name || (PRIOS.find((p) => p.id === v.id) || {}).name || v.id || '' : String(v == null ? '' : v) });
@@ -1048,7 +1108,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       reporter: r.reporter, creator: r.reporter, created: r.created, updated: r.updated,
       labels: r.labels, components: r.components, fixVersions: r.fixVersions, priority: r.priority,
       timeTracking: tt, sprints: SPRINTS.filter((s) => r.sprints.includes(s.id)),
-      stories, children, links: linksOf(key).map((l) => ({ relation: l.relation, issue: toRef(rec(l.other), false) })),
+      stories, children, links: linksOf(key).map((l) => ({ id: l.id, relation: l.relation, issue: toRef(rec(l.other), false) })),
       comments: r.comments, changelog: r.changelog, watchers: r.watchers,
     };
     if (r.dueDate) det.dueDate = r.dueDate;
@@ -1058,7 +1118,27 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     if (r.qaStoryPoints != null) det.qaStoryPoints = r.qaStoryPoints;
     if (r.epic) det.epic = toRef(rec(r.epic));
     if (r.parent) det.parent = toRef(rec(r.parent), false);
+    if (hasDev(r)) {
+      devInit(r);
+      Object.assign(det, { developer: realUsers(r.developer), reviewer: realUsers(r.reviewer), qa: realUsers(r.qa), mergeRequests: fieldText(r.mr), branches: fieldText(r.branches) });
+    }
+    det.commentFormat = commentFormatOf(r);
     return det;
+  }
+
+  /** v0.6 development fields of a record, filled on first use (placeholders and defaults like Jira's). */
+  function devInit(r) {
+    if (r.mr !== undefined) return;
+    const x = DEV_DATA[r.key] || {};
+    const users = (list, def) => (list ? list.map((k) => U[k]) : def);
+    r.developer = users(x.developer, r.assignee ? [r.assignee] : [PLACEHOLDER]);
+    if (!r.developer.length) r.developer = [PLACEHOLDER];
+    r.reviewer = users(x.reviewer, [PLACEHOLDER]);
+    if (!r.reviewer.length) r.reviewer = [PLACEHOLDER];
+    r.qa = users(x.qa, [PLACEHOLDER]);
+    if (!r.qa.length) r.qa = [PLACEHOLDER];
+    r.mr = x.mr != null ? x.mr : 'Не заполнено';
+    r.branches = x.branches != null ? x.branches : 'Не заполнено';
   }
 
   const METHODS = {
@@ -1230,7 +1310,8 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       if (!r) throw new MockError('not_found', `issue ${p && p.key} not found`);
       const project = projOf(r);
       const pr = PROJECTS.find((x) => x.key === project) || { key: project, name: project };
-      const m = metaFields(project, typeIdOf(r));
+      const m = metaFields(project, typeIdOf(r), true);
+      if (hasDev(r)) devInit(r);
       const fields = NO_EDIT.includes(r.key) ? [] : m.fields;
       const desc = descOf(r);
       const format = looksHtml(desc) ? 'html' : desc.trim() ? 'wiki' : m.descriptionFormat;
@@ -1244,8 +1325,12 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     searchIssuesFor(p) {
       requireConfigured();
       const purpose = p && p.purpose;
-      if (purpose !== 'epic' && purpose !== 'parent') throw new MockError('bad_params', 'purpose must be epic or parent');
+      if (purpose !== 'epic' && purpose !== 'parent' && purpose !== 'link') throw new MockError('bad_params', 'purpose must be epic, parent or link');
       const q = String((p && p.query) || '').trim().toLowerCase();
+      if (purpose === 'link') {
+        return clone(all().filter((r) => !q || r.key.toLowerCase() === q || r.key.toLowerCase().startsWith(q) || r.summary.toLowerCase().includes(q))
+          .sort((a, b) => b.updated.localeCompare(a.updated)).slice(0, 20).map((r) => toRef(r)));
+      }
       return clone(all().filter((r) => projOf(r) === p.project && !isDone(r) && (purpose === 'epic' ? r.type.kind === 'epic' : r.type.kind !== 'subtask'))
         .filter((r) => !q || r.key.toLowerCase() === q || r.key.toLowerCase().startsWith(q) || r.summary.toLowerCase().includes(q) || String(r.epicName || '').toLowerCase().includes(q))
         .sort((a, b) => b.key.localeCompare(a.key, undefined, { numeric: true })).slice(0, 20).map((r) => toRef(r)));
@@ -1292,8 +1377,9 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
         r.changelog.unshift({ id: String(commentSeq++), author: U.am, created: r.updated, items: [{ field: 'summary', from: '', to: r.summary }, { field: 'priority', from: 'High', to: 'Highest' }] });
       }
       if (String((p && p.expectedUpdated) || '') !== r.updated) throw new MockError('edit_conflict', msg('Задачу изменили в Jira после того, как вы её открыли.', 'Задачу змінили в Jira після того, як ви її відкрили.', 'The issue was changed in Jira after you opened it.'));
-      const m = metaFields(projOf(r), typeIdOf(r));
+      const m = metaFields(projOf(r), typeIdOf(r), true);
       const values = (p && p.values) || {};
+      if (hasDev(r)) devInit(r);
       checkValues(m.fields, values, false);
       const items = applyValues(r, m.fields, values);
       const t0 = new Date(Math.max(Date.now(), new Date(r.updated).getTime() + 1000));
@@ -1304,6 +1390,72 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       // MB: the fields are saved, but the agile sprint move "fails" (contract: warning, still a success)
       if (projOf(r) === 'MB' && Object.prototype.hasOwnProperty.call(values, 'customfield_10107')) out.warning = msg('Спринт не изменён: доска BI DEV Agile board недоступна.', 'Спринт не змінено: дошка BI DEV Agile board недоступна.', 'Sprint not changed: the BI DEV Agile board is not available.');
       return out;
+    },
+    /* --- v0.6 issue panel --- */
+    searchUsers(p) {
+      requireConfigured();
+      const q = String((p && p.query) || '').trim().toLowerCase();
+      if (!q) return [];
+      return clone(Object.values(U).filter((u) => u.name.toLowerCase().includes(q) || u.displayName.toLowerCase().includes(q)).slice(0, 20));
+    },
+    openFieldLink(p) {
+      requireConfigured();
+      const r = rec(p && p.key);
+      if (!r) throw new MockError('not_found', `issue ${p && p.key} not found`);
+      if (hasDev(r)) devInit(r);
+      const field = p.field === 'mergeRequests' ? r.mr : p.field === 'branches' ? r.branches : null;
+      const u = String((p && p.url) || '');
+      // a whole token, or a token without trailing .,;:) (DR-37)
+      const ok = field != null && /^https?:\/\/[^\s/@]+(\/\S*)?$/i.test(u) && String(field).split(/\s+/).some((tok) => tok === u || tok.replace(/[.,;:)]+$/, '') === u);
+      if (!ok) throw new MockError('bad_params', 'the URL is not in the field');
+      console.info('[jiraffe mock] openFieldLink →', p.key, p.field, u); // eslint-disable-line no-console
+      return null;
+    },
+    getLinkTypes() {
+      requireConfigured();
+      return Object.entries(LT).map(([k, [name, outward, inward]]) => ({ id: LT_IDS[k], name, inward, outward }));
+    },
+    addIssueLink(p) {
+      requireConfigured();
+      const r = rec(p && p.key);
+      if (!r) throw new MockError('not_found', `issue ${p && p.key} not found`);
+      const type = Object.keys(LT_IDS).find((k) => LT_IDS[k] === String(p.typeId));
+      if (!type || (p.direction !== 'outward' && p.direction !== 'inward')) throw new MockError('bad_params', 'typeId / direction');
+      if (String(p.target || '').toUpperCase() === r.key) throw new MockError('bad_params', 'target must differ from key');
+      const target = rec(String(p.target || '').toUpperCase());
+      if (!target) throw new MockError('not_found', `issue ${p.target} not found`);
+      if (NO_EDIT.includes(r.key)) throw new MockError('forbidden_edit', msg('Нет прав на связывание этой задачи.', 'Немає прав на зв’язування цієї задачі.', 'You do not have permission to link this issue.'));
+      LINKS.push(p.direction === 'outward' ? [r.key, type, target.key, String(linkSeq++)] : [target.key, type, r.key, String(linkSeq++)]);
+      r.updated = rfc(new Date(Math.max(Date.now(), new Date(r.updated).getTime() + 1000)));
+      setTimeout(() => emit('board', {}), 30);
+      return null;
+    },
+    deleteIssueLink(p) {
+      requireConfigured();
+      const r = rec(p && p.key);
+      if (!r) throw new MockError('not_found', `issue ${p && p.key} not found`);
+      const i = LINKS.findIndex((l) => l[3] === String(p.linkId) && (l[0] === r.key || l[2] === r.key));
+      if (i < 0) throw new MockError('bad_params', 'the link does not belong to the issue');
+      if (NO_EDIT.includes(r.key)) throw new MockError('forbidden_edit', msg('Нет прав на изменение связей этой задачи.', 'Немає прав на зміну зв’язків цієї задачі.', 'You do not have permission to change links of this issue.'));
+      LINKS.splice(i, 1);
+      r.updated = rfc(new Date(Math.max(Date.now(), new Date(r.updated).getTime() + 1000)));
+      setTimeout(() => emit('board', {}), 30);
+      return null;
+    },
+    addComment(p) {
+      requireConfigured();
+      const r = rec(p && p.key);
+      if (!r) throw new MockError('not_found', `issue ${p && p.key} not found`);
+      if (p.format !== commentFormatOf(r)) throw new MockError('bad_params', `format must be ${commentFormatOf(r)}`);
+      const body = String(p.body || '').trim();
+      if (!body) throw new MockError('validation', msg('Комментарий пуст.', 'Коментар порожній.', 'The comment is empty.'), [{ field: 'body', message: msg('Напишите текст комментария.', 'Напишіть текст коментаря.', 'Write the comment text.') }]);
+      if (body.length > 32000) throw new MockError('validation', msg('Комментарий слишком длинный.', 'Коментар задовгий.', 'The comment is too long.'), []);
+      if (NO_COMMENT.includes(r.key)) throw new MockError('forbidden_comment', msg('Нет прав на комментирование этой задачи.', 'Немає прав на коментування цієї задачі.', 'You do not have permission to comment on this issue.'));
+      const at = rfc(now());
+      const c = { id: String(commentSeq++), author: ME, created: at, updated: at, body };
+      r.comments.push(c);
+      r.updated = rfc(new Date(Math.max(Date.now(), new Date(r.updated).getTime() + 1000)));
+      return clone(c); // no event (SPEC v0.6)
     },
     setWindowTheme(p) { // v0.4: the native title bar; nothing to paint in a browser
       if (!p || typeof p.dark !== 'boolean' || (p.caption != null && !/^#[0-9a-f]{6}$/i.test(String(p.caption)))) throw new MockError('bad_params', 'dark must be a boolean, caption "#rrggbb"');

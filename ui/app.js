@@ -297,24 +297,30 @@
     },
   };
 
-  /** safeDefault: the cancel button ("Keep editing") is the primary, focused choice; OK is the destructive one. */
-  function confirmDialog({ title, body, okLabel, cancelLabel, safeDefault }) {
+  /** safeDefault: the cancel button ("Keep editing") is the primary, focused choice; OK is the destructive one.
+      extraLabel: a third, primary and focused choice (e.g. "Save"); resolves 'extra'. */
+  function confirmDialog({ title, body, okLabel, cancelLabel, safeDefault, extraLabel }) {
     const dlg = $('#dlg-confirm');
     const cancel = $('#dlg-confirm [data-action="cancel"]');
+    const extra = $('#confirm-extra');
+    extra.hidden = !extraLabel;
+    dlg.classList.toggle('is-wide', !!extraLabel); // DR-32: three buttons on one line
+    extra.textContent = extraLabel || '';
+    if (extraLabel) safeDefault = true; // OK (discard) is never the primary next to it
     $('#confirm-title').textContent = title;
     $('#confirm-body').textContent = body;
     $('#confirm-ok').textContent = okLabel || t('common.ok');
     cancel.textContent = cancelLabel || t('common.cancel');
     $('#confirm-ok').className = safeDefault ? 'btn' : 'btn btn-primary';
-    cancel.className = safeDefault ? 'btn btn-primary' : 'btn';
+    cancel.className = safeDefault && !extraLabel ? 'btn btn-primary' : 'btn';
     return new Promise((resolve) => {
       let done = false;
       const finish = (v) => { if (done) return; done = true; resolve(v); layers.close(dlg); };
       dlg.onclick = (e) => {
         const a = e.target.closest('[data-action]');
-        if (a) finish(a.dataset.action === 'ok');
+        if (a) finish(a.dataset.action === 'extra' ? 'extra' : a.dataset.action === 'ok');
       };
-      layers.open(dlg, { focus: safeDefault ? '[data-action="cancel"]' : '#confirm-ok', onClose: () => { if (!done) { done = true; resolve(false); } } });
+      layers.open(dlg, { focus: extraLabel ? '#confirm-extra' : safeDefault ? '[data-action="cancel"]' : '#confirm-ok', onClose: () => { if (!done) { done = true; resolve(false); } } });
     });
   }
 
@@ -1587,8 +1593,7 @@
     if (S.view === 'sprints') loadSprints({ silent: !!S.sp.data }); else S.sp.stale = true;
     invalidateEpics();
     if (S.view === 'epics' && S.ep.data) loadEpics({ silent: true }); else S.ep.stale = true;
-    detailCache.delete(key);
-    if (S.drawer && drawerKey() === key) loadDetail({ silent: true });
+    ieAfterChange(key, null); // the issue's `updated` changed: a cached edit meta is stale
   }
 
   /** Optimistically changes the status everywhere, runs the transition, reverts on error. */
@@ -2352,6 +2357,7 @@
     const d = S.drawer;
     if (d) {
       if (drawerKey() === key) return;
+      if (isInline()) { ieLeave().then((ok) => { if (ok) openIssue(key, seed, { push, returnFocus }); }); return; } // CR-21
       if (push) d.stack.push({ key, seed });
       else d.stack = [{ key, seed }];
       d.tab = 'details';
@@ -2362,7 +2368,8 @@
     renderDrawer();
     layers.open($('#drawer'), {
       focus: '#drawer-title',
-      onClose: () => { S.drawer = null; detailCache.clear(); menu.close(false); },
+      onDismiss: () => ieGuard(() => layers.close($('#drawer'))),
+      onClose: () => { ieDispose(); S.drawer = null; detailCache.clear(); menu.close(false); },
       restoreFocus: () => (returnFocus && returnFocus()) || $(`#${activeSectionId()} [data-focus-key="${CSS.escape(key)}"]`),
     });
     loadDetail();
@@ -2371,6 +2378,7 @@
   function drawerBack() {
     const d = S.drawer;
     if (!d || d.stack.length < 2) return;
+    if (isInline()) { ieLeave().then((ok) => { if (ok) drawerBack(); }); return; }
     d.stack.pop();
     d.tab = 'details';
     loadDetail({ navigated: true });
@@ -2394,6 +2402,7 @@
       d.editLoading = false;
     }
     if (S.drawer !== d || drawerKey() !== key) return;
+    ieStoreMeta(key, meta);
     if (meta && !(Array.isArray(meta.fields) && meta.fields.length)) {
       S.noEditKeys.add(key);
       toast(t('cf.noPermission'));
@@ -2434,13 +2443,14 @@
     return html`<span class="person">${avatar(name, 'avatar-xs')}<span>${name}</span></span>`;
   }
 
-  function relRow(ref) {
+  function relRow(ref, after) {
     if (!ref || !ref.key) return '';
+    const tail = after && typeof after === 'object' ? after : '';
     const done = catOf(ref.status) === 'done';
     const tone = ref.color || ref.name ? epicTone(ref.color, ref.key) : null;
-    return html`<li><button type="button" class="rel-row${ref.mine ? ' is-mine' : ''}${done ? ' is-done' : ''}" data-open-key="${ref.key}"${tone ? html` data-epic="${tone}"` : ''}>
+    return html`<li${tail ? html` class="rel-li"` : ''}><button type="button" class="rel-row${ref.mine ? ' is-mine' : ''}${done ? ' is-done' : ''}" data-open-key="${ref.key}"${tone ? html` data-epic="${tone}"` : ''}>
       ${ref.type ? typeIcon(ref.type) : ''}<span class="card-key">${ref.key}</span><span class="rel-sum">${ref.name && ref.name !== ref.summary ? html`<strong>${ref.name}</strong> · ` : ''}${ref.summary || ''}</span>${ref.assignee ? assigneeAvatar(ref.assignee) : ''}${statusPill(ref.status)}
-    </button></li>`;
+    </button>${tail}</li>`;
   }
   function relSection(id, title, refs) {
     if (!refs || !refs.length) return '';
@@ -2452,8 +2462,11 @@
     const num = (v) => (v == null || v === '' ? null : Number(v));
     const orig = num(tt.originalSeconds); const rem = num(tt.remainingSeconds); const spent = num(tt.spentSeconds);
     const sp = det.storyPoints != null ? det.storyPoints : det.issue.storyPoints;
-    const points = [['drawer.storyPoints', sp], ['drawer.devStoryPoints', det.devStoryPoints], ['drawer.qaStoryPoints', det.qaStoryPoints]]
-      .filter(([, v]) => v != null && v !== '' && Number.isFinite(Number(v)));
+    const key = drawerKey();
+    const valued = (v) => v != null && v !== '' && Number.isFinite(Number(v));
+    // v0.6: a row per points field the issue has (a value, or the field in the edit meta); SP until the meta is known
+    const points = [['storyPoints', sp, true], ['devStoryPoints', det.devStoryPoints], ['qaStoryPoints', det.qaStoryPoints]]
+      .filter(([slot, v, always]) => { const st = ieSlotState(key, slot); return valued(v) || st === 'edit' || (always && st === 'unknown'); });
     if (orig == null && rem == null && spent == null && !points.length) return '';
     const max = Math.max(orig || 0, (spent || 0) + (rem || 0), 1);
     const row = (cls, label, sec, str) => (sec == null && !str ? '' : html`<div class="est-row ${cls}">
@@ -2465,7 +2478,7 @@
         ${row('est-orig', t('drawer.estOriginal'), orig, tt.original)}
         ${row('est-spent', t('drawer.estSpent'), spent, tt.spent)}
         ${row('est-rem', t('drawer.estRemaining'), rem, tt.remaining)}
-        ${points.map(([key, v]) => html`<div class="est-row est-sp"><span class="est-label">${t(key)}</span><span class="est-sp-val">${spBadge(Number(v), t(key))}</span></div>`)}
+        ${points.map(([slot, v]) => html`<div class="est-row est-sp"><span class="est-label" id="ie-l-${slot}">${t('drawer.' + slot)}</span>${ieValue(slot, t('drawer.' + slot), valued(v) ? html`<span class="est-sp-val">${spBadge(Number(v), t('drawer.' + slot))}</span>` : html`<span class="muted">—</span>`)}</div>`)}
       </div></section>`;
   }
 
@@ -2485,17 +2498,17 @@
 
   function detailsHTML(det) {
     const is = det.issue;
-    const links = new Map();
-    det.links.forEach((l) => { if (!l || !l.issue) return; const r = l.relation || t('drawer.related'); if (!links.has(r)) links.set(r, []); links.get(r).push(l.issue); });
+    const people = (slot, list) => (list === undefined ? '' : html`<div><dt id="ie-l-${slot}">${t('drawer.' + slot)}</dt><dd>${ieValue(slot, t('drawer.' + slot), peopleHTML(list))}</dd></div>`);
     const sprints = det.sprints.length ? html`<section class="d-sec" aria-labelledby="d-sprints"><h3 id="d-sprints">${t('drawer.sprints')}</h3><ul class="sprint-chips" role="list">${det.sprints.map((s) => html`<li class="sprint-chip">${icon('sprint', 'icon-xs')}<span>${s.name}</span>${sprintStateBadge(s.state)}</li>`)}</ul></section>` : '';
     const dateRow = (label, iso, rel) => (iso ? html`<div><dt>${label}</dt><dd>${i18n.dateTime(iso)}${rel ? html` · ${relSpan(iso)}` : ''}</dd></div>` : '');
-    return html`
+    return html`${ieHints()}
       <section class="d-sec" aria-labelledby="d-desc"><h3 id="d-desc">${t('drawer.description')}</h3>
-        ${det.description && det.description.trim() ? html`<div data-wiki="desc"></div>` : html`<p class="empty-line">${t('drawer.noDescription')}</p>`}
+        ${ieValue('description', t('drawer.description'), det.description && det.description.trim() ? html`<div data-wiki="desc"></div>` : html`<p class="empty-line">${t('drawer.noDescription')}</p>`, { block: true, labelId: 'd-desc' })}
       </section>
       <dl class="props props-grid">
-        <div><dt>${t('issue.assignee')}</dt><dd>${personHTML(is.assignee)}</dd></div>
-        <div><dt>${t('issue.reporter')}</dt><dd>${personHTML(det.reporter, 'issue.nobody')}</dd></div>
+        <div><dt id="ie-l-assignee">${t('issue.assignee')}</dt><dd>${ieValue('assignee', t('issue.assignee'), personHTML(is.assignee))}</dd></div>
+        <div><dt id="ie-l-reporter">${t('issue.reporter')}</dt><dd>${ieValue('reporter', t('issue.reporter'), personHTML(det.reporter, 'issue.nobody'))}</dd></div>
+        ${people('developer', det.developer)}${people('reviewer', det.reviewer)}${people('qa', det.qa)}
         <div><dt>${t('issue.priority')}</dt><dd>${nameOf(det.priority || is.priority) ? html`<span class="person">${priorityIcon(det.priority || is.priority)}<span>${nameOf(det.priority || is.priority)}</span></span>` : '—'}</dd></div>
         <div><dt>${t('issue.type')}</dt><dd>${is.type ? typeBadge(is.type) : '—'}</dd></div>
         <div><dt>${t('issue.project')}</dt><dd>${projectOf(is) || '—'}</dd></div>
@@ -2505,14 +2518,14 @@
         ${dateRow(t('issue.updated'), det.updated || is.updated, true)}
         ${det.watchers != null ? html`<div><dt>${t('issue.watchers')}</dt><dd>${det.watchers}</dd></div>` : ''}
       </dl>
+      ${developmentHTML(det)}
       ${estimatesHTML(det)}
       ${sprints}
       ${det.epic ? relSection('d-epic', t('drawer.epic'), [det.epic]) : ''}
       ${det.parent ? relSection('d-parent', t('drawer.parent'), [det.parent]) : ''}
       ${relSection('d-stories', t('drawer.stories'), det.stories)}
       ${relSection('d-children', childrenTitle(det), det.children)}
-      ${links.size ? html`<section class="d-sec" aria-labelledby="d-links"><h3 id="d-links">${t('drawer.links')}<span class="d-count">${det.links.length}</span></h3>
-        ${[...links].map(([rel, refs]) => html`<h4 class="d-sub">${rel}</h4><ul class="rel-list" role="list">${refs.map(relRow)}</ul>`)}</section>` : ''}
+      ${linksHTML(det)}
       ${det.labels.length || det.components.length || det.fixVersions.length ? html`<dl class="taglines">
         ${chipsSection('d-labels', t('drawer.labels'), det.labels)}
         ${chipsSection('d-components', t('drawer.components'), det.components)}
@@ -2521,14 +2534,15 @@
   }
 
   function commentsHTML(det) {
-    if (!det.comments.length) return stateBlock({ iconName: 'message', title: t('drawer.noComments') });
+    const composer = html`<div data-composer></div>`; // the persistent composer goes here (renderDrawer)
+    if (!det.comments.length) return html`${stateBlock({ iconName: 'message', title: t('drawer.noComments') })}${composer}`;
     return html`<ol class="comments" role="list">${det.comments.map((c, i) => {
       const who = (c.author && (c.author.displayName || c.author.name)) || t('issue.nobody');
       const edited = c.updated && c.created && c.updated !== c.created;
-      return html`<li class="comment">${avatar(who, 'avatar-sm')}<div class="comment-main">
+      return html`<li class="comment" id="cmt-${domId(String(c.id != null ? c.id : i))}" tabindex="-1">${avatar(who, 'avatar-sm')}<div class="comment-main">
         <div class="comment-head"><span class="comment-author">${who}</span>${relSpan(c.created, '', 'comment-time')}${edited ? html`<span class="muted">· ${t('drawer.edited')}</span>` : ''}</div>
         <div data-wiki="c${i}"></div></div></li>`;
-    })}</ol>`;
+    })}</ol>${composer}`;
   }
 
   const FIELD_KEYS = { status: 'issue.status', assignee: 'issue.assignee', priority: 'issue.priority', resolution: 'issue.resolution', summary: 'drawer.fieldSummary', description: 'drawer.description', labels: 'drawer.labels', component: 'drawer.components', 'fix version': 'drawer.versions', sprint: 'drawer.sprintField', 'story points': 'drawer.storyPoints', 'epic link': 'drawer.epic', link: 'drawer.links', issuetype: 'issue.type', reporter: 'issue.reporter', duedate: 'issue.due', timeestimate: 'drawer.estRemaining', timeoriginalestimate: 'drawer.estOriginal', timespent: 'drawer.estSpent' };
@@ -2597,7 +2611,7 @@
 
     const prev = d.stack.length > 1 ? d.stack[d.stack.length - 2] : null;
     const tabLabel = (tab) => tab === 'comments' && det ? t('drawer.tabCommentsN', { n: det.comments.length }) : t('drawer.tab.' + tab);
-    setHTML(el, html`<div class="drawer-panel" data-type="${typeVisual(is.type)}">
+    const kept = ieKeepNodes(el, () => setHTML(el, html`<div class="drawer-panel" data-type="${typeVisual(is.type)}">
       <header class="drawer-head">
         ${prev ? html`<button type="button" class="icon-btn" data-action="back" aria-label="${t('drawer.back', { key: prev.key })}" title="${t('drawer.back', { key: prev.key })}">${icon('arrow-left')}</button>` : ''}
         <div class="drawer-crumbs">${is.type ? typeIcon(is.type) : ''}<span class="card-key">${is.key}</span>${d.loading && det ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : ''}</div>
@@ -2613,12 +2627,12 @@
       </div>
       <div class="tabs" role="tablist" aria-label="${t('drawer.tabsLabel')}">${DRAWER_TABS.map((tab) => html`<button type="button" role="tab" class="tab" id="dtab-${tab}" data-tab="${tab}" aria-selected="${d.tab === tab ? 'true' : 'false'}" aria-controls="dpanel" tabindex="${d.tab === tab ? '0' : '-1'}">${tabLabel(tab)}</button>`)}</div>
       <div class="drawer-body" id="dpanel" role="tabpanel" aria-labelledby="dtab-${d.tab}" tabindex="0" aria-busy="${d.loading ? 'true' : 'false'}">${body}</div>
-    </div>`);
+    </div>`), top.key, det);
     if (det) fillWiki(el, det);
     const nb = $('.drawer-body', el);
     if (nb) nb.scrollTop = scrollTop;
     if (navigated) $('#drawer-title').focus({ preventScroll: true });
-    else if (hadFocus) {
+    else if (hadFocus && !kept) {
       const target = (focusSel && el.querySelector(focusSel)) || $('#drawer-title');
       if (target && !target.disabled) target.focus({ preventScroll: true }); else $('#drawer-title').focus({ preventScroll: true });
     }
@@ -2643,24 +2657,42 @@
   function onDrawerClick(e) {
     const d = S.drawer;
     if (!d) return;
+    if (isInline() && S.cf.root.contains(e.target)) return; // the inline editor's own handlers (onCf*)
+    const flink = e.target.closest('[data-flink]');
+    if (flink) { openFieldLink(flink.dataset.flink, flink.dataset.flinkUrl); return; }
+    const copy = e.target.closest('[data-copy]');
+    if (copy) { copyText(copy.dataset.copy); return; }
+    const del = e.target.closest('[data-link-del]');
+    if (del) { linkRemove(del); return; }
+    const pencil = e.target.closest('[data-ie-edit]');
+    if (pencil) { ieOpen(pencil.dataset.ieEdit); return; }
     const statusBtn = e.target.closest('[data-status-menu]');
     if (statusBtn) { openStatusMenu(statusBtn); return; }
     const tab = e.target.closest('[data-tab]');
     if (tab) { selectTab(tab.dataset.tab, true); return; }
     const rel = e.target.closest('[data-open-key]');
-    if (rel) { openIssue(rel.dataset.openKey, seedFromDetail(rel.dataset.openKey), { push: true }); return; }
+    if (rel) { const k = rel.dataset.openKey; ieGuard(() => openIssue(k, seedFromDetail(k), { push: true })); return; }
     const url = e.target.closest('[data-url]');
     if (url) { openUrl(url.dataset.url); return; }
     const a = e.target.closest('[data-action]');
-    if (!a) return;
+    if (!a) {
+      // a click on a simple value (people, points) edits it; block values (description, MRs, branches) keep text selection
+      const row = e.target.closest('.ie-val');
+      if (row && !row.classList.contains('is-block') && !row.classList.contains('is-ro') && !e.target.closest('a, button') && !String(window.getSelection() || '').trim()) ieOpen(row.dataset.ie);
+      return;
+    }
     switch (a.dataset.action) {
-      case 'close': layers.close($('#drawer')); break;
-      case 'back': drawerBack(); break;
+      case 'close': ieGuard(() => layers.close($('#drawer'))); break;
+      case 'back': ieGuard(drawerBack); break;
       case 'detail-retry': loadDetail(); break;
       case 'edit':
         if (a.getAttribute('aria-disabled') === 'true') toast(t('cf.noPermission'));
-        else editFromDrawer();
+        else ieGuard(editFromDrawer);
         break;
+      case 'link-add': ieOpen('link'); break;
+      case 'cm-post': cmPost(); break;
+      case 'cm-cancel': cmCancel(); break;
+      case 'cm-preview': if (d.composer) cmTogglePreview(d.composer); break;
       case 'open-jira': {
         const cur = (d.detail && d.detail.issue) || findIssueAnywhere(drawerKey()) || {};
         openUrl(cur.url);
@@ -2670,6 +2702,14 @@
   }
 
   function onDrawerKey(e) {
+    if (isInline() && S.cf.root.contains(e.target)) return; // handled by onCfKey
+    const d = S.drawer;
+    if (e.target.classList && e.target.classList.contains('ie-val') && (e.key === 'Enter' || e.key === 'F2') && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      ieOpen(e.target.dataset.ie);
+      return;
+    }
+    if (d && d.composer && d.composer.el.contains(e.target) && e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); cmPost(); return; }
     const tab = e.target.closest && e.target.closest('[role="tab"]');
     if (tab) {
       const i = DRAWER_TABS.indexOf(tab.dataset.tab);
@@ -2677,7 +2717,7 @@
       if (go != null) { e.preventDefault(); selectTab(DRAWER_TABS[(go + DRAWER_TABS.length) % DRAWER_TABS.length], true); }
       return;
     }
-    if (e.key === 'Backspace' && e.altKey) { e.preventDefault(); drawerBack(); }
+    if (e.key === 'Backspace' && e.altKey) { e.preventDefault(); ieGuard(drawerBack); }
   }
 
   async function openUrl(url) {
@@ -2696,7 +2736,17 @@
   const CF_MULTI = new Set(['multiselect', 'components', 'versions', 'users']);
   const CF_KEEP_ON_SWITCH = ['summary', 'description', 'labels', 'assignee']; // SPEC: project / type change keeps these
   const DURATION = /^\s*(\d+(?:[.,]\d+)?\s*[wdhm]\s*)+$/i;
-  const cfId = (fid) => 'cf-' + domId(fid);
+  const cfId = (fid) => ((S.cf && S.cf.idp) || 'cf-') + domId(fid);
+  /** The current form's root: the dialog body, or an inline editor in the issue panel (v0.6: S.cf.mode 'inline'). */
+  const cfRoot = () => (S.cf && S.cf.root) || $('#cf-body');
+  /** Announces through the dialog's live region, or the app's one for inline editors. */
+  const cfLive = (text) => { const el = S.cf && S.cf.mode === 'inline' ? $('#app-live') : $('#cf-live'); if (el) el.textContent = text; };
+  const cfEditing = (cf) => cf.mode !== 'create'; // the edit form and inline editors work on an existing issue
+  const isAssigneeField = (f) => (f.role ? f.role === 'assignee' : f.id === 'assignee');
+  /** Jira's placeholder for an empty multi-user field (display only; SPEC v0.6). */
+  const isPlaceholderUser = (u) => !!u && /^(неназначено|не назначено|unassigned)$/i.test(String(u.displayName || u.name || '').trim());
+  /** The form engine's events: the dialog's form, or the open inline editor (never both). */
+  const cfOwns = (e) => !!S.cf && (S.cf.mode === 'inline' ? !!S.cf.root && S.cf.root.contains(e.target) : $('#dlg-issue').contains(e.target));
   /** A number as typed back: no grouping, full precision, the locale's decimal separator (1234 → "1234", 0.25 → "0,25"). */
   const cfNumText = (v) => (v == null || v === '' ? '' : nf({ useGrouping: false, maximumFractionDigits: 20 }).format(Number(v)));
   /** Parses typed numbers: spaces / NBSP (grouping) ignored, "," or "." as the decimal separator. */
@@ -2720,8 +2770,8 @@
     if (isEmptyVal(v)) return '';
     switch (kind) {
       case 'user': return v.name || '';
-      case 'users': return v.map((u) => u.name).sort().join('\n');
-      case 'epic': case 'parent': return v.key || '';
+      case 'users': return v.filter((u) => !isPlaceholderUser(u)).map((u) => u.name).sort().join('\n');
+      case 'epic': case 'parent': case 'issueLink': return v.key || '';
       case 'select': case 'priority': return v.id != null ? String(v.id) : '';
       case 'storyPoints': return typeof v === 'object' ? 'id:' + v.id : String(Number(v));
       case 'multiselect': case 'components': case 'versions': case 'labels': return [...v].map(String).sort().join('\n');
@@ -2963,9 +3013,11 @@
       case 'summary': case 'text': case 'epicName':
         control = html`<input class="input" type="text" ${a11y} maxlength="${f.max || (f.kind === 'summary' ? 255 : 255)}" value="${v || ''}" autocomplete="off">`;
         break;
-      case 'textarea':
-        control = html`<textarea class="input textarea" rows="3" ${a11y}>${v || ''}</textarea>`;
+      case 'textarea': {
+        const rows = cf.mode === 'inline' ? Math.min(10, Math.max(4, String(v || '').split('\n').length + 1)) : 3; // DR-33
+        control = html`<textarea class="input textarea" rows="${rows}" ${a11y}>${v || ''}</textarea>`;
         break;
+      }
       case 'description':
         if (cf.descriptionFormat === 'wiki') {
           const pv = cf.wikiPreview;
@@ -3008,16 +3060,19 @@
         break;
       }
       case 'users':
-        control = cfChips(f, id, a11y, (v || []).map((u) => ({ key: u.name, label: u.displayName || u.name })), t('cf.searchPeople'));
+        control = cfChips(f, id, a11y, (v || []).filter((u) => !isPlaceholderUser(u)).map((u) => ({ key: u.name, label: u.displayName || u.name })), t('cf.searchPeople'));
         break;
       case 'user': {
         control = cfCombo(f, id, a11y, v ? v.displayName || v.name : '', t('cf.searchPeople'), !!v);
         const self = me();
-        control = html`${control}<div class="cf-quick">${self && (!v || v.name !== self.name) ? html`<button type="button" class="link-btn" data-cf="assign-me" data-field="${f.id}">${t('cf.assignToMe')}</button>` : ''}${!f.required && v ? html`<button type="button" class="link-btn" data-cf="unassign" data-field="${f.id}">${t('cf.unassign')}</button>` : ''}</div>`;
+        // assignee: "Assign to me" / "Unassign"; other people fields (reporter, …): "Me" / "Clear", tied to the field's label
+        const asg = isAssigneeField(f);
+        const tie = asg ? '' : html` aria-describedby="${id}-l"`;
+        control = html`${control}<div class="cf-quick">${self && (!v || v.name !== self.name) ? html`<button type="button" class="link-btn" data-cf="assign-me" data-field="${f.id}"${tie}>${t(asg ? 'cf.assignToMe' : 'cf.me')}</button>` : ''}${!f.required && v ? html`<button type="button" class="link-btn" data-cf="unassign" data-field="${f.id}"${tie}>${t(asg ? 'cf.unassign' : 'cf.clear')}</button>` : ''}</div>`;
         break;
       }
-      case 'epic': case 'parent':
-        control = cfCombo(f, id, a11y, v ? `${v.key}${v.summary ? ' ' + v.summary : ''}` : '', t(f.kind === 'epic' ? 'cf.searchEpic' : 'cf.searchParent'), !!v);
+      case 'epic': case 'parent': case 'issueLink':
+        control = cfCombo(f, id, a11y, v ? `${v.key}${v.summary ? ' ' + v.summary : ''}` : '', t(f.kind === 'epic' ? 'cf.searchEpic' : f.kind === 'issueLink' ? 'ie.searchIssue' : 'cf.searchParent'), !!v);
         break;
       case 'estimate': {
         const raw = cf.raw[f.id] || {};
@@ -3077,7 +3132,7 @@
   /** Editor / preview after the field markup is in place. */
   function cfAfterRender() {
     const cf = S.cf;
-    const host = $('#cf-body [data-editor]');
+    const host = $('[data-editor]', cfRoot());
     if (host) {
       const fid = host.dataset.editor;
       const id = cfId(fid);
@@ -3091,11 +3146,11 @@
       cf.editor.el.id = id;
       cf.editor.el.dataset.field = fid;
       const res = cf.editor.load(cf.values[fid] || '');
-      if (cf.mode === 'edit' && cf.lossyKnown == null) { cf.lossyKnown = true; if (res.lossy && !cf.lossy) { cf.lossy = true; cfRender(); return; } }
+      if (cfEditing(cf) && cf.lossyKnown == null) { cf.lossyKnown = true; if (res.lossy && !cf.lossy) { cf.lossy = true; if (cf.mode === 'inline') ieRender(); else cfRender(); return; } }
       if (cf.errors[fid]) cf.editor.setInvalid(true, `${id}-e ${id}-h`);
     }
-    const pv = $('#cf-body .cf-wiki-preview:not([hidden])');
-    if (pv) pv.replaceChildren(wiki.render($('#cf-body .cf-wiki-text').value || ''));
+    const pv = $('.cf-wiki-preview:not([hidden])', cfRoot());
+    if (pv) pv.replaceChildren(wiki.render($('.cf-wiki-text', cfRoot()).value || ''));
   }
 
   function cfRenderFooter() {
@@ -3118,7 +3173,7 @@
   function cfRerenderField(fid, focusSel) {
     const cf = S.cf;
     const f = cfField(fid);
-    const wrap = $(`#cf-body [data-fwrap="${CSS.escape(fid)}"]`);
+    const wrap = $(`[data-fwrap="${CSS.escape(fid)}"]`, cfRoot());
     if (!f || !wrap || f.kind === 'description' && cf.descriptionFormat !== 'wiki') return;
     const box = document.createElement('div');
     setHTML(box, cfFieldHTML(f));
@@ -3136,9 +3191,9 @@
     if (!cf) return;
     if (msg) cf.errors[fid] = msg; else delete cf.errors[fid];
     const id = cfId(fid);
-    const p = $(`#cf-body [data-cf-error="${CSS.escape(fid)}"]`);
+    const p = $(`[data-cf-error="${CSS.escape(fid)}"]`, cfRoot());
     if (p) { p.textContent = msg || ''; p.hidden = !msg; }
-    $$(`#cf-body [data-field="${CSS.escape(fid)}"]`).forEach((c) => {
+    $$(`[data-field="${CSS.escape(fid)}"]`, cfRoot()).forEach((c) => {
       if (c.classList.contains('rte-content')) return;
       if (msg) c.setAttribute('aria-invalid', 'true'); else c.removeAttribute('aria-invalid');
       const ids = [msg ? id + '-e' : '', cf.marks[fid] ? id + '-m' : '', id + '-h'].filter(Boolean).join(' ');
@@ -3148,11 +3203,11 @@
   }
   function cfFocusFirst(invalidOnly) {
     const cf = S.cf;
-    if (!cf || !$('#dlg-issue').open) return;
-    const body = $('#cf-body');
+    if (!cf || (cf.mode !== 'inline' && !$('#dlg-issue').open)) return;
+    const body = cfRoot();
     if (invalidOnly) {
       const fid = cf.fields.map((f) => f.id).find((x) => cf.errors[x]);
-      const target = fid ? (fid === 'description' || (cfField(fid) || {}).kind === 'description') && cf.editor ? cf.editor.el : $(`[data-field="${CSS.escape(fid)}"]`, body) : $('#cf-form-error');
+      const target = fid ? (fid === 'description' || (cfField(fid) || {}).kind === 'description') && cf.editor ? cf.editor.el : $(`[data-field="${CSS.escape(fid)}"]`, body) : $('#cf-form-error', body);
       if (target) { if (target.id === 'cf-form-error') target.setAttribute('tabindex', '-1'); target.focus(); target.scrollIntoView({ block: 'nearest' }); }
       return;
     }
@@ -3165,7 +3220,7 @@
   /** Reads the plain inputs into cf.raw / cf.values (pickers and chips update values directly). */
   function cfCollectRaw() {
     const cf = S.cf;
-    $$('#cf-body [data-field]').forEach((c) => {
+    $$('[data-field]', cfRoot()).forEach((c) => {
       const fid = c.dataset.field;
       const f = cfField(fid);
       if (!f || c.classList.contains('cb-input') || c.classList.contains('rte-content')) return;
@@ -3212,7 +3267,7 @@
         const o = String(r.originalEstimate || '').trim(); const rem = String(r.remainingEstimate || '').trim();
         if ((o && !DURATION.test(o)) || (rem && !DURATION.test(rem))) err = t('cf.estimateInvalid');
         // CR-17: a part that had a value can't be cleared (Jira would keep the old value)
-        else if (cf.mode === 'edit' && ((!o && init.originalEstimate) || (!rem && init.remainingEstimate))) err = t('cf.estimateNoClear');
+        else if (cfEditing(cf) && ((!o && init.originalEstimate) || (!rem && init.remainingEstimate))) err = t('cf.estimateNoClear');
         v = o || rem ? Object.assign(o ? { originalEstimate: o } : {}, rem ? { remainingEstimate: rem } : {}) : null;
         break;
       }
@@ -3252,7 +3307,7 @@
     if (v == null) return v;
     if (kind === 'user') return { name: v.name };
     if (kind === 'users') return v.map((u) => ({ name: u.name }));
-    if (kind === 'epic' || kind === 'parent') return { key: v.key };
+    if (kind === 'epic' || kind === 'parent' || kind === 'issueLink') return { key: v.key };
     return v;
   }
   /** Create: non-empty values; edit: the changed fields only (unchanged description is never re-sent). */
@@ -3300,12 +3355,13 @@
   /* --- submit --- */
   async function cfSubmit() {
     const cf = S.cf;
+    if (cf && cf.mode === 'inline') { ieSave(); return; }
     if (!cf || cf.saving || cf.loading) return;
     const btn = $('#cf-foot [data-cf="submit"]');
     if (btn && btn.getAttribute('aria-disabled') === 'true') return;
     const { values, errors } = cfValidate();
     cf.formError = '';
-    if (cf.created) { cf.created = null; const n = $('#cf-body .cf-created'); if (n) n.remove(); }
+    if (cf.created) { cf.created = null; const n = $('.cf-created', cfRoot()); if (n) n.remove(); }
     Object.keys(cf.errors).forEach((k) => cfSetError(k, null));
     Object.entries(errors).forEach(([k, m]) => cfSetError(k, m));
     const fe = $('#cf-form-error'); if (fe) fe.remove();
@@ -3318,7 +3374,7 @@
       cf.formErrorQuiet = true; // announced through #cf-live below (no second role=alert)
       cf.errorLinks = order;
       cfRefreshNotices();
-      $('#cf-live').textContent = cf.formError;
+      cfLive(cf.formError);
       cfFocusFirst(true);
       return;
     }
@@ -3338,7 +3394,7 @@
           // DR-30: the form stays open — the result is a notice at the top of the form (a toast would cover the dialog)
           cf.created = { key, warning: (res && res.warning) || '' };
           cfResetForAnother();
-          $('#cf-live').textContent = [t('cf.created', { key }), cf.created.warning].filter(Boolean).join('. ');
+          cfLive([t('cf.created', { key }), cf.created.warning].filter(Boolean).join('. '));
           return;
         }
         toast(t('cf.created', { key }), { tone: 'success', action: key ? { label: t('common.open'), run: () => openIssue(key) } : null });
@@ -3366,7 +3422,7 @@
       else if (e.code === 'edit_conflict') { cf.conflict = true; cf.formError = ''; }
       else cf.formError = `${t(cf.mode === 'create' ? 'cf.createFailed' : 'cf.saveFailed')}: ${errorText(e)}`;
       cfRefreshNotices();
-      if (cf.conflict) { const r = $('#cf-body [data-cf="reload"]'); if (r) r.focus(); } else cfFocusFirst(true);
+      if (cf.conflict) { const r = $('[data-cf="reload"]', cfRoot()); if (r) r.focus(); } else cfFocusFirst(true);
     } finally {
       if (S.cf === cf) { cf.saving = false; cfRenderFooter(); }
     }
@@ -3374,13 +3430,14 @@
   /** Conflict / form error banners without re-rendering the fields (the editor keeps its state). */
   function cfRefreshNotices() {
     const cf = S.cf;
-    const body = $('#cf-body');
+    const body = cfRoot();
     $$('.cf-conflict, #cf-form-error', body).forEach((x) => x.remove());
     const fields = $('.cf-fields', body);
     if (!fields) return;
     const box = document.createElement('div');
     const parts = [];
-    if (cf.conflict) parts.push(html`<div class="notice notice-warn cf-conflict" role="alert">${icon('alert')}<span class="notice-text">${t('cf.conflict')}</span><button type="button" class="btn btn-sm" data-cf="reload">${icon('refresh')}<span>${t('cf.reload')}</span></button><button type="button" class="btn btn-sm btn-ghost" data-cf="cancel">${t('common.cancel')}</button></div>`);
+    // inline editors: their own Cancel is right below
+    if (cf.conflict) parts.push(html`<div class="notice notice-warn cf-conflict" role="alert">${icon('alert')}<span class="notice-text">${t('cf.conflict')}</span><button type="button" class="btn btn-sm" data-cf="reload">${icon('refresh')}<span>${t('cf.reload')}</span></button>${cf.mode === 'inline' ? '' : html`<button type="button" class="btn btn-sm btn-ghost" data-cf="cancel">${t('common.cancel')}</button>`}</div>`);
     if (cf.formError) {
       const links = (cf.errorLinks || []).map((fid) => cfField(fid)).filter(Boolean);
       parts.push(html`<div class="form-alert cf-form-alert"${cf.formErrorQuiet ? '' : html` role="alert"`} id="cf-form-error">${icon('alert')}<div><span>${cf.formError}</span>${links.length ? html`<ul class="cf-error-links" role="list">${links.map((f) => html`<li><button type="button" class="link-btn" data-cf="goto" data-field="${f.id}">${f.name}</button></li>`)}</ul>` : ''}</div></div>`);
@@ -3390,10 +3447,7 @@
   }
   function cfAfterChange(project, key) {
     // The backend emits `board` (views reload); the drawer re-reads the edited issue.
-    if (key) {
-      detailCache.delete(key);
-      if (S.drawer && drawerKey() === key) loadDetail({ silent: true });
-    }
+    if (key) ieAfterChange(key, null);
   }
   function cfResetForAnother() {
     const cf = S.cf;
@@ -3407,18 +3461,19 @@
     cf.saving = false;
     cfRender();
     cf.dirty = false; // DR-22: the reset form is the new baseline (closing it doesn't prompt)
-    const s = $('#cf-body [data-field="summary"]');
+    const s = $('[data-field="summary"]', cfRoot());
     if (s) s.focus();
   }
 
   /* --- edit conflict: reload --- */
   async function cfReloadConflict() {
     const cf = S.cf;
-    if (!cf || cf.mode !== 'edit') return;
+    if (!cf || cf.mode === 'create') return;
     cfCollectRaw();
     let meta;
     try { meta = await api('getEditMeta', { key: cf.key }); } catch (e) { toastError(t('cf.reloadFailed'), e); return; }
     if (S.cf !== cf) return;
+    if (cf.mode === 'inline') ieStoreMeta(cf.key, meta);
     const fresh = meta.values || {};
     const oldInitial = cf.initial;
     const marks = {};
@@ -3441,21 +3496,22 @@
     cf.conflict = false;
     cf.marks = marks;
     Object.keys(marks).forEach((fid) => {
-      const m = $(`#${CSS.escape(cfId(fid))}-m`);
+      const m = $(`#${CSS.escape(cfId(fid))}-m`, cfRoot());
       if (m) { m.hidden = false; $('span', m).textContent = marks[fid]; }
       cfSetError(fid, cf.errors[fid] || null); // refresh aria-describedby with the mark
     });
     cfRefreshNotices();
-    const live = $('#cf-live');
-    live.textContent = Object.keys(marks).length ? t('cf.reloadedMarked', { n: Object.keys(marks).length }) : t('cf.reloaded');
+    cfLive(Object.keys(marks).length ? t('cf.reloadedMarked', { n: Object.keys(marks).length }) : t('cf.reloaded'));
     const first = Object.keys(marks)[0];
-    const target = first ? $(`#cf-body [data-field="${CSS.escape(first)}"]`) : $('#cf-foot [data-cf="submit"]');
+    const target = first ? $(`[data-field="${CSS.escape(first)}"]`, cfRoot()) : cf.mode === 'inline' ? $('[data-cf="submit"]', cfRoot()) : $('#cf-foot [data-cf="submit"]');
     if (target) target.focus();
+    if (cf.mode === 'inline') ieRefreshDetail(cf.key); // the panel shows what is in Jira now
   }
 
   /* --- closing --- */
   async function cfClose(force) {
     const cf = S.cf;
+    if (cf && cf.mode === 'inline') { if (force) ieClose(); else ieCancel(); return; }
     if (!cf || (cf.saving && !force)) return; // a running save decides (success closes, failure keeps the form)
     if (!force && !cf.saving) {
       cfCollectRaw();
@@ -3476,7 +3532,7 @@
   async function cfOpenInJira() {
     const cf = S.cf;
     if (!cf) return;
-    if (cf.mode === 'edit' && cf.url) { openUrl(cf.url); return; }
+    if (cfEditing(cf) && cf.url) { openUrl(cf.url); return; }
     const s = await ensureSettings();
     const base = s && s.jiraUrl ? String(s.jiraUrl).replace(/\/+$/, '') : '';
     if (base) openUrl(`${base}/secure/CreateIssue!default.jspa`);
@@ -3504,7 +3560,7 @@
     let items;
     if (st.loading && !st.options.length) items = html`<li class="cb-state" role="option" aria-disabled="true">${t('common.loading')}</li>`;
     else if (st.error) items = html`<li class="cb-state cb-error" role="option" aria-disabled="true">${st.error}</li>`;
-    else if (!st.options.length) items = html`<li class="cb-state" role="option" aria-disabled="true">${t('cf.noMatches')}</li>`;
+    else if (!st.options.length) items = html`<li class="cb-state" role="option" aria-disabled="true">${st.typeHint ? t('cf.typeToSearch') : t('cf.noMatches')}</li>`;
     else {
       const sel = cbSelected(f);
       items = st.options.map((o, i) => html`<li class="cb-opt${i === st.active ? ' is-active' : ''}" role="option" id="${id}-o${i}" data-i="${i}" aria-selected="${sel.has(o.key) || i === st.active ? 'true' : 'false'}">
@@ -3512,7 +3568,7 @@
     }
     setHTML(list, html`${items}`);
     list.classList.remove('is-flip');
-    const body = list.closest('.cf-body');
+    const body = list.closest('.cf-body, .drawer-body');
     if (body && list.getBoundingClientRect().right > body.getBoundingClientRect().right - 4) list.classList.add('is-flip');
     if (st.active >= 0 && st.options[st.active]) { input.setAttribute('aria-activedescendant', `${id}-o${st.active}`); const a = $(`#${CSS.escape(id)}-o${st.active}`); if (a) a.scrollIntoView({ block: 'nearest' }); } else input.removeAttribute('aria-activedescendant');
   }
@@ -3538,17 +3594,20 @@
       try {
         let opts;
         if (f.kind === 'user' || f.kind === 'users') {
-          const users = await api('searchAssignable', cf.mode === 'edit' ? { key: cf.key, query } : { project: cf.project, query });
+          // assignee: the project's assignable users; reporter / developer / reviewer / QA: any user (v0.6 searchUsers)
+          const users = !isAssigneeField(f) ? (query.trim() ? await api('searchUsers', { query }) : [])
+            : await api('searchAssignable', cfEditing(cf) ? { key: cf.key, query } : { project: cf.project, query });
           const sel = cbSelected(f);
           opts = (users || []).filter((u) => !sel.has(u.name)).map((u) => ({ key: u.name, label: u.displayName || u.name, sub: u.name, avatar: u.displayName || u.name, value: { name: u.name, displayName: u.displayName || u.name } }));
           if (f.kind === 'user' && !f.required && !query.trim()) opts.unshift({ key: '__none', label: t('issue.unassigned'), value: null });
         } else {
-          const refs = await api('searchIssuesFor', { purpose: f.kind === 'epic' ? 'epic' : 'parent', project: cf.project, query });
-          opts = (refs || []).map((r) => ({ key: r.key, keyText: r.key, label: r.name || r.summary || '', sub: r.name && r.summary && r.name !== r.summary ? r.summary : '', type: r.type, status: r.status, value: { key: r.key, summary: r.summary || r.name || '' } }));
+          const refs = await api('searchIssuesFor', { purpose: f.kind === 'epic' ? 'epic' : f.kind === 'issueLink' ? 'link' : 'parent', project: cf.project, query });
+          opts = (refs || []).filter((r) => f.kind !== 'issueLink' || r.key !== cf.key).map((r) => ({ key: r.key, keyText: r.key, label: r.name || r.summary || '', sub: r.name && r.summary && r.name !== r.summary ? r.summary : '', type: r.type, status: r.status, value: { key: r.key, summary: r.summary || r.name || '' } }));
         }
         if (S.cf !== cf || seq !== st.seq) return;
         st.options = opts;
         st.active = opts.length ? 0 : -1;
+        st.typeHint = (f.kind === 'user' || f.kind === 'users') && !isAssigneeField(f) && !query.trim();
       } catch (e) {
         if (S.cf !== cf || seq !== st.seq) return;
         st.options = [];
@@ -3568,7 +3627,7 @@
       const f = cfField(fid);
       const input = $(`#${CSS.escape(cfId(fid))}`);
       const v = S.cf.values[fid];
-      if (input && (f.kind === 'user' || f.kind === 'epic' || f.kind === 'parent')) input.value = v ? (f.kind === 'user' ? v.displayName || v.name : `${v.key}${v.summary ? ' ' + v.summary : ''}`) : '';
+      if (input && (f.kind === 'user' || f.kind === 'epic' || f.kind === 'parent' || f.kind === 'issueLink')) input.value = v ? (f.kind === 'user' ? v.displayName || v.name : `${v.key}${v.summary ? ' ' + v.summary : ''}`) : '';
     }
   }
   function cbPick(fid, i) {
@@ -3582,7 +3641,7 @@
       cur.push(o.value);
       cfSetValue(fid, cur, '.cb-input');
     } else cfSetValue(fid, o.value, '.cb-input');
-    $('#cf-live').textContent = t('cf.picked', { value: o.keyText ? `${o.keyText} ${o.label}` : o.label });
+    cfLive(t('cf.picked', { value: o.keyText ? `${o.keyText} ${o.label}` : o.label }));
   }
   function addLabel(fid, input) {
     const raw = input.value.replace(/,/g, ' ').trim();
@@ -3597,6 +3656,7 @@
 
   /* --- events --- */
   function onCfInput(e) {
+    if (!cfOwns(e)) return;
     const cf = S.cf;
     if (!cf) return;
     const c = e.target;
@@ -3614,8 +3674,10 @@
       return;
     }
     if (c.classList.contains('cf-wiki-text')) cf.values[fid] = c.value;
+    if (cf.mode === 'inline' && f0 && f0.kind === 'textarea') ieFit(c);
   }
   function onCfChange(e) {
+    if (!cfOwns(e)) return;
     const cf = S.cf;
     if (!cf) return;
     const c = e.target;
@@ -3634,6 +3696,7 @@
     if (c.dataset.field) { cf.dirty = true; cfCollectRaw(); }
   }
   function onCfFocusOut(e) {
+    if (!cfOwns(e)) return;
     const cf = S.cf;
     if (!cf || cf.replacing) return;
     const c = e.target;
@@ -3659,6 +3722,7 @@
     if ((f.kind === 'number' || (f.kind === 'storyPoints' && !(f.options && f.options.length))) && c.value.trim() && !/^-?\d+([.,]\d+)?$/.test(c.value.trim())) cfSetError(fid, t('cf.numberInvalid'));
   }
   function onCfKey(e) {
+    if (!cfOwns(e)) return;
     const cf = S.cf;
     if (!cf) return;
     const c = e.target;
@@ -3666,15 +3730,17 @@
     const ty = c.closest && c.closest('[data-cf-type]');
     if (ty && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) {
       e.preventDefault();
-      const all = $$('#cf-body [data-cf-type]');
+      const all = $$('[data-cf-type]', cfRoot());
       const i = all.indexOf(ty);
       const n = e.key === 'Home' ? 0 : e.key === 'End' ? all.length - 1 : (i + (e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1) + all.length) % all.length;
       cfPickType(all[n].dataset.cfType, true);
       return;
     }
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); cfSubmit(); return; }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); e.stopPropagation(); cfSubmit(); return; }
+    const inline = cf.mode === 'inline';
     if (!c.classList || !c.classList.contains('cb-input')) {
-      if (e.key === 'Enter' && c.tagName === 'INPUT' && c.type !== 'checkbox') e.preventDefault(); // no implicit submit
+      if (e.key === 'Enter' && (c.tagName === 'INPUT' || (inline && c.tagName === 'SELECT')) && c.type !== 'checkbox') { e.preventDefault(); if (inline) ieSave(); } // no implicit submit
+      else if (inline && e.key === 'Escape' && !e.defaultPrevented) { e.preventDefault(); e.stopPropagation(); ieCancel(); }
       return;
     }
     const fid = c.dataset.field;
@@ -3696,9 +3762,11 @@
       case 'Enter':
         e.preventDefault();
         if (st.open && st.active >= 0) cbPick(fid, st.active);
+        else if (inline) ieSave(); // Enter saves a single-line inline editor
         break;
       case 'Escape':
         if (st.open) { e.preventDefault(); e.stopPropagation(); cbClose(fid, true); }
+        else if (inline) { e.preventDefault(); e.stopPropagation(); ieCancel(); }
         break;
       case 'Backspace':
         if (CF_MULTI.has(f.kind) && !c.value) { const cur = (cf.values[fid] || []).slice(); if (cur.length) { cur.pop(); cfSetValue(fid, cur, '.cb-input'); } }
@@ -3713,10 +3781,11 @@
     cf.issueTypeId = typeId;
     cf.fields = [];
     cfLoad({ issueTypeId: typeId, keep }).then(() => {
-      if (focus) { const b = $(`#cf-body [data-cf-type="${CSS.escape(String(typeId))}"]`); if (b) b.focus(); }
+      if (focus) { const b = $(`[data-cf-type="${CSS.escape(String(typeId))}"]`, cfRoot()); if (b) b.focus(); }
     });
   }
   function onCfClick(e) {
+    if (!cfOwns(e)) return;
     const cf = S.cf;
     if (!cf) return;
     const opt = e.target.closest('.cb-opt');
@@ -3742,23 +3811,23 @@
       case 'reload': cfReloadConflict(); break;
       case 'open-created': openIssue(a.dataset.key); break;
       case 'goto': { // DR-24: links in the error summary
-        const target = $(`#${CSS.escape(cfId(fid))}`) || $(`#cf-body [data-field="${CSS.escape(fid)}"]:not(.link-btn):not(.cb-chip-x)`);
+        const target = $(`#${CSS.escape(cfId(fid))}`) || $(`[data-field="${CSS.escape(fid)}"]:not(.link-btn):not(.cb-chip-x)`, cfRoot());
         if (target) { target.focus(); target.scrollIntoView({ block: 'nearest' }); }
         break;
       }
       case 'open-jira': cfOpenInJira(); break;
-      case 'assign-me': { const u = me(); if (u) { cfSetValue(fid, { name: u.name, displayName: u.displayName || u.name }, '.cb-input'); $('#cf-live').textContent = t('cf.picked', { value: u.displayName || u.name }); } break; }
+      case 'assign-me': { const u = me(); if (u) { cfSetValue(fid, { name: u.name, displayName: u.displayName || u.name }, '.cb-input'); cfLive(t('cf.picked', { value: u.displayName || u.name })); } break; }
       case 'unassign': cfSetValue(fid, null, '.cb-input'); break;
       case 'clear': cfSetValue(fid, null, '.cb-input'); break;
       case 'chip-remove': {
         const f = cfField(fid);
         const cur = (cf.values[fid] || []).filter((x) => (f.kind === 'users' ? x.name : String(x)) !== a.dataset.key);
         cfSetValue(fid, cur, '.cb-input');
-        $('#cf-live').textContent = t('cf.removed', { value: a.dataset.key });
+        cfLive(t('cf.removed', { value: a.dataset.key }));
         break;
       }
       case 'preview': {
-        const ta = $('#cf-body .cf-wiki-text');
+        const ta = $('.cf-wiki-text', cfRoot());
         if (ta) cf.values[ta.dataset.field] = ta.value;
         cf.wikiPreview = !cf.wikiPreview;
         cfRerenderField(ta.dataset.field, '[data-cf="preview"]');
@@ -3766,6 +3835,641 @@
       }
       default:
     }
+  }
+
+  /* ================================================================
+   * ISSUE PANEL EDITING (SPEC v0.6): one field at a time in place (the v0.5 form engine in mode 'inline', its root
+   * re-attached into the drawer after every re-render), issue links add / remove, the comment composer.
+   * The edit meta is fetched on the first inline edit of an issue and reused for this drawer (never prefetched).
+   * ================================================================ */
+  const appLive = (text) => { const el = $('#app-live'); if (el) el.textContent = text; };
+  const isInline = () => !!S.cf && S.cf.mode === 'inline';
+  const fieldNamed = (f, ...names) => names.includes(String(f.name || '').trim().toLowerCase());
+  /** The edit-meta field behind a panel row: by FieldMeta.role (the slot names are the roles). An older backend without
+      roles: by kind and the SPEC v0.6 "Discovery" names (case-insensitive, trimmed). */
+  function ieFieldOf(slot, fields) {
+    const find = (p) => (fields || []).find(p) || null;
+    if ((fields || []).some((f) => f.role)) return find((f) => f.role === slot);
+    const users = (f) => f.kind === 'users';
+    switch (slot) {
+      case 'description': return find((f) => f.kind === 'description');
+      case 'assignee': return find((f) => f.id === 'assignee');
+      case 'reporter': return find((f) => f.id === 'reporter');
+      case 'developer': return find((f) => users(f) && fieldNamed(f, 'developer'));
+      case 'reviewer': return find((f) => users(f) && fieldNamed(f, 'reviewer'));
+      case 'qa': return find((f) => users(f) && fieldNamed(f, 'qa engineer')) || find((f) => users(f) && fieldNamed(f, 'qa'));
+      case 'mergeRequests': return find((f) => f.kind === 'textarea' && fieldNamed(f, 'merge_requests', 'merge requests'));
+      case 'branches': return find((f) => f.kind === 'textarea' && fieldNamed(f, 'branches'));
+      case 'devStoryPoints': return find((f) => f.kind === 'storyPoints' && fieldNamed(f, 'dev story points'));
+      case 'qaStoryPoints': return find((f) => f.kind === 'storyPoints' && fieldNamed(f, 'qa story points'));
+      case 'storyPoints': return find((f) => f.kind === 'storyPoints' && !fieldNamed(f, 'dev story points', 'qa story points'));
+      default: return null;
+    }
+  }
+  function ieStoreMeta(key, meta) {
+    const d = S.drawer;
+    if (!d || !meta) return;
+    if (!d.editMetas) d.editMetas = new Map();
+    d.editMetas.set(key, meta);
+    if (!(Array.isArray(meta.fields) && meta.fields.length)) S.noEditKeys.add(key);
+  }
+  /** The issue's edit meta for this drawer: fetched once, again only after it went stale (a change made here). */
+  async function ieMeta(key) {
+    const d = S.drawer;
+    const cached = d.editMetas && d.editMetas.get(key);
+    if (cached && !cached.stale) return cached;
+    const meta = await api('getEditMeta', { key });
+    if (S.drawer !== d) return null;
+    ieStoreMeta(key, meta);
+    return meta;
+  }
+  /** 'unknown' (no edit meta yet), 'edit', 'ro' (not in the edit meta) or 'none' (no edit permission). */
+  function ieSlotState(key, slot) {
+    if (S.noEditKeys.has(key)) return 'none';
+    const meta = S.drawer && S.drawer.editMetas && S.drawer.editMetas.get(key);
+    if (!meta) return 'unknown';
+    return ieFieldOf(slot, meta.fields) ? 'edit' : 'ro';
+  }
+  /** Re-reads the issue into the panel; resolves when it is shown. */
+  async function ieRefreshDetail(key) {
+    detailCache.delete(key);
+    if (S.drawer && drawerKey() === key) await loadDetail({ silent: true });
+  }
+  /** After any change to the issue (another form, a transition, links, comments): its `updated` moved on. */
+  function ieAfterChange(key) {
+    const meta = S.drawer && S.drawer.editMetas && S.drawer.editMetas.get(key);
+    if (meta) meta.stale = true; // refetched on the next inline edit; its field list still marks read-only rows
+    ieRefreshDetail(key);
+  }
+
+  /** A panel value that can be edited in place: focusable (Enter / F2), a pencil on hover / focus; read-only (lock,
+      tooltip) once the edit meta says so. While its editor is open, a slot that the editor root is moved into. */
+  function ieValue(slot, label, content, opts = {}) {
+    const d = S.drawer;
+    const key = drawerKey();
+    const cf = S.cf;
+    if (cf && cf.mode === 'inline' && cf.key === key && cf.slot === slot) return html`<div data-ie-slot="${slot}"></div>`;
+    const st = ieSlotState(key, slot);
+    const ro = st === 'ro' || st === 'none';
+    const busy = !!d && d.ieLoading === slot;
+    const labelId = opts.labelId || `ie-l-${slot}`;
+    const why = ro ? t(st === 'none' ? 'cf.noPermission' : 'ie.readOnly') : '';
+    return html`<div class="ie-val${ro ? ' is-ro' : ''}${opts.block ? ' is-block' : ''}" id="ie-v-${slot}" data-ie="${slot}" tabindex="0" role="group" aria-labelledby="${opts.block ? labelId : `${labelId} ie-c-${slot}`}" aria-describedby="${st === 'none' ? 'ie-np-hint' : ro ? 'ie-ro-hint' : 'ie-hint'}"${busy ? html` aria-busy="true"` : ''}${ro ? html` title="${why}"` : ''}>
+      <div class="ie-content" id="ie-c-${slot}">${content}</div>
+      ${busy ? html`<span class="ie-side"><span class="spinner spinner-sm" aria-hidden="true"></span></span>`
+        : ro ? html`<span class="ie-side ie-lock" aria-hidden="true">${icon('lock')}</span>`
+        : html`<button type="button" class="icon-btn icon-btn-sm ie-side ie-pencil" data-ie-edit="${slot}" tabindex="-1" aria-label="${t('ie.edit', { name: label })}" title="${t('ie.edit', { name: label })}">${icon('pencil')}</button>`}
+    </div>`;
+  }
+  const ieHints = () => html`<span class="sr-only" id="ie-hint">${t('ie.hint')}</span><span class="sr-only" id="ie-ro-hint">${t('ie.readOnly')}</span><span class="sr-only" id="ie-np-hint">${t('cf.noPermission')}</span>`;
+
+  /** Multi-user values (Developer / Reviewer / QA): avatars with names; Jira's placeholder user is not shown. */
+  function peopleHTML(list) {
+    const users = (list || []).filter((u) => u && (u.displayName || u.name) && !isPlaceholderUser(u));
+    if (!users.length) return html`<span class="muted">${t('issue.unassigned')}</span>`;
+    return html`<ul class="people" role="list">${users.map((u) => html`<li class="person">${avatar(u.displayName || u.name, 'avatar-xs')}<span>${u.displayName || u.name}</span></li>`)}</ul>`;
+  }
+
+  /* --- merge requests & branches (display) --- */
+  /** The link in a whitespace-separated token: the whole token, or the token without trailing ".,;:)" (DR-37; the
+      backend's openFieldLink accepts both), when that is an http(s) URL by the editor's rule (CR-22: the same check the
+      UI applies everywhere — no user info, no broken % escapes). Nothing is extracted from inside a token
+      ("prefix:https://…" stays text). Returns { url, tail } or null. */
+  function fieldUrl(tok) {
+    if (tok.length > 2048) return null;
+    const m = /^(.*?)([.,;:)]*)$/.exec(tok);
+    return JiraffeEditor.isHttpUrl(m[1]) ? { url: m[1], tail: m[2] } : null;
+  }
+  /** GitLab MR URLs read as "group/project !123"; other URLs as they are. */
+  function mrLabel(url) {
+    const m = /^https?:\/\/[^/]+\/(.+?)\/-\/merge_requests\/(\d+)(?:[/?#]\S*)?$/i.exec(url);
+    if (!m) return url;
+    let path = m[1];
+    try { path = decodeURIComponent(path); } catch { /* keep it encoded */ }
+    return `${path} !${m[2]}`;
+  }
+  const fieldLines = (text) => String(text || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  function fieldTokensHTML(line, field) {
+    return line.split(/(\s+)/).map((tok) => {
+      const u = fieldUrl(tok);
+      return u
+        ? html`<button type="button" class="link-btn field-link" data-flink="${field}" data-flink-url="${u.url}" title="${u.url}"><span>${field === 'mergeRequests' ? mrLabel(u.url) : u.url}</span>${icon('external', 'icon-xs')}</button>${u.tail}`
+        : tok;
+    });
+  }
+  function mrHTML(text) {
+    return html`<ul class="dev-list" role="list">${fieldLines(text).map((line) => html`<li class="dev-line">${fieldTokensHTML(line, 'mergeRequests')}</li>`)}</ul>`;
+  }
+  function branchesHTML(text) {
+    return html`<ul class="dev-list" role="list">${fieldLines(text).map((line, i) => {
+      if (line.split(/\s+/).some(fieldUrl)) return html`<li class="dev-line">${fieldTokensHTML(line, 'branches')}</li>`;
+      const m = /^([^\s:]+)\s*:\s*(\S.*)$/.exec(line); // "repo: branch" / "repo:branch"
+      const branch = m ? m[2].trim() : line;
+      return html`<li class="dev-line branch-line">${m ? html`<span class="chip branch-repo">${m[1]}</span>` : ''}<code class="branch-name">${branch}</code><button type="button" class="icon-btn icon-btn-sm copy-btn" id="copy-b${i}" data-copy="${branch}" aria-label="${t('drawer.copyBranch', { branch })}" title="${t('drawer.copyBranch', { branch })}">${icon('copy')}</button></li>`;
+    })}</ul>`;
+  }
+  function developmentHTML(det) {
+    if (det.mergeRequests === undefined && det.branches === undefined) return '';
+    const row = (slot, text, render) => (text === undefined ? '' : html`<dt id="ie-l-${slot}">${t('drawer.' + slot)}</dt>
+      <dd>${ieValue(slot, t('drawer.' + slot), fieldLines(text).length ? render(text) : html`<span class="muted">—</span>`, { block: true })}</dd>`);
+    return html`<section class="d-sec" aria-labelledby="d-dev"><h3 id="d-dev">${t('drawer.development')}</h3>
+      <dl class="props dev-props">${row('mergeRequests', det.mergeRequests, mrHTML)}${row('branches', det.branches, branchesHTML)}</dl></section>`;
+  }
+  async function openFieldLink(field, url) {
+    const key = drawerKey();
+    if (!key || !url) return;
+    try { await api('openFieldLink', { key, field, url }); } catch (e) { toastError(t('common.openFailed'), e); }
+  }
+  async function copyText(text) {
+    let ok = false;
+    try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); ok = true; } } catch { ok = false; }
+    if (!ok) { // fallback: a hidden textarea inside the open dialog (the app behind it is inert)
+      const prev = document.activeElement;
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.className = 'sr-only';
+      $('#drawer').append(ta);
+      ta.select();
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+      ta.remove();
+      if (prev && prev.isConnected) prev.focus({ preventScroll: true });
+    }
+    toast(ok ? t('drawer.copied', { text }) : t('drawer.copyFailed'), { tone: ok ? 'success' : 'error' });
+  }
+
+  /* --- links --- */
+  function linksHTML(det) {
+    const d = S.drawer;
+    const key = det.issue.key || drawerKey();
+    const groups = new Map();
+    det.links.forEach((l) => { if (!l || !l.issue) return; const r = l.relation || t('drawer.related'); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(l); });
+    const linking = isInline() && S.cf.slot === 'link' && S.cf.key === key;
+    const remove = (l, rel) => {
+      if (!l.id) return '';
+      const busy = d && d.linkBusy === l.id;
+      const label = t('links.remove', { relation: rel, key: l.issue.key });
+      return html`<button type="button" class="icon-btn icon-btn-sm rel-x" id="lx-${domId(String(l.id))}" data-link-del="${l.id}" data-link-key="${l.issue.key}" data-link-rel="${rel}" aria-label="${label}" title="${label}"${busy ? html` aria-busy="true"` : ''}>${busy ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : icon('x')}</button>`;
+    };
+    const busyAdd = !!d && d.ieLoading === 'link';
+    return html`<section class="d-sec" aria-labelledby="d-links">
+      <div class="d-sec-head"><h3 id="d-links">${t('drawer.links')}${det.links.length ? html`<span class="d-count">${det.links.length}</span>` : ''}</h3>
+        ${linking ? '' : html`<button type="button" class="btn btn-sm btn-ghost" id="link-add" data-action="link-add"${busyAdd ? html` aria-busy="true"` : ''}>${icon('plus')}<span>${t('links.add')}</span></button>`}</div>
+      ${linking ? html`<div data-ie-slot="link"></div>` : ''}
+      ${groups.size ? [...groups].map(([rel, list]) => html`<h4 class="d-sub">${rel}</h4><ul class="rel-list" role="list">${list.map((l) => relRow(l.issue, remove(l, rel)))}</ul>`)
+        : linking ? '' : html`<p class="empty-line">${t('links.none')}</p>`}
+    </section>`;
+  }
+  async function ieLinkTypes() {
+    if (S.linkTypes && Date.now() - S.linkTypes.at < 3600000) return S.linkTypes.list;
+    const list = await api('getLinkTypes', {});
+    S.linkTypes = { at: Date.now(), list: Array.isArray(list) ? list : [] };
+    return S.linkTypes.list;
+  }
+  /** Every link type's outward and inward phrase ("blocks", "is blocked by"); a phrase offered once. */
+  function ieLinkOptions(types) {
+    const out = [];
+    const seen = new Set();
+    types.forEach((ty) => [['outward', ty.outward], ['inward', ty.inward]].forEach(([dir, phrase]) => {
+      const name = String(phrase || '').trim();
+      if (!name || seen.has(name.toLowerCase())) return;
+      seen.add(name.toLowerCase());
+      out.push({ id: `${ty.id}|${dir}`, name });
+    }));
+    return out;
+  }
+  async function linkRemove(btn) {
+    const d = S.drawer;
+    const key = drawerKey();
+    if (!d || !key || d.linkBusy) return;
+    const id = btn.dataset.linkDel;
+    const other = btn.dataset.linkKey;
+    const relation = btn.dataset.linkRel;
+    const idx = $$('#drawer [data-link-del]').indexOf(btn);
+    const ok = await confirmDialog({ title: t('links.removeTitle'), body: t('links.removeText', { key, relation, other }), okLabel: t('links.removeOk'), cancelLabel: t('common.cancel'), safeDefault: true });
+    if (!ok || S.drawer !== d || drawerKey() !== key) return;
+    d.linkBusy = id;
+    renderDrawer();
+    try {
+      await api('deleteIssueLink', { key, linkId: id });
+      if (d.detail) d.detail.links = d.detail.links.filter((l) => l.id !== id); // at once; the reload confirms
+      d.linkBusy = null;
+      renderDrawer();
+      const left = $$('#drawer [data-link-del]');
+      const next = left[Math.min(idx, left.length - 1)] || $('#link-add');
+      if (next) next.focus();
+      appLive(t('links.removed', { key: other }));
+      detailCache.delete(other);
+      ieAfterChange(key);
+    } catch (e) {
+      toastError(t('links.removeFailed'), e);
+    } finally {
+      if (S.drawer === d && d.linkBusy) { d.linkBusy = null; renderDrawer(); }
+    }
+  }
+
+  /* --- inline editors --- */
+  /** Opens the editor of one panel row ("link": the "+ Link issue" form). */
+  async function ieOpen(slot) {
+    const d = S.drawer;
+    const key = drawerKey();
+    if (!d || !d.detail || !key || d.ieLoading) return;
+    if (S.cf && !isInline()) return;
+    if (S.cf) {
+      if (S.cf.slot === slot && S.cf.key === key) { ieFocus(); return; }
+      if (!(await ieLeave())) return;
+      if (S.drawer !== d || drawerKey() !== key || S.cf) return;
+    }
+    if (slot !== 'link' && S.noEditKeys.has(key)) { toast(t('cf.noPermission')); return; }
+    d.ieLoading = slot;
+    renderDrawer(); // the row shows a spinner; focus stays on it
+    let meta = null;
+    let types = null;
+    try {
+      if (slot === 'link') types = await ieLinkTypes(); else meta = await ieMeta(key);
+    } catch (e) {
+      toastError(t(slot === 'link' ? 'links.typesFailed' : 'cf.editLoadFailed'), e);
+    } finally {
+      if (S.drawer === d) d.ieLoading = null;
+    }
+    if (S.drawer !== d) return;
+    if (drawerKey() !== key || S.cf || (slot === 'link' ? !types : !meta)) { renderDrawer(); return; }
+    let fields;
+    let values;
+    if (slot === 'link') {
+      const options = ieLinkOptions(types);
+      if (!options.length) { renderDrawer(); toast(t('links.noTypes')); return; }
+      fields = [{ id: 'linkType', name: t('links.relation'), kind: 'select', required: true, options },
+        { id: 'linkTarget', name: t('links.issue'), kind: 'issueLink', required: true }];
+      values = { linkType: { id: options.some((o) => o.id === S.lastLinkType) ? S.lastLinkType : options[0].id }, linkTarget: null };
+    } else {
+      const f = S.noEditKeys.has(key) ? null : ieFieldOf(slot, meta.fields);
+      renderDrawer();
+      if (!f) { toast(S.noEditKeys.has(key) ? t('cf.noPermission') : t('ie.readOnly')); return; } // the row is read-only now
+      fields = [f];
+      values = { [f.id]: meta.values && meta.values[f.id] != null ? meta.values[f.id] : null };
+    }
+    const root = document.createElement('div');
+    root.className = 'ie-editor' + (slot === 'link' ? ' ie-link' : ' is-single');
+    root.setAttribute('role', 'group');
+    if (slot === 'link') root.setAttribute('aria-label', t('links.add'));
+    else root.setAttribute('aria-labelledby', slot === 'description' ? 'd-desc' : `ie-l-${slot}`);
+    S.cf = { mode: 'inline', slot, key, idp: 'ie-', root, project: (meta && meta.project && meta.project.key) || key.split('-')[0],
+      fields, values, initial: Object.assign({}, values), raw: {}, errors: {}, marks: {}, cb: {}, formError: '', loading: false, loadError: null,
+      saving: false, dirty: false, wikiPreview: false, editor: null, lossy: false, conflict: false, seq: 0,
+      descriptionFormat: meta && meta.descriptionFormat === 'wiki' ? 'wiki' : 'html', updated: meta ? meta.updated : '',
+      url: (d.detail.issue && d.detail.issue.url) || '' };
+    ieRender();
+    renderDrawer();
+    ieFocus();
+  }
+  /** DR-33: an inline MR / branches textarea grows with its text (wrapped lines too), 4 to 10 lines. */
+  function ieFit(ta) {
+    const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
+    const pad = ta.offsetHeight - ta.clientHeight + parseFloat(getComputedStyle(ta).paddingTop) + parseFloat(getComputedStyle(ta).paddingBottom);
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(Math.max(ta.scrollHeight + (ta.offsetHeight - ta.clientHeight), lh * 4 + pad), lh * 10 + pad) + 'px';
+  }
+  function ieFocus() {
+    const cf = S.cf;
+    if (!isInline() || !cf.root.isConnected) return;
+    $$('.cf-field[data-kind="textarea"] textarea', cf.root).forEach(ieFit);
+    const target = cf.editor ? cf.editor.el : $('[data-field]:not(.link-btn):not(.cb-chip-x)', cf.root);
+    if (!target) return;
+    target.focus();
+    if (target.tagName === 'INPUT' && target.type === 'text') target.select();
+    target.scrollIntoView({ block: 'nearest' });
+  }
+  function ieFocusRow(slot) {
+    const el = slot === 'link' ? $('#link-add') : $(`#ie-v-${slot}`);
+    if (el) el.focus({ preventScroll: true });
+  }
+  const ieMultiLine = (cf) => cf.fields.some((f) => f.kind === 'description' || f.kind === 'textarea');
+  function ieRender() {
+    const cf = S.cf;
+    if (!isInline()) return;
+    if (cf.editor) { cf.editor.destroy(); cf.editor = null; }
+    setHTML(cf.root, html`<div class="cf-fields">${cf.fields.map(cfFieldHTML)}</div>
+      <div class="ie-actions">
+        <button type="button" class="btn btn-sm btn-primary" data-cf="submit"${cf.saving ? html` aria-busy="true"` : ''}><span>${cf.slot === 'link' ? t('links.addOk') : t('common.save')}</span></button>
+        <button type="button" class="btn btn-sm" data-cf="cancel">${t('common.cancel')}</button>
+        <span class="ie-keys">${t(ieMultiLine(cf) ? 'ie.keysMulti' : 'ie.keysSingle')}</span>
+      </div>`);
+    cfRefreshNotices();
+    cfAfterRender();
+  }
+  function ieBusy(cf, on) {
+    const save = $('.ie-actions [data-cf="submit"]', cf.root);
+    const cancel = $('.ie-actions [data-cf="cancel"]', cf.root);
+    if (save) { if (on) save.setAttribute('aria-busy', 'true'); else save.removeAttribute('aria-busy'); }
+    if (cancel) { if (on) cancel.setAttribute('aria-disabled', 'true'); else cancel.removeAttribute('aria-disabled'); }
+    cf.root.setAttribute('aria-busy', on ? 'true' : 'false');
+  }
+  /** Has the open editor anything to save? */
+  function ieDirty(cf) {
+    if (cf.conflict) return true;
+    const { values, errors } = cfValidate();
+    if (cf.slot === 'link') return !!values.linkTarget || !!($('.cb-input', cf.root) || {}).value;
+    return Object.keys(errors).some((k) => errors[k] !== t('cf.required')) || Object.keys(cfPayload(values)).length > 0;
+  }
+  /** Closes the open inline editor before something else happens; asks Save / Discard / Keep editing when it has
+      changes. Resolves true when it is closed. */
+  async function ieLeave() {
+    const cf = S.cf;
+    if (!cf) return true;
+    if (cf.mode !== 'inline' || cf.saving) return false;
+    if (!ieDirty(cf)) { ieClose(); return true; }
+    const name = cf.slot === 'link' ? t('links.add') : cf.fields[0].name;
+    const r = await confirmDialog({ title: t('ie.unsavedTitle', { name }), body: t('ie.unsavedText'), okLabel: t('cf.discard'), cancelLabel: t('cf.keepEditing'), extraLabel: cf.slot === 'link' ? t('links.addOk') : t('common.save') });
+    if (S.cf !== cf) return !S.cf;
+    if (r === 'extra') { await ieSave(); return S.cf !== cf; }
+    if (r === true) { ieClose(); return true; }
+    ieFocus();
+    return false;
+  }
+  /** Runs fn once no inline editor is open (it may ask first). */
+  function ieGuard(fn) {
+    if (!isInline()) { fn(); return; }
+    ieLeave().then((ok) => { if (ok) fn(); });
+  }
+  /** Esc / Cancel: asks only when the description was changed (SPEC). */
+  async function ieCancel() {
+    const cf = S.cf;
+    if (!isInline() || cf.saving) return;
+    if (cf.fields.some((f) => f.kind === 'description') && ieDirty(cf)) {
+      const ok = await confirmDialog({ title: t('cf.discardTitle'), body: t('ie.discardText'), okLabel: t('cf.discard'), cancelLabel: t('cf.keepEditing'), safeDefault: true });
+      if (!ok || S.cf !== cf) return;
+    }
+    ieClose();
+  }
+  function ieClose() {
+    const cf = S.cf;
+    if (!isInline()) return;
+    const active = document.activeElement;
+    const hadFocus = cf.root.contains(active) || !active || active === document.body;
+    Object.values(cf.cb).forEach((st) => clearTimeout(st.timer));
+    if (cf.editor) { cf.editor.destroy(); cf.editor = null; }
+    S.cf = null;
+    if (!S.drawer) return;
+    renderDrawer();
+    if (hadFocus) ieFocusRow(cf.slot);
+  }
+  /** The drawer closes: the editor goes without asking (the caller asked), the comment draft stays in memory. */
+  function ieDispose() {
+    if (isInline()) { if (S.cf.editor) S.cf.editor.destroy(); S.cf = null; }
+    const d = S.drawer;
+    if (d && d.composer) { cmStash(d.composer); d.composer = null; }
+  }
+  function ieError(cf, e) {
+    cf.formError = '';
+    if (e.code === 'validation' && e.fields.length) {
+      const known = e.fields.filter((x) => cfField(x.field));
+      const rest = e.fields.filter((x) => !cfField(x.field)).map((x) => x.message).filter(Boolean);
+      known.forEach((x) => cfSetError(x.field, x.message));
+      cf.formError = rest.length ? rest.join(' ') : known.length ? '' : e.message;
+    } else if (e.code === 'validation') cf.formError = e.message || t('cf.saveFailed');
+    else if (e.code === 'edit_conflict') cf.conflict = true;
+    else cf.formError = `${t(cf.slot === 'link' ? 'links.addFailed' : 'cf.saveFailed')}: ${errorText(e)}`;
+    cf.formErrorQuiet = false;
+    cf.errorLinks = [];
+    cfRefreshNotices();
+    if (cf.conflict) { const r = $('[data-cf="reload"]', cf.root); if (r) r.focus(); return; }
+    if (Object.keys(cf.errors).length) cfFocusFirst(true);
+  }
+  /** Saves the one field: updateIssue with expectedUpdated from the edit meta, which is then refreshed. */
+  async function ieSave() {
+    const cf = S.cf;
+    if (!isInline() || cf.saving) return;
+    Object.keys(cf.cb).forEach((fid) => { if (cf.cb[fid].open) cbClose(fid, true); });
+    const { values, errors } = cfValidate();
+    cf.formError = '';
+    Object.keys(cf.errors).forEach((k) => cfSetError(k, null));
+    if (cf.slot === 'link') {
+      const target = values.linkTarget && values.linkTarget.key;
+      if (!errors.linkTarget && target && target.toUpperCase() === cf.key.toUpperCase()) errors.linkTarget = t('links.self');
+    }
+    if (Object.keys(errors).length) {
+      Object.entries(errors).forEach(([k, m]) => cfSetError(k, m));
+      cfRefreshNotices();
+      cfLive(Object.values(errors)[0]);
+      cfFocusFirst(true);
+      return;
+    }
+    if (cf.slot === 'link') { await ieSaveLink(cf, values); return; }
+    const f = cf.fields[0];
+    const payload = cfPayload(values);
+    if (!Object.keys(payload).length && !cf.conflict) { ieClose(); return; } // nothing changed: no request
+    cf.saving = true;
+    ieBusy(cf, true);
+    const d = S.drawer;
+    try {
+      // CR-20: the app's own writes (a comment, a link, a transition) mark the cached meta stale and move `updated`.
+      // Refetch it: this field unchanged in Jira ⇒ save against the fresh `updated`; changed ⇒ the conflict notice.
+      const cached = d && d.editMetas && d.editMetas.get(cf.key);
+      if (cached && (cached.stale || cached.updated !== cf.updated) && !cf.conflict) {
+        const fresh = await ieMeta(cf.key);
+        if (S.cf !== cf) return;
+        if (fresh && fresh.updated !== cf.updated) {
+          const now = fresh.values ? fresh.values[f.id] : null;
+          if (cfCanon(f.kind, now) !== cfCanon(f.kind, cf.initial[f.id])) { ieError(cf, { code: 'edit_conflict', fields: [] }); return; }
+          cf.updated = fresh.updated;
+        }
+      }
+      const res = await api('updateIssue', { key: cf.key, values: payload, expectedUpdated: cf.updated });
+      const meta = d && d.editMetas && d.editMetas.get(cf.key);
+      if (meta) {
+        if (res && res.updated) { meta.updated = res.updated; meta.values = Object.assign({}, meta.values, { [f.id]: values[f.id] }); }
+        else meta.stale = true; // SPEC: refetch the edit meta when `updated` is ""
+      }
+      if (res && res.warning) toast(res.warning, { tone: 'warn' }); // saved, but e.g. Jira re-applied a default
+      await ieRefreshDetail(cf.key); // SPEC: the panel re-renders from getIssue
+      appLive(t('ie.saved', { name: f.name }));
+      if (S.cf === cf) ieClose();
+    } catch (e) {
+      if (S.cf !== cf) return;
+      ieError(cf, e);
+    } finally {
+      if (S.cf === cf) { cf.saving = false; ieBusy(cf, false); }
+    }
+  }
+  async function ieSaveLink(cf, values) {
+    const [typeId, direction] = String(values.linkType.id).split('|');
+    const target = values.linkTarget.key;
+    cf.saving = true;
+    ieBusy(cf, true);
+    try {
+      await api('addIssueLink', { key: cf.key, typeId, direction, target });
+      S.lastLinkType = values.linkType.id;
+      const phrase = (cf.fields[0].options.find((o) => o.id === values.linkType.id) || {}).name || '';
+      detailCache.delete(target);
+      const meta = S.drawer && S.drawer.editMetas && S.drawer.editMetas.get(cf.key);
+      if (meta) meta.stale = true; // a new link moves the issue's `updated`
+      await ieRefreshDetail(cf.key);
+      appLive(t('links.added', { relation: phrase, key: target }));
+      if (S.cf === cf) ieClose();
+    } catch (e) {
+      if (S.cf !== cf) return;
+      ieError(cf, e);
+    } finally {
+      if (S.cf === cf) { cf.saving = false; ieBusy(cf, false); }
+    }
+  }
+
+  /** renderDrawer helper: puts the persistent nodes (the open inline editor, the comment composer) into the freshly
+      rendered panel, keeping focus and the caret. Returns true when focus was kept. */
+  function ieKeepNodes(el, render, key, det) {
+    const d = S.drawer;
+    const cf = isInline() && S.cf.key === key ? S.cf : null;
+    let comp = null;
+    if (det && d.tab === 'comments') comp = cmFor(key, det);
+    else if (d.composer && d.composer.key !== key) { cmStash(d.composer); d.composer = null; }
+    const nodes = [cf && [cf.root, `[data-ie-slot="${cf.slot}"]`], comp && [comp.el, '[data-composer]']].filter(Boolean);
+    const active = document.activeElement;
+    const owner = nodes.find(([n]) => n.contains(active));
+    const sel = window.getSelection();
+    const caret = owner && sel && sel.rangeCount && owner[0].contains(sel.anchorNode) ? [sel.anchorNode, sel.anchorOffset, sel.focusNode, sel.focusOffset] : null;
+    const range = owner && (active.tagName === 'TEXTAREA' || (active.tagName === 'INPUT' && active.type === 'text')) ? [active.selectionStart, active.selectionEnd] : null;
+    if (S.cf) S.cf.replacing = true; // detaching the focused control fires focusout: not a user action
+    try {
+      render();
+      nodes.forEach(([node, slotSel]) => { const slot = $(slotSel, el); if (slot) slot.replaceWith(node); });
+    } finally {
+      if (S.cf) S.cf.replacing = false;
+    }
+    if (!owner || !active.isConnected) return false;
+    active.focus({ preventScroll: true });
+    try {
+      if (range) active.setSelectionRange(range[0], range[1]);
+      else if (caret) sel.setBaseAndExtent(caret[0], caret[1], caret[2], caret[3]);
+    } catch { /* the caret is a nicety */ }
+    return true;
+  }
+
+  /* --- comment composer --- */
+  const commentDrafts = new Map(); // "KEY|format" → draft text, while the app runs
+  const cmDraftKey = (c) => `${c.key}|${c.format}`;
+  function cmText(c) {
+    if (c.editor) return c.editor.isEmpty() ? '' : c.editor.getHTML();
+    const ta = $('textarea.cm-text', c.el);
+    return ta ? ta.value : '';
+  }
+  function cmStash(c) {
+    const text = cmText(c);
+    if (text.trim()) commentDrafts.set(cmDraftKey(c), text); else commentDrafts.delete(cmDraftKey(c));
+    if (c.editor) { c.editor.destroy(); c.editor = null; }
+  }
+  function cmFor(key, det) {
+    const d = S.drawer;
+    const format = det.commentFormat === 'html' ? 'html' : 'wiki';
+    if (d.composer && (d.composer.key !== key || d.composer.format !== format)) {
+      if (d.composer.posting) return null; // shown again once its comment is posted
+      cmStash(d.composer);
+      d.composer = null;
+    }
+    if (!d.composer) d.composer = cmCreate(key, format);
+    return d.composer;
+  }
+  function cmCreate(key, format) {
+    const el = document.createElement('section');
+    el.className = 'd-sec composer';
+    el.setAttribute('aria-labelledby', 'cm-title');
+    const draft = commentDrafts.get(`${key}|${format}`) || '';
+    setHTML(el, html`<h3 id="cm-title">${t('cm.title')}</h3>
+      ${format === 'html' ? html`<div class="cm-editor"></div>` : html`<div class="cf-wiki">
+        <div class="cf-wiki-bar"><span class="cf-wiki-note">${t('cf.wikiNote')}</span><button type="button" class="btn btn-sm" data-action="cm-preview" aria-pressed="false" aria-controls="cm-preview">${icon('eye')}<span>${t('cf.preview')}</span></button></div>
+        <textarea class="input textarea mono cf-wiki-text cm-text" id="cm-text" rows="4" aria-labelledby="cm-title" aria-describedby="cm-error cm-keys" spellcheck="false">${draft}</textarea>
+        <div class="cf-wiki-preview cm-preview" id="cm-preview" role="region" aria-label="${t('cf.preview')}" tabindex="0" hidden></div>
+      </div>`}
+      <p class="field-error" id="cm-error" hidden></p>
+      <div class="composer-actions">
+        <span class="ie-keys" id="cm-keys">${t('cm.keys')}</span>
+        <button type="button" class="btn btn-sm" data-action="cm-cancel">${t('common.cancel')}</button>
+        <button type="button" class="btn btn-sm btn-primary" data-action="cm-post"><span>${t('cm.post')}</span></button>
+      </div>`);
+    const c = { key, format, el, editor: null, posting: false };
+    if (format === 'html') {
+      c.editor = JiraffeEditor.create({
+        host: $('.cm-editor', el), label: t('cm.title'), describedBy: 'cm-error cm-keys', t,
+        sanitize: (src) => wiki.sanitizeForEditor(src),
+        onChange: () => cmError(c, ''),
+        onNotice: (msg) => toast(msg, { tone: 'warn' }),
+      });
+      c.editor.el.id = 'cm-text';
+      c.editor.load(draft);
+    }
+    return c;
+  }
+  function cmError(c, msg) {
+    const p = $('#cm-error', c.el);
+    if (!p || (p.textContent === msg && p.hidden === !msg)) return;
+    p.textContent = msg;
+    p.hidden = !msg;
+    if (c.editor) c.editor.setInvalid(!!msg, 'cm-error cm-keys');
+    else { const ta = $('.cm-text', c.el); if (msg) ta.setAttribute('aria-invalid', 'true'); else ta.removeAttribute('aria-invalid'); }
+    if (msg) appLive(msg);
+  }
+  function cmFocus(c) { const x = c.editor ? c.editor.el : $('.cm-text', c.el); if (x && !x.hidden) x.focus(); }
+  function cmClear(c) {
+    const ta = $('textarea.cm-text', c.el);
+    if (c.editor) c.editor.load('');
+    else if (ta) {
+      ta.value = '';
+      if (c.preview) cmTogglePreview(c);
+    }
+    commentDrafts.delete(cmDraftKey(c));
+    cmError(c, '');
+  }
+  function cmTogglePreview(c) {
+    c.preview = !c.preview;
+    const ta = $('.cm-text', c.el);
+    const pv = $('.cm-preview', c.el);
+    const btn = $('[data-action="cm-preview"]', c.el);
+    if (c.preview) pv.replaceChildren(wiki.render(ta.value || ''));
+    ta.hidden = c.preview;
+    pv.hidden = !c.preview;
+    btn.setAttribute('aria-pressed', c.preview ? 'true' : 'false');
+    btn.classList.toggle('is-on', c.preview);
+  }
+  async function cmPost() {
+    const d = S.drawer;
+    const c = d && d.composer;
+    if (!c || c.posting) return;
+    const body = cmText(c);
+    if (!body.trim()) { cmError(c, t('cm.empty')); cmFocus(c); return; }
+    if (body.length > 32000) { cmError(c, t('cf.tooLong', { n: 32000 })); cmFocus(c); return; }
+    c.posting = true;
+    const btn = $('[data-action="cm-post"]', c.el);
+    btn.setAttribute('aria-busy', 'true');
+    try {
+      const res = await api('addComment', { key: c.key, body, format: c.format });
+      cmClear(c);
+      const det = S.drawer === d && drawerKey() === c.key ? d.detail : null;
+      if (det && res) {
+        det.comments = det.comments.concat([res]);
+        renderDrawer();
+        const li = $(`#cmt-${CSS.escape(domId(String(res.id)))}`);
+        if (li) { li.focus(); li.scrollIntoView({ block: 'nearest' }); }
+      }
+      appLive(t('cm.posted'));
+      const meta = d && d.editMetas && d.editMetas.get(c.key);
+      if (meta) meta.stale = true; // a comment moves the issue's `updated`
+    } catch (e) {
+      const field = e.code === 'validation' && e.fields.length ? e.fields[0].message : '';
+      cmError(c, e.code === 'validation' ? field || e.message || t('cm.failed') : e.code === 'forbidden_comment' ? errorText(e) : `${t('cm.failed')}: ${errorText(e)}`);
+    } finally {
+      c.posting = false;
+      btn.removeAttribute('aria-busy');
+    }
+  }
+  async function cmCancel() {
+    const c = S.drawer && S.drawer.composer;
+    if (!c || c.posting) return;
+    if (cmText(c).trim()) {
+      const ok = await confirmDialog({ title: t('cm.discardTitle'), body: t('cm.discardText'), okLabel: t('cf.discard'), cancelLabel: t('cf.keepEditing'), safeDefault: true });
+      if (!ok || !S.drawer || S.drawer.composer !== c) return;
+    }
+    cmClear(c);
+    cmFocus(c);
   }
 
   /* ================================================================
@@ -5958,6 +6662,13 @@
     $('#upd-settings').addEventListener('click', onUpdateSettingsClick);
     $('#drawer').addEventListener('click', onDrawerClick);
     $('#drawer').addEventListener('keydown', onDrawerKey);
+    const drawerEl = $('#drawer'); // v0.6 inline editors (each handler checks that the event is inside the open editor)
+    drawerEl.addEventListener('input', onCfInput);
+    drawerEl.addEventListener('change', onCfChange);
+    drawerEl.addEventListener('focusout', onCfFocusOut);
+    drawerEl.addEventListener('keydown', onCfKey);
+    drawerEl.addEventListener('click', onCfClick);
+    drawerEl.addEventListener('mousedown', (e) => { if (e.target.closest('.ie-editor .cb-opt')) e.preventDefault(); }); // keep focus in the picker
     $('#scrim').addEventListener('click', () => layers.closeTop('scrim'));
 
     // Status view

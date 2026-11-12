@@ -83,6 +83,9 @@ type FieldMetaDTO struct {
 	Options  []OptionDTO `json:"options,omitempty"`
 	Default  any         `json:"default,omitempty"`
 	Max      int         `json:"max,omitempty"`
+	// Role names the field's purpose independent of its (instance-specific)
+	// id or localized name; "" (omitted) for other fields. See roleOf.
+	Role string `json:"role,omitempty"`
 	// agile: the sprint is not in Jira's meta and is set via the agile API.
 	agile bool
 }
@@ -257,13 +260,42 @@ func mainOrder(ids jira.FieldIDs, typeKind string) []string {
 	return out
 }
 
+// roleOf is the FieldMeta role of a field id: the system ids reporter,
+// assignee, description and the discovered developer, reviewer, qa,
+// mergeRequests, branches, storyPoints, devStoryPoints, qaStoryPoints.
+func roleOf(id string, ids jira.FieldIDs) string {
+	switch id {
+	case "":
+		return ""
+	case "reporter", "assignee", "description":
+		return id
+	}
+	for _, r := range []struct{ id, role string }{
+		{ids.Developer, "developer"}, {ids.Reviewer, "reviewer"}, {ids.QA, "qa"},
+		{ids.MergeRequests, "mergeRequests"}, {ids.Branches, "branches"},
+		{ids.StoryPoints, "storyPoints"}, {ids.DevStoryPoints, "devStoryPoints"}, {ids.QAStoryPoints, "qaStoryPoints"},
+	} {
+		if r.id == id {
+			return r.role
+		}
+	}
+	return ""
+}
+
+// editExtras are the fields the edit form (and inline editing) also offers
+// when Jira's edit meta has them, after the main fields (v0.6).
+func editExtras(ids jira.FieldIDs) []string {
+	return []string{"reporter", ids.Developer, ids.Reviewer, ids.QA, ids.MergeRequests, ids.Branches}
+}
+
 // buildFields turns Jira meta fields into the form: the main fields present
 // (in their order) and every other required field (in Jira's order);
 // unsupported main fields that are not required are left out. A required
 // reporter without a default defaults to me (Jira Server fills it in).
-func buildFields(meta []jira.MetaField, ids jira.FieldIDs, typeKind string, me *jira.User) []FieldMetaDTO {
+// extra are further fields shown with the main ones, after them (edit).
+func buildFields(meta []jira.MetaField, ids jira.FieldIDs, typeKind string, me *jira.User, extra []string) []FieldMetaDTO {
 	order := map[string]int{}
-	for i, id := range mainOrder(ids, typeKind) {
+	for i, id := range append(mainOrder(ids, typeKind), extra...) {
 		if id != "" {
 			if _, dup := order[id]; !dup {
 				order[id] = i
@@ -277,7 +309,7 @@ func buildFields(meta []jira.MetaField, ids jira.FieldIDs, typeKind string, me *
 			continue
 		}
 		_, isMain := order[f.ID]
-		d := FieldMetaDTO{ID: f.ID, Name: f.Name, Kind: kind, Required: f.Required, Main: isMain, Max: max}
+		d := FieldMetaDTO{ID: f.ID, Name: f.Name, Kind: kind, Required: f.Required, Main: isMain, Max: max, Role: roleOf(f.ID, ids)}
 		if d.Name == "" {
 			d.Name = f.ID
 		}
@@ -380,8 +412,8 @@ func readValue(f FieldMetaDTO, raw json.RawMessage) any {
 		if json.Unmarshal(raw, &us) == nil {
 			out := []UserDTO{}
 			for _, u := range us {
-				if u.Name != "" {
-					out = append(out, UserDTO{Name: u.Name, DisplayName: orElse(u.DisplayName, u.Name)})
+				if d := (UserDTO{Name: u.Name, DisplayName: orElse(u.DisplayName, u.Name)}); u.Name != "" && !isPlaceholderUser(d) {
+					out = append(out, d)
 				}
 			}
 			return out
@@ -674,7 +706,7 @@ func (a *App) createMetaFor(ctx context.Context, c *jira.Client, id, project, ty
 		if err != nil {
 			return nil, a.editErr(err)
 		}
-		tm = &typeMeta{fields: a.addSprint(ctx, c, id, project, v, buildFields(meta, v.meta.fields, chosen.Kind, v.me), chosen.Kind)}
+		tm = &typeMeta{fields: a.addSprint(ctx, c, id, project, v, buildFields(meta, v.meta.fields, chosen.Kind, v.me, nil), chosen.Kind)}
 		tm.format, tm.known = a.projectDescriptionFormatKnown(ctx, c, id, project)
 		if tm.fields == nil {
 			tm.fields = []FieldMetaDTO{}
@@ -723,6 +755,9 @@ func formCandidates(meta []jira.MetaField, ids jira.FieldIDs) []string {
 		for _, id := range mainOrder(ids, k) {
 			main[id] = true
 		}
+	}
+	for _, id := range editExtras(ids) {
+		main[id] = true
 	}
 	var out []string
 	for _, f := range meta {
@@ -775,7 +810,7 @@ func (a *App) editStateOf(ctx context.Context, c *jira.Client, id, key string, w
 		Updated: updated, Fields: []FieldMetaDTO{}, Values: map[string]any{}}}
 	typeKind := v.kind(&it)
 	if len(meta) > 0 { // none ⇒ no edit permission: fields stay []
-		st.dto.Fields = a.addSprint(ctx, c, id, project, v, buildFields(meta, v.meta.fields, typeKind, nil), typeKind)
+		st.dto.Fields = a.addSprint(ctx, c, id, project, v, buildFields(meta, v.meta.fields, typeKind, nil, editExtras(v.meta.fields)), typeKind)
 	}
 	if !withValues {
 		return st, nil
@@ -786,6 +821,9 @@ func (a *App) editStateOf(ctx context.Context, c *jira.Client, id, key string, w
 	var epicKeys []string
 	for _, f := range st.dto.Fields {
 		val := readValue(f, raw[f.ID])
+		if s, ok := val.(string); ok && (f.ID == v.meta.fields.MergeRequests || f.ID == v.meta.fields.Branches) {
+			val = fieldText(s) // CRLF, the "Не заполнено" default
+		}
 		if val == nil {
 			continue
 		}
@@ -867,17 +905,19 @@ func (a *App) searchIssuesFor(ctx context.Context, purpose, project, query strin
 	if len(query) > maxSearchQuery {
 		return nil, a.badParams("query is too long")
 	}
-	if !jira.ValidProjectKey(project) {
+	if purpose != "link" && !jira.ValidProjectKey(project) {
 		return nil, a.badParams("project is required")
 	}
 	var jql string
 	switch purpose {
+	case "link": // any issue the user can see, any project and type
+		jql = ""
 	case "epic":
 		jql = "project = " + quoteKeys([]string{strings.ToUpper(project)}) + " AND issuetype = Epic AND statusCategory != Done"
 	case "parent":
 		jql = "project = " + quoteKeys([]string{strings.ToUpper(project)}) + " AND issuetype not in subTaskIssueTypes() AND statusCategory != Done"
 	default:
-		return nil, a.badParams(`purpose must be "epic" or "parent"`)
+		return nil, a.badParams(`purpose must be "epic", "parent" or "link"`)
 	}
 	var or []string
 	if t := pickerText(query); t != "" {
@@ -886,10 +926,13 @@ func (a *App) searchIssuesFor(ctx context.Context, purpose, project, query strin
 	if k := strings.ToUpper(query); jira.ValidIssueKey(k) {
 		or = append(or, "key = "+quoteKeys([]string{k}))
 	}
-	if len(or) > 0 {
+	switch {
+	case len(or) > 0 && jql == "":
+		jql = "(" + strings.Join(or, " OR ") + ")"
+	case len(or) > 0:
 		jql += " AND (" + strings.Join(or, " OR ") + ")"
 	}
-	jql += " ORDER BY updated DESC"
+	jql = strings.TrimSpace(jql + " ORDER BY updated DESC")
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	v, err := a.newView(ctx, c, id)

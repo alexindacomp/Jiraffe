@@ -469,6 +469,56 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 			return nil, err
 		}
 		return a.updateIssue(ctx, p.Key, p.Values, p.ExpectedUpdated)
+	case "searchUsers":
+		var p struct {
+			Query string `json:"query"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.searchUsers(ctx, p.Query)
+	case "openFieldLink":
+		var p struct {
+			Key   string `json:"key"`
+			Field string `json:"field"`
+			URL   string `json:"url"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, a.openFieldLink(ctx, p.Key, p.Field, p.URL)
+	case "getLinkTypes":
+		return a.getLinkTypes(ctx)
+	case "addIssueLink":
+		var p struct {
+			Key       string `json:"key"`
+			TypeID    string `json:"typeId"`
+			Direction string `json:"direction"`
+			Target    string `json:"target"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, a.addIssueLink(ctx, p.Key, p.TypeID, p.Direction, p.Target)
+	case "deleteIssueLink":
+		var p struct {
+			Key    string `json:"key"`
+			LinkID string `json:"linkId"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, a.deleteIssueLink(ctx, p.Key, p.LinkID)
+	case "addComment":
+		var p struct {
+			Key    string `json:"key"`
+			Body   string `json:"body"`
+			Format string `json:"format"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.addComment(ctx, p.Key, p.Body, p.Format)
 	case "getUpdateStatus":
 		return a.updateStatus(), nil
 	case "checkForUpdates":

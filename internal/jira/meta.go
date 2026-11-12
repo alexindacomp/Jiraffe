@@ -44,12 +44,20 @@ type FieldIDs struct {
 	// the real Jira they are select fields).
 	DevStoryPoints string
 	QAStoryPoints  string
+	// v0.6, found by name (see DiscoverFields): free-text MR / branch
+	// fields and the multi-user people fields.
+	MergeRequests string
+	Branches      string
+	Developer     string
+	Reviewer      string
+	QA            string
 }
 
 // List returns the ids that exist (for the "fields" query parameter).
 func (f FieldIDs) List() []string {
 	var out []string
-	for _, id := range []string{f.EpicLink, f.EpicName, f.EpicColor, f.Sprint, f.StoryPoints, f.DevStoryPoints, f.QAStoryPoints} {
+	for _, id := range []string{f.EpicLink, f.EpicName, f.EpicColor, f.Sprint, f.StoryPoints, f.DevStoryPoints, f.QAStoryPoints,
+		f.MergeRequests, f.Branches, f.Developer, f.Reviewer, f.QA} {
 		if id != "" {
 			out = append(out, id)
 		}
@@ -72,12 +80,25 @@ const (
 	FieldQAStoryPoints  = "QA Story Points"
 )
 
+// Names (or clause names) of the v0.6 fields.
+var (
+	FieldMergeRequests = []string{"Merge_requests", "Merge requests"}
+	FieldBranches      = []string{"Branches"}
+	FieldDeveloper     = []string{"Developer"}
+	FieldReviewer      = []string{"Reviewer"}
+	FieldQA            = []string{"QA Engineer"}
+	FieldQAFallback    = []string{"QA"}
+)
+
 // DiscoverFields finds the Epic Link / Epic Name / Epic Color / Sprint fields
 // by their schema, Story Points as a number field whose clause names
-// contain "Story Points", and Dev / QA Story Points by field name or clause
-// name, any schema (case-insensitive, trimmed). The first match wins.
+// contain "Story Points", and Dev / QA Story Points, Merge requests,
+// Branches, Developer, Reviewer and QA Engineer (fallback "QA") by field
+// name or clause name, any schema (case-insensitive, trimmed). The first
+// match wins.
 func DiscoverFields(defs []FieldDef) FieldIDs {
 	var f FieldIDs
+	var qaFallback string
 	set := func(dst *string, id string) {
 		if *dst == "" {
 			*dst = id
@@ -92,6 +113,17 @@ func DiscoverFields(defs []FieldDef) FieldIDs {
 		}
 		if d.named(FieldQAStoryPoints) {
 			set(&f.QAStoryPoints, d.ID)
+		}
+		for _, n := range []struct {
+			dst   *string
+			names []string
+		}{{&f.MergeRequests, FieldMergeRequests}, {&f.Branches, FieldBranches}, {&f.Developer, FieldDeveloper},
+			{&f.Reviewer, FieldReviewer}, {&f.QA, FieldQA}, {&qaFallback, FieldQAFallback}} {
+			for _, name := range n.names {
+				if d.named(name) {
+					set(n.dst, d.ID)
+				}
+			}
 		}
 		if d.Schema == nil {
 			continue
@@ -114,6 +146,9 @@ func DiscoverFields(defs []FieldDef) FieldIDs {
 				}
 			}
 		}
+	}
+	if f.QA == "" {
+		f.QA = qaFallback
 	}
 	return f
 }

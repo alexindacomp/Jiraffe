@@ -53,6 +53,9 @@
     <symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
     <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></symbol>
     <!-- v0.5: issue form + rich-text editor -->
+    <!-- v0.6: issue panel -->
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
     <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M17 3a2.85 2.85 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5z"/><path d="m15 5 4 4"/></symbol>
     <symbol id="i-heading-3" viewBox="0 0 24 24"><path d="M4 6v12M12 6v12M4 12h8"/><path d="M16.5 8.5a2 2 0 1 1 2.5 3 2 2 0 1 1-2.5 3"/></symbol>
     <symbol id="i-heading-4" viewBox="0 0 24 24"><path d="M4 6v12M12 6v12M4 12h8"/><path d="M19 18V8l-3.5 6H21"/></symbol>
@@ -484,6 +487,7 @@
     <div class="modal-actions">
       <button type="button" class="btn" data-action="cancel" data-i18n="common.cancel"></button>
       <button type="button" class="btn btn-primary" data-action="ok" id="confirm-ok"></button>
+      <button type="button" class="btn btn-primary" data-action="extra" id="confirm-extra" hidden></button>
     </div>
   </div>
 </dialog>
@@ -524,6 +528,7 @@
 <div class="menu" id="menu" hidden></div>
 
 <div class="toasts" id="toasts" aria-live="polite" aria-relevant="additions"></div>
+<p class="sr-only" id="app-live" aria-live="polite"></p><!-- v0.6: issue panel announcements (outside the inert app) -->
 
 <script src="i18n.js"></script>
 <script src="mock.js"></script>

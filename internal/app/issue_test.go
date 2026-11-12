@@ -103,7 +103,7 @@ func TestGetIssueMapping(t *testing.T) {
 		t.Errorf("detail %+v", d)
 	}
 	js, _ := json.Marshal(d)
-	for _, want := range []string{`"timeTracking":{"originalSeconds":32400,`, `"original":"1d"`, `"links":[{"relation":"blocks","issue":{`,
+	for _, want := range []string{`"timeTracking":{"originalSeconds":32400,`, `"original":"1d"`, `"links":[{"id":"1","relation":"blocks","issue":{`,
 		`"changelog":[{"id":"101"`, `"sprints":[{"id":6338`, `"watchers":4`} {
 		if !strings.Contains(string(js), want) {
 			t.Errorf("JSON lacks %s: %s", want, js)

@@ -6,7 +6,9 @@ filter and each project's own columns (from its agile board or workflow), quick
 status changes from a dropdown, issue details (description, comments, history,
 estimates, links, epic and stories), sprints as a backlog-style list grouped by
 sprint, epics & stories, tracked projects and alerts about new comments on my
-issues, creating and editing issues (rich-text editor for HTML descriptions),
+issues, creating and editing issues (rich-text editor for HTML descriptions;
+fields, people, story points, merge requests/branches and links editable right in
+the issue panel), writing comments,
 a per-project epic time dashboard and automatic updates. One
 self-contained `jiraffe.exe` (Go, no CGO, WebView2 UI, about 4.6 MB). The full specification is in [SPEC.md](SPEC.md).
 

@@ -5,6 +5,7 @@ import "fmt"
 // strings shown by the Go side (tray menu, balloons, dialogs).
 var texts = map[string]map[string]string{
 	"en": {
+		"err_forbidden_comment":      "You have no permission to comment on this issue in Jira",
 		"fe_html":                    "This formatting cannot be saved: %s",
 		"err_busy_create":            "This issue is already being created",
 		"warn_sprint_not_changed":    "Saved, but the sprint was not changed: %s",
@@ -124,6 +125,7 @@ var texts = map[string]map[string]string{
 		"errTokenForNewHost":         "Enter the token again when changing the Jira address",
 	},
 	"ru": {
+		"err_forbidden_comment":      "У вас нет прав комментировать эту задачу в Jira",
 		"fe_html":                    "Такое оформление нельзя сохранить: %s",
 		"err_busy_create":            "Эта задача уже создаётся",
 		"warn_sprint_not_changed":    "Сохранено, но спринт не изменён: %s",
@@ -243,6 +245,7 @@ var texts = map[string]map[string]string{
 		"errTokenForNewHost":         "При смене адреса Jira введите токен заново",
 	},
 	"uk": {
+		"err_forbidden_comment":      "У вас немає прав коментувати цю задачу в Jira",
 		"fe_html":                    "Таке оформлення не можна зберегти: %s",
 		"err_busy_create":            "Ця задача вже створюється",
 		"warn_sprint_not_changed":    "Збережено, але спринт не змінено: %s",

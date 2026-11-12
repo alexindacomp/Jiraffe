@@ -1175,3 +1175,202 @@ simply not sent; on update they clear the field (`null` / `[]`). Clearing an est
 4. Validation errors (ours and Jira's) are shown per field; unsupported required fields block creation with a way
    to finish in Jira.
 5. `go vet`, `go test` pass; exe ≤ 5 MB; ru/uk/en; light/dark; no network resources in the page; top bar fits at 760 px.
+
+# v0.6 — issue panel: more fields, inline editing, links, comments
+
+Decisions (user): fields are edited **in place in the issue panel** (click → editor → save that one field; the
+v0.5 edit form stays); MRs/branches come from **fields of the issue** (filled in by hand); review = code + design only.
+
+Real-Jira facts (checked):
+- `Merge_requests` (`customfield_13619`) and `Branches` (`customfield_13702`): **textarea**, free text, typically one
+  URL / one `repo: branch` per line, CRLF; the literal default text **"Не заполнено"** means empty.
+  Examples: `https://gitlab.rozetka.company/marketplace/front/-/merge_requests/6224`,
+  `front: MF-8026/moderation-stages-chips-filters`, `warranty-service-api:WS-131`.
+- `Developer` (`customfield_10400`), `Reviewer` (`customfield_10402`), `QA Engineer` (`customfield_10401`):
+  **multi-user pickers**; empty is represented by a placeholder user whose display name is **"неназначено"**.
+- Issue links: standard (`issuelinks`, types like Blocks: inward "is blocked by" / outward "blocks", Relates).
+- The dev-status panel is empty / access-denied in this Jira — not used.
+
+## Discovery (by field name or clause name, case-insensitive, trimmed; absent ⇒ feature hidden)
+`mergeRequests`: "Merge_requests" | "Merge requests"; `branches`: "Branches"; `developer`: "Developer";
+`reviewer`: "Reviewer"; `qa`: "QA Engineer" (fallback "QA"). Dev/QA story points as in v0.4.
+
+## IssueDetail (additions)
+```
+updated stays as is (display); for edits the UI always uses getEditMeta.updated
+developer?: [User], reviewer?: [User], qa?: [User]      // present (possibly []) iff the field exists;
+                                                        // placeholder users ("неназначено", "unassigned",
+                                                        // "не назначено", case-insensitive) are dropped
+mergeRequests?: string, branches?: string               // raw text, "\r\n"→"\n", trimmed; "Не заполнено" ⇒ "";
+                                                        // present iff the field exists
+links: [LinkDTO + { id }]                               // link id added (for removal)
+commentFormat: "html" | "wiki"                          // see Comments
+```
+Placeholder handling is display-only: writes send exactly what the user chose (`[]` clears; Jira may re-apply its default).
+
+## Inline editing (drawer)
+- Editable in place: **description**, **assignee**, **reporter**, **developer**, **reviewer**, **qa**, **story points**,
+  **dev story points**, **qa story points**, **merge requests**, **branches**, and **links** (add/remove).
+- On the first inline edit of an issue the UI calls `getEditMeta {key}` (once per drawer open, reused; never
+  prefetched on open). A field not present in the edit meta ⇒ read-only (tooltip "can't be edited in Jira for this
+  issue"); `fields: []` ⇒ no edit permission (v0.5 behaviour).
+- Backend: the edit meta's form fields now also include, when present in Jira's editmeta: `reporter` (kind `user`),
+  developer/reviewer/qa (kind `users`), mergeRequests/branches (kind `textarea`), so `updateIssue` accepts them
+  (they also appear in the v0.5 edit form after the main fields). No other contract change.
+- Save = `updateIssue {key, values: {fieldId: value}, expectedUpdated}` with **one field**; on success the drawer
+  re-renders from `getIssue` and the cached edit meta's `updated` is refreshed (refetch edit meta if `updated` is "");
+  `edit_conflict` ⇒ inline message "Changed in Jira meanwhile" + Reload (re-fetch, keep the user's draft in the
+  editor). `validation` ⇒ inline field error. `warning` ⇒ toast.
+- Editors: people → the v0.5 pickers (assignee: `searchAssignable`; reporter/developer/reviewer/qa: new
+  `searchUsers`), multi-user as chips; numbers / select story points as in the form; MR/branches → plain multi-line
+  textarea; description → the v0.5 rich editor (html) or wiki textarea + preview, same lossy notice rules.
+- UX: pencil appears on hover/focus of the field row (rows are keyboard-focusable: Enter/F2 opens the editor);
+  Save / Cancel buttons; Enter saves single-line editors, Ctrl+Enter multi-line/rich; Esc cancels (asks only if the
+  rich description changed); busy state; one inline editor open at a time (opening another asks to save/discard if
+  dirty); focus returns to the field row.
+
+## Merge requests & branches (display)
+- A "Development" section in Details: **Merge requests** — one row per non-empty line; an `http(s)://` URL becomes a
+  link (label: `<project path> !<iid>` for GitLab MR URLs `…/<group>/<project>/-/merge_requests/<n>`, else the URL);
+  other text shown as text. **Branches** — one row per line, monospace; `repo: branch` / `repo:branch` shown as repo
+  chip + branch. Empty ⇒ "—". Copy-to-clipboard button for branch names.
+- Opening links: new method `openFieldLink {key, field: "mergeRequests"|"branches", url}` — the backend re-reads that
+  field of that issue and opens `url` via the shell **only if** it appears verbatim as a whitespace-separated token in
+  the field's current value and is an absolute `http(s)` URL without userinfo or control characters. Otherwise
+  `bad_params`. (`openUrl` keeps its Jira-origin rule.)
+
+## Links ("Relates to", "Blocks", …)
+- Display as today, grouped by relation phrase, plus a remove (×) button per link (confirm) and an "+ Link issue"
+  action: relation select (every link type's outward and inward phrase, from `getLinkTypes`), issue picker
+  (`searchIssuesFor` with new purpose `"link"`: any issue type in any project the user can see; query by key or text),
+  Save.
+- Methods:
+  - `getLinkTypes` → `[{ id, name, inward, outward }]` (cached 1 h).
+  - `addIssueLink { key, typeId, direction: "outward"|"inward", target }` → null. Meaning: "`key` <phrase> `target`"
+    where phrase = the type's outward (direction outward) or inward text. Map to
+    `POST /rest/api/2/issueLink {type:{id}, inwardIssue:{key}, outwardIssue:{key}}` so that reading `key`'s
+    `issuelinks` afterwards shows exactly that phrase towards `target` (verify the direction mapping against the
+    Jira Server docs and encode it in a test with a fake Jira that mirrors Jira's GET representation).
+  - `deleteIssueLink { key, linkId }` → null; the backend first reads `key`'s links and only deletes a link id that
+    belongs to `key` (else `bad_params`); `DELETE /rest/api/2/issueLink/{id}`.
+  - Errors: 403 ⇒ `forbidden_edit`; 400/404 ⇒ `validation`/`not_found`. Caches invalidated + `board` event.
+
+## Comments
+- `IssueDetail.commentFormat`: `"html"` if most of the issue's last ≤ 10 comments look like HTML; `"wiki"` if they
+  look like wiki/plain; no comments ⇒ the project's description format (v0.5, known/guessed).
+- Method `addComment { key, body, format }` → `CommentDTO` (the created comment). `format` must equal the issue's
+  current `commentFormat` (else `bad_params`). `html` ⇒ strict `checkHTML` (images: Jira attachment paths only);
+  `wiki` ⇒ the full unmasked screen (like textarea). Body 1–32 000 chars, trimmed; empty ⇒ validation.
+  `POST /rest/api/2/issue/{key}/comment {body}`; 403 ⇒ `forbidden_comment` (localized). The comment-alert
+  poller must not alert on the user's own new comment (already filtered by author — keep it so).
+- UI: at the bottom of the Comments tab a composer: the rich editor (html) or wiki textarea + preview, "Comment"
+  button (Ctrl+Enter), Cancel clears (asks if non-empty). On success the new comment appears at the end, the
+  composer clears, the tab count updates, focus goes to the new comment. Draft kept per issue in memory while the
+  app runs. Errors inline.
+
+## Methods (additions)
+`searchUsers { query }` → `[User]` (≤ 20; `GET /rest/api/2/user/search?username=Q&maxResults=20`; empty query ⇒ []),
+`openFieldLink`, `getLinkTypes`, `addIssueLink`, `deleteIssueLink`, `addComment`; `searchIssuesFor` purpose `"link"`.
+
+## Contract additions (v0.6)
+
+Exact shapes as implemented (deviations / precisions marked **≠**).
+
+### IssueDetail (getIssue)
+```jsonc
+{
+  // … v0.5 fields unchanged …
+  "links": [ { "id": "501", "relation": "blocks", "issue": { "key": "RBI-61", "summary": "…", /* IssueRef */ } } ],
+  "developer": [ { "name": "bob", "displayName": "Bob" } ],   // present iff the field exists in this Jira
+  "reviewer": [],                                             // [] — empty, or only placeholder users
+  "qa": [],                                                   // a null field value is [] too
+  "mergeRequests": "https://gitlab.example/front/-/merge_requests/6224\nfront: MF-8026/chips",  // present iff the field exists
+  "branches": "",                                             // "" — empty or "Не заполнено"
+  "commentFormat": "html"                                     // always present: "html" | "wiki"
+}
+```
+- People: placeholder users are dropped when the display name or user name is (trimmed, case-insensitive)
+  "неназначено", "не назначено" or "unassigned". MR/branch text: `\r\n` and `\r` → `\n`, trimmed, the default
+  text "Не заполнено" (case-insensitive) ⇒ `""`.
+- `commentFormat`: the latest 10 comments, counting the non-empty ones; `"html"` when more than half of those look like
+  HTML, else `"wiki"`; none counted ⇒ the project's description format (v0.5; `"wiki"` when unknown).
+- Field discovery (field name or clause name, case-insensitive, trimmed; first match wins): mergeRequests
+  "Merge_requests" | "Merge requests", branches "Branches", developer "Developer", reviewer "Reviewer", qa
+  "QA Engineer", else "QA".
+
+### Edit meta (getEditMeta / updateIssue)
+- When Jira's edit meta has them, `fields` also contains, **after** the main fields and before the required extras,
+  with `main: true`: `reporter` (kind `user`), developer / reviewer / qa (kind `users`), mergeRequests / branches (kind
+  `textarea`, `max` 32000) — the kinds come from the Jira schema as in v0.5 (an unsupported schema leaves the field
+  out unless required). Create meta is unchanged (a required `reporter` keeps its v0.5 default).
+- `role` (new, optional) names a field's purpose independently of its instance-specific id and localized name:
+  `"reporter"`, `"assignee"`, `"description"` (system fields), `"developer"`, `"reviewer"`, `"qa"`, `"mergeRequests"`,
+  `"branches"`, `"storyPoints"`, `"devStoryPoints"`, `"qaStoryPoints"` (discovered fields); omitted for every other
+  field (create meta too). Match fields by `role`, never by `name`:
+```jsonc
+{ "id": "customfield_10400", "name": "Developer", "kind": "users", "required": false, "main": true, "role": "developer" }
+{ "id": "customfield_10204", "name": "Dev Story Points", "kind": "storyPoints", "required": false, "main": true,
+  "options": [ { "id": "10601", "name": "8" } ], "role": "devStoryPoints" }
+{ "id": "summary", "name": "Summary", "kind": "summary", "required": true, "main": true, "max": 255 }   // no role
+```
+- `values` of these fields: people as in v0.5 (`users` ⇒ `[{name, displayName}]`) **≠** with placeholder users
+  dropped; MR/branch text normalized like IssueDetail (`"Не заполнено"` ⇒ `""`).
+- Writes as v0.5: `users` accepts `[{"name"}]` or `["name"]` (`[]` clears); a textarea `""` is sent as `null`
+  (clears); textarea values get the full wiki screen (no `{code}` exemption). Example single-field saves:
+```jsonc
+{ "key": "RBI-50", "values": { "customfield_10400": [ { "name": "bob" }, "carol" ] }, "expectedUpdated": "…" }
+// → PUT {"fields":{"customfield_10400":[{"name":"bob"},{"name":"carol"}]}}
+{ "key": "RBI-50", "values": { "reporter": { "name": "carol" } }, "expectedUpdated": "…" }
+{ "key": "RBI-50", "values": { "customfield_13619": "https://gitlab.example/x/-/merge_requests/1\nhttps://gitlab.example/y" }, "expectedUpdated": "…" }
+```
+
+### Methods
+```jsonc
+// searchUsers {"query":"bo"}           (trimmed, ≤ 100 chars; "" ⇒ [] without a request)
+[ { "name": "bob", "displayName": "Bob" } ]   // ≤ 20, placeholder users dropped
+
+// openFieldLink {"key":"RBI-40","field":"mergeRequests"|"branches","url":"https://gitlab.example/front/-/merge_requests/6224"}
+null   // opened via the shell; bad_params unless the url equals a whitespace-separated token of the field's current
+       // value (re-read now) — verbatim, or with the token's trailing ".,;:)" characters removed ("…/57)," ⇒ "…/57") —
+       // and is an absolute http(s) URL with a host, without user info, spaces, control or invisible format (Cf)
+       // characters, at most 2 KB; bad_params also when this Jira has no such field
+
+// getLinkTypes                          (cached 1 h)
+[ { "id": "10000", "name": "Blocks", "inward": "is blocked by", "outward": "blocks" } ]
+
+// addIssueLink {"key":"RBI-60","typeId":"10000","direction":"outward","target":"RBI-61"}
+null   // afterwards RBI-60 shows "blocks RBI-61" and RBI-61 shows "is blocked by RBI-60";
+       // direction "inward" ⇒ RBI-60 "is blocked by" the target. target is upper-cased.
+
+// deleteIssueLink {"key":"RBI-60","linkId":"501"}
+null   // only a link listed on `key` (source or destination); else bad_params
+
+// addComment {"key":"RBI-80","body":"Fixed in *1.2*","format":"wiki"}
+{ "id": "10234", "author": { "name": "alex", "displayName": "Alex" },
+  "created": "2026-11-12T11:00:00+02:00", "updated": "2026-11-12T11:00:00+02:00", "body": "Fixed in *1.2*" }
+
+// searchIssuesFor {"purpose":"link","query":"cma-12"}    (project optional and ignored for "link")
+[ IssueRef ]   // JQL: (summary ~ "cma-12*" OR key = "CMA-12") ORDER BY updated DESC — any project, any type,
+               // any status; an empty query ⇒ "ORDER BY updated DESC"
+```
+- Link direction (Jira Server): `POST /rest/api/2/issueLink` creates the link with `inwardIssue` as its **source**
+  (the issue that shows the outward phrase) and `outwardIssue` as its destination. So
+  "key <outward> target" ⇒ `{type:{id}, inwardIssue:{key}, outwardIssue:{target}}`;
+  "key <inward> target" ⇒ `{type:{id}, inwardIssue:{target}, outwardIssue:{key}}`.
+- `addIssueLink` errors: `bad_params` (invalid keys, target = key, unknown `typeId` (not in getLinkTypes), direction
+  other than outward/inward); Jira 403 ⇒ `forbidden_edit`; 400 ⇒ `validation` (Jira's text in `message`); 404 ⇒
+  `not_found`. `deleteIssueLink`: same mapping. Both drop the issue caches and emit `board` (`{}`).
+- `addComment`: the body is trimmed; `format` must equal the issue's current commentFormat (the latest ≤ 10 comments,
+  else the project's format) — else `bad_params` (`"format must be \"wiki\" for this issue"`). Checks (`validation`
+  on field `"body"`): empty ⇒ required; > 32 000 characters ⇒ too long; `html` ⇒ the HTML description contract (images
+  on the Jira origin's attachment/avatar paths only); `wiki` ⇒ the full wiki screen (no `{code}` exemption). Jira 403 ⇒
+  `forbidden_comment` ("You have no permission to comment on this issue in Jira"); Jira 400 ⇒ `validation` (Jira's
+  `comment` error on `"body"`). No event (no cached view shows comments); the comment poller never alerts on my own
+  comments.
+
+## Acceptance criteria v0.6
+1. The issue panel shows Merge requests, Branches (with working links), Developer, Reviewer, QA, and links with ids.
+2. Description, assignee, reporter, developer, reviewer, QA, story points (incl. Dev/QA), MRs and branches can be
+   edited in place; links can be added and removed; conflicts and errors are shown inline.
+3. Comments can be written (HTML or wiki per the issue) and appear immediately.
+4. `go vet`, `go test`, `./build.sh --check` pass; exe ≤ 5 MB; ru/uk/en; light/dark; keyboard accessible.

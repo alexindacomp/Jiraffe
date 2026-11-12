@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"log"
+	"strings"
 	"time"
 
 	"jiraffe/internal/jira"
@@ -49,6 +51,7 @@ type ChangeDTO struct {
 
 // LinkDTO is the Link contract type: relation as seen from the issue.
 type LinkDTO struct {
+	ID       string   `json:"id"` // the issue link id (deleteIssueLink)
 	Relation string   `json:"relation"`
 	Issue    IssueRef `json:"issue"`
 }
@@ -105,6 +108,17 @@ type IssueDetail struct {
 	// Points" fields (select fields on the real Jira), absent when unset.
 	DevStoryPoints *float64 `json:"devStoryPoints,omitempty"`
 	QAStoryPoints  *float64 `json:"qaStoryPoints,omitempty"`
+
+	// v0.6. People fields: present (possibly []) iff the field exists,
+	// placeholder users dropped. MR / branch text: present iff the field
+	// exists ("" when empty or the "Не заполнено" default).
+	Developer     *[]UserDTO `json:"developer,omitempty"`
+	Reviewer      *[]UserDTO `json:"reviewer,omitempty"`
+	QA            *[]UserDTO `json:"qa,omitempty"`
+	MergeRequests *string    `json:"mergeRequests,omitempty"`
+	Branches      *string    `json:"branches,omitempty"`
+	// CommentFormat is how a new comment is written: "html" or "wiki".
+	CommentFormat string `json:"commentFormat"`
 }
 
 var detailFields = []string{"summary", "status", "issuetype", "priority", "updated", "created", "assignee",
@@ -126,7 +140,9 @@ func (a *App) getIssue(ctx context.Context, key string) (*IssueDetail, error) {
 		return nil, err
 	}
 	fields := v.fields(detailFields, false)
-	for _, id := range []string{v.meta.fields.Sprint, v.meta.fields.DevStoryPoints, v.meta.fields.QAStoryPoints} {
+	mf := v.meta.fields
+	for _, id := range []string{mf.Sprint, mf.DevStoryPoints, mf.QAStoryPoints, mf.MergeRequests, mf.Branches,
+		mf.Developer, mf.Reviewer, mf.QA} {
 		if id != "" {
 			fields = append(fields, id)
 		}
@@ -149,6 +165,9 @@ func (a *App) getIssue(ctx context.Context, key string) (*IssueDetail, error) {
 	epicKey := v.epicLink(is)
 	a.loadEpics(ctx, v, []string{epicKey})
 	d := v.detail(*is, comments)
+	if d.CommentFormat = commentFormat(comments); d.CommentFormat == "" {
+		d.CommentFormat = a.projectDescriptionFormat(ctx, c, id, projectOf(*is))
+	}
 	if epicKey != "" {
 		e, ok := v.epics[epicKey]
 		if !ok { // epic not readable: a bare reference
@@ -198,6 +217,26 @@ func (v *view) detail(is jira.Issue, comments []jira.Comment) *IssueDetail {
 	}
 	d.DevStoryPoints = f.CustomPoints(v.meta.fields.DevStoryPoints)
 	d.QAStoryPoints = f.CustomPoints(v.meta.fields.QAStoryPoints)
+	for _, p := range []struct {
+		id  string
+		dst **[]UserDTO
+	}{{v.meta.fields.Developer, &d.Developer}, {v.meta.fields.Reviewer, &d.Reviewer}, {v.meta.fields.QA, &d.QA}} {
+		if raw, ok := f.Custom[p.id]; ok && p.id != "" {
+			users := peopleOf(raw)
+			*p.dst = &users
+		}
+	}
+	for _, p := range []struct {
+		id  string
+		dst **string
+	}{{v.meta.fields.MergeRequests, &d.MergeRequests}, {v.meta.fields.Branches, &d.Branches}} {
+		if raw, ok := f.Custom[p.id]; ok && p.id != "" {
+			var s string
+			_ = json.Unmarshal(raw, &s)
+			t := fieldText(s)
+			*p.dst = &t
+		}
+	}
 	if f.Resolution != nil {
 		d.Resolution = f.Resolution.Name
 	}
@@ -248,7 +287,7 @@ func (v *view) detail(is jira.Issue, comments []jira.Comment) *IssueDetail {
 			continue
 		}
 		r := v.ref(*other)
-		d.Links = append(d.Links, LinkDTO{Relation: rel, Issue: r})
+		d.Links = append(d.Links, LinkDTO{ID: l.ID, Relation: rel, Issue: r})
 		switch {
 		case kind == KindStory && r.Type.Kind != KindEpic && r.Type.Kind != KindStory:
 			addChild(r)
@@ -325,4 +364,78 @@ func containsRef(refs []IssueRef, key string) bool {
 		}
 	}
 	return false
+}
+
+// placeholderUsers are the display names Jira puts into empty people fields.
+var placeholderUsers = []string{"неназначено", "не назначено", "unassigned"}
+
+func isPlaceholderUser(u UserDTO) bool {
+	for _, n := range []string{u.DisplayName, u.Name} {
+		for _, p := range placeholderUsers {
+			if strings.EqualFold(strings.TrimSpace(n), p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// peopleOf reads a user or multi-user field (array or single object) and
+// drops placeholder users; never nil.
+func peopleOf(raw json.RawMessage) []UserDTO {
+	var list []jira.User
+	if json.Unmarshal(raw, &list) != nil {
+		var one *jira.User
+		if json.Unmarshal(raw, &one) == nil && one != nil {
+			list = []jira.User{*one}
+		}
+	}
+	out := []UserDTO{}
+	for i := range list {
+		if u := userDTO(&list[i]); u != nil && u.Name != "" && !isPlaceholderUser(*u) {
+			out = append(out, *u)
+		}
+	}
+	return out
+}
+
+// emptyFieldText is the default text of the MR / branch fields.
+const emptyFieldText = "Не заполнено"
+
+// fieldText normalizes a free-text field: CRLF to LF, trimmed; Jira's
+// "Не заполнено" default means empty.
+func fieldText(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n"))
+	if strings.EqualFold(s, emptyFieldText) {
+		return ""
+	}
+	return s
+}
+
+// maxFormatSample is how many of the latest comments decide commentFormat.
+const maxFormatSample = 10
+
+// commentFormat is "html" when more than half of the latest (≤ 10)
+// non-empty comments look like HTML, "wiki" otherwise; "" without comments.
+func commentFormat(comments []jira.Comment) string {
+	if len(comments) > maxFormatSample {
+		comments = comments[len(comments)-maxFormatSample:]
+	}
+	html, n := 0, 0
+	for _, c := range comments {
+		switch descriptionFormat(c.Body) {
+		case DescHTML:
+			html++
+			n++
+		case DescWiki:
+			n++
+		}
+	}
+	switch {
+	case n == 0:
+		return ""
+	case html*2 > n:
+		return DescHTML
+	}
+	return DescWiki
 }
