@@ -101,7 +101,7 @@
   --panel: linear-gradient(135deg, rgb(255 255 255 / .86), rgb(247 248 251 / .82));
   --panel-border: rgb(255 255 255 / .75);
   --panel-shadow: 0 24px 60px rgb(20 22 26 / .14), 0 0 0 1px rgb(20 22 26 / .05), inset 0 1px rgb(255 255 255 / .85);
-  --sticky-glass: rgb(250 250 252 / .74); /* v0.7.6: sticky list headers on the glass panel (blurred, so rows don't ghost through) */
+  --sticky-glass: rgb(255 255 255 / .30); /* v0.7.7: sticky sprint headers: nearly the section's own glass; the blur hides rows under it */
   --sticky-bg: #f4f5f7; /* sticky headers: opaque, the light panel's colour (DR-41: rows must not ghost through) */
   --surface: rgb(255 255 255 / .62);
   --surface-hover: rgb(255 255 255 / .82);
@@ -216,7 +216,7 @@
     --panel: linear-gradient(135deg, rgb(36 37 41 / .76), rgb(20 21 24 / .70));
     --panel-border: rgb(255 255 255 / .11);
     --panel-shadow: 0 24px 70px rgb(0 0 0 / .35), inset 0 1px rgb(255 255 255 / .07);
-    --sticky-glass: rgb(32 33 37 / .74);
+    --sticky-glass: rgb(255 255 255 / .03);
     --sticky-bg: #242528;
     --surface: rgb(255 255 255 / .035);
     --surface-hover: rgb(255 255 255 / .05);
@@ -997,10 +997,10 @@ input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
   position: relative;
   background: var(--surface); border: 1px solid var(--card-border); border-radius: var(--r-xl);
 }
-/* State stripe: above the sticky header so it runs the full height of the section */
+/* State stripe: above the sticky header; v0.7.7: only along the straight part of the edge (stops where the corners start) */
 .sp-sec::before {
-  content: ""; position: absolute; left: -1px; top: -1px; bottom: -1px; width: var(--stripe-w); z-index: calc(var(--z-sticky) + 1);
-  border-radius: var(--r-xl) 0 0 var(--r-xl); background: var(--sp-state);
+  content: ""; position: absolute; left: -1px; top: var(--r-xl); bottom: var(--r-xl); width: var(--stripe-w); z-index: calc(var(--z-sticky) + 1);
+  border-radius: 0 2px 2px 0; background: var(--sp-state);
 }
 .sp-sec[data-state="active"] { --sp-state: var(--accent-line); }
 .sp-sec[data-state="future"] { --sp-state: var(--cat-new); }
@@ -1010,7 +1010,7 @@ input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
   display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3);
   min-height: 48px; padding: var(--sp-2) var(--sp-4) var(--sp-2) calc(var(--sp-3) + var(--stripe-w));
   background: var(--sticky-glass); border-radius: calc(var(--r-xl) - 1px);
-  -webkit-backdrop-filter: blur(20px) saturate(140%); backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(24px) saturate(140%); backdrop-filter: blur(24px) saturate(140%);
 }
 .sp-sec[data-state="active"] .sp-head { background: var(--sp-active-bg); }
 .sp-sec.is-open .sp-head, .sp-sec:has(.sp-goal) .sp-head { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
@@ -1109,11 +1109,9 @@ input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
 .tree-page > .filter-empty { margin: var(--sp-4) 0 0; }
 .tsec { margin-top: var(--sp-3); }
 .tsec-head {
-  position: sticky; top: 0; z-index: var(--z-sticky);
+  /* v0.7.7: not sticky — a transparent title would show the rows scrolling under it */
   display: flex; align-items: center; gap: var(--sp-2);
-  margin: 0 calc(-1 * var(--sp-6)); padding: var(--sp-3) calc(var(--sp-6) + var(--sp-1)) var(--sp-2); /* the panel's inset */
-  background: var(--sticky-glass);
-  -webkit-backdrop-filter: blur(20px) saturate(140%); backdrop-filter: blur(20px) saturate(140%);
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
   font-size: var(--fs-md); font-weight: var(--fw-bold); color: var(--text); /* v0.7.6: like the board's .col-title */
 }
 .tsec-head::before { content: ""; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); }
@@ -1138,8 +1136,8 @@ input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
 .tnode:focus-visible > .trow { outline: 2px solid var(--focus); outline-offset: -2px; box-shadow: inset 0 0 0 3px var(--focus-halo); }
 .tnode-epic > .trow { min-height: 48px; padding-left: calc(var(--sp-2) + var(--stripe-w)); border-radius: var(--r-card); }
 .tnode-epic > .trow::before {
-  content: ""; position: absolute; left: -1px; top: -1px; bottom: -1px; width: var(--stripe-w);
-  border-radius: var(--r-card) 0 0 var(--r-card); background: var(--epic);
+  content: ""; position: absolute; left: -1px; top: var(--r-card); bottom: var(--r-card); width: var(--stripe-w);
+  border-radius: 0 2px 2px 0; background: var(--epic);
 }
 .tnode-epic[aria-expanded="true"] > .trow { background: color-mix(in srgb, var(--epic) 7%, var(--surface)); }
 .tnode.is-mine > .trow { box-shadow: inset 3px 0 0 var(--accent); }
@@ -1288,7 +1286,7 @@ input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
   transition: border-color var(--dur-1) var(--ease-out), background var(--dur-2) var(--ease-out);
 }
 
-.pj-row.is-tracked::before { content: ""; position: absolute; left: -1px; top: -1px; bottom: -1px; width: var(--stripe-w); border-radius: var(--r-card) 0 0 var(--r-card); background: var(--accent); }
+.pj-row.is-tracked::before { content: ""; position: absolute; left: -1px; top: var(--r-card); bottom: var(--r-card); width: var(--stripe-w); border-radius: 0 2px 2px 0; background: var(--accent); }
 .pj-avatar {
   display: grid; place-items: center; width: 36px; height: 36px; border-radius: var(--r-lg);
   background: var(--av, #c6c8ff); color: #273024; font-size: var(--fs-2xs); font-weight: var(--fw-bold); letter-spacing: .02em;
@@ -1406,7 +1404,7 @@ input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
 }
 .notif:hover { border-color: var(--card-border-hover); }
 .notif.is-unread { background: var(--card-mine-bg); border-color: color-mix(in srgb, var(--accent-line) 55%, transparent); }
-.notif.is-unread::before { content: ""; position: absolute; left: -1px; top: -1px; bottom: -1px; width: var(--stripe-w); border-radius: var(--r-card) 0 0 var(--r-card); background: var(--accent); }
+.notif.is-unread::before { content: ""; position: absolute; left: -1px; top: var(--r-card); bottom: var(--r-card); width: var(--stripe-w); border-radius: 0 2px 2px 0; background: var(--accent); }
 .notif-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .notif-line { display: flex; align-items: baseline; gap: var(--sp-2); min-width: 0; }
 .notif-author { font-weight: var(--fw-semibold); }
@@ -1598,7 +1596,7 @@ dialog { color: var(--text); }
   transition: border-color var(--dur-1) var(--ease-out), background var(--dur-1) var(--ease-out), transform var(--dur-1) var(--ease-out);
 }
 .rel-row:hover { border-color: var(--card-border-hover); background: var(--surface-hover); transform: translateX(2px); }
-.rel-row[data-epic]::before { content: ""; position: absolute; left: -1px; top: -1px; bottom: -1px; width: var(--stripe-w); border-radius: var(--r-lg) 0 0 var(--r-lg); background: var(--epic); }
+.rel-row[data-epic]::before { content: ""; position: absolute; left: -1px; top: var(--r-lg); bottom: var(--r-lg); width: var(--stripe-w); border-radius: 0 2px 2px 0; background: var(--epic); }
 .rel-row.is-mine { box-shadow: inset 3px 0 0 var(--accent); }
 .rel-row.is-done .rel-sum { color: var(--text-3); text-decoration: line-through; }
 .rel-row .card-key { flex: none; }
