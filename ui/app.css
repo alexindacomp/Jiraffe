@@ -612,7 +612,7 @@ select.input option { background: var(--surface-raised); color: var(--text); }
 .input-num { width: 88px; text-align: right; font-variant-numeric: tabular-nums; }
 .input-num-sm { width: 72px; }
 .textarea { height: auto; padding: var(--sp-2) 10px; resize: vertical; line-height: 1.5; }
-/* v0.7.2: one closed-select look everywhere (glass well + chevron); the native popup follows color-scheme */
+/* v0.7.2: one closed-select look everywhere (glass well + chevron); v0.7.5: the list opens as the app #menu (app.js) */
 .select {
   appearance: none; padding-right: 34px; cursor: pointer; width: auto; min-width: 180px;
   background-image: var(--chev); background-repeat: no-repeat; background-position: right 11px center; background-size: 15px 15px;

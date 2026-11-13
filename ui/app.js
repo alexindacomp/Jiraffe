@@ -6935,6 +6935,45 @@
     $('#wl-run-btn').addEventListener('click', logNow);
     $('#wl-day').addEventListener('click', (e) => openWorklogDays(e.currentTarget));
 
+    // Every native <select> opens the app's glass menu instead of the system popup (the closed control is
+    // already styled). The select stays the source of truth: picking sets its value and fires input/change,
+    // so forms (create/edit, settings) work unchanged.
+    let selSeq = 0;
+    const selectOpen = (sel) => {
+      if (sel.disabled || sel.closest('#menu')) return;
+      if (!sel.id) sel.id = 'sel-' + (++selSeq);
+      const opts = [...sel.options].filter((o) => !o.disabled && !o.hidden);
+      menu.open(sel, {
+        label: (sel.labels && sel.labels[0] && sel.labels[0].textContent.trim()) || sel.getAttribute('aria-label') || '',
+        radio: true,
+        items: opts,
+        isSelected: (o) => o.value === sel.value,
+        item: (o) => html`<span class="mi-main"><span class="mi-title">${o.textContent}</span>${o.parentElement && o.parentElement.tagName === 'OPTGROUP' && o === o.parentElement.querySelector('option:not([disabled])') ? html`<span class="mi-sub">${o.parentElement.label}</span>` : ''}</span>`,
+        onPick: (o) => {
+          if (o.value === sel.value || !o.isConnected) return;
+          sel.value = o.value;
+          sel.dispatchEvent(new Event('input', { bubbles: true }));
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        },
+        anchorSel: '#' + CSS.escape(sel.id),
+      });
+    };
+    document.addEventListener('mousedown', (e) => {
+      const sel = e.target.closest && e.target.closest('select');
+      if (!sel || e.button !== 0 || sel.multiple || sel.size > 1) return;
+      e.preventDefault(); // no system popup
+      sel.focus({ preventScroll: true });
+      selectOpen(sel);
+    }, true);
+    document.addEventListener('keydown', (e) => {
+      const sel = e.target;
+      if (!(sel instanceof HTMLSelectElement) || sel.multiple || sel.size > 1) return;
+      if (e.key === ' ' || e.key === 'Enter' || e.key === 'F4' || (e.altKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp'))) {
+        e.preventDefault();
+        selectOpen(sel);
+      }
+    }, true);
+
     // Board: widen the horizontal scrollbar (CSS .sb-hot) while the pointer is on it or within 12px above it.
     let sbHot = null;
     const sbCool = () => { if (sbHot) { sbHot.classList.remove('sb-hot'); sbHot = null; } };
