@@ -381,6 +381,9 @@ func (a *App) getEpics(ctx context.Context, includeDone bool, scope, project str
 	if err != nil {
 		return nil, err
 	}
+	if scope == ScopeReported { // the tree filters by assignee only
+		return nil, a.newErr(CodeBadParams, "err_bad_scope")
+	}
 	c, id, err := a.client()
 	if err != nil {
 		return nil, err
@@ -519,6 +522,9 @@ func (a *App) getStories(ctx context.Context, includeDone bool, scope, project s
 	scope, err := a.parseScope(scope, ScopeAll)
 	if err != nil {
 		return nil, err
+	}
+	if scope == ScopeReported { // the tree filters by assignee only
+		return nil, a.newErr(CodeBadParams, "err_bad_scope")
 	}
 	c, id, err := a.client()
 	if err != nil {

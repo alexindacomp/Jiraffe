@@ -100,7 +100,7 @@ type Board struct {
 	FetchedAt string   `json:"fetchedAt"`
 	Scope     string   `json:"scope"`
 	Truncated bool     `json:"truncated"`
-	// Hidden (scope "mine" without a project only) counts my issues left
+	// Hidden (scopes "mine" and "reported" without a project) counts my issues left
 	// out because their project is not tracked.
 	Hidden *HiddenDTO `json:"hidden,omitempty"`
 	// Layout describes the columns of a project board (project mode only).
@@ -138,7 +138,13 @@ func hiddenByTracking(all []jira.Issue, tracked []string) *HiddenDTO {
 const (
 	ScopeMine = "mine"
 	ScopeAll  = "all"
+	// ScopeReported: issues I reported (reporter = currentUser()).
+	ScopeReported = "reported"
 )
+
+// ReportedBoardJQL is the tracked-projects board of scope "reported" (the
+// counterpart of the configurable "mine" boardJQL).
+const ReportedBoardJQL = "reporter = currentUser() AND statusCategory != Done ORDER BY updated DESC"
 
 const (
 	boardTTL        = 60 * time.Second
@@ -226,12 +232,12 @@ func BuildColumns(issues []IssueDTO) []Column {
 	return out
 }
 
-// parseScope maps "" to def and rejects anything but mine/all.
+// parseScope maps "" to def and rejects anything but mine/all/reported.
 func (a *App) parseScope(scope, def string) (string, error) {
 	switch scope {
 	case "":
 		return def, nil
-	case ScopeMine, ScopeAll:
+	case ScopeMine, ScopeAll, ScopeReported:
 		return scope, nil
 	}
 	return "", a.newErr(CodeBadParams, "err_bad_scope")
@@ -271,6 +277,9 @@ func ProjectBoardJQL(scope, project, boardJQL string) string {
 	p := "project = " + quoteKeys([]string{project})
 	if scope == ScopeAll {
 		return p + " AND (statusCategory != Done OR " + recentlyDone + ")"
+	}
+	if scope == ScopeReported {
+		return p + " AND reporter = currentUser() AND (statusCategory != Done OR " + recentlyDone + ")"
 	}
 	if w := jqlWhere(boardJQL); w != "" {
 		return p + " AND ((" + w + ") OR (assignee = currentUser() AND statusCategory = Done AND " + recentlyDone + "))"
@@ -373,6 +382,9 @@ func (a *App) getBoard(ctx context.Context, force bool, scope, project string, b
 	}
 	b := &Board{Columns: []Column{}, FetchedAt: now.Format(time.RFC3339), Scope: scope}
 	jql, limit := a.cfg.Get().BoardJQL, mineBoardMax
+	if scope == ScopeReported {
+		jql = ReportedBoardJQL
+	}
 	if scope == ScopeAll {
 		inJira, err := a.queryProjects(ctx, c, id, tracked)
 		if err != nil {
@@ -393,7 +405,7 @@ func (a *App) getBoard(ctx context.Context, force bool, scope, project string, b
 		return nil, err
 	}
 	issues := filterTracked(res.Issues, tracked)
-	if scope == ScopeMine {
+	if scope != ScopeAll {
 		b.Hidden = hiddenByTracking(res.Issues, tracked)
 	}
 	var epicKeys []string

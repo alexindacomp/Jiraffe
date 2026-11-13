@@ -139,6 +139,10 @@
           <input type="checkbox" role="switch" class="switch" id="mine-toggle">
           <span data-i18n="scope.mine"></span>
         </label>
+        <label class="mine-toggle" id="reported-wrap" data-i18n-attr="title:scope.reportedTitle" hidden>
+          <input type="checkbox" role="switch" class="switch" id="reported-toggle">
+          <span data-i18n="scope.reported"></span>
+        </label>
         <div class="project-filter" id="project-filter">
           <div class="chips" id="project-chips" role="radiogroup" data-i18n-attr="aria-label:projectFilter.label" hidden></div>
           <button type="button" class="picker-btn picker-btn-sm" id="project-menu-btn" aria-haspopup="menu" aria-expanded="false" hidden></button>
@@ -504,6 +508,7 @@
 <!-- v0.7 window chrome (frameless window), outside #app: a drag strip over the top bar (only while the scrim is shown)
      and the resize edges. -->
 <div class="win-drag" data-drag aria-hidden="true"></div>
+<div class="tooltip" id="tooltip" role="tooltip" hidden></div><!-- the shared glass tooltip (app.js bindTooltips) -->
 <div class="win-resize" aria-hidden="true">
   <span data-edge="n"></span><span data-edge="s"></span><span data-edge="w"></span><span data-edge="e"></span>
   <span data-edge="nw"></span><span data-edge="ne"></span><span data-edge="sw"></span><span data-edge="se"></span>

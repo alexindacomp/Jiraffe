@@ -240,10 +240,11 @@
 
   /** Remembered UI choices. Defaults: "Only mine" on for the board, off for sprints and epics. */
   function applyPrefs() {
-    S.boardScope = prefs.get('board.mine', true) === false ? 'all' : 'mine';
+    S.boardScope = prefs.get('board.reported', false) === true ? 'reported' : prefs.get('board.mine', true) === false ? 'all' : 'mine';
     const project = prefs.get('project', '');
     S.project = typeof project === 'string' ? project : '';
     S.sp.mine = prefs.get('sprint.mine', false) === true;
+    S.sp.reported = !S.sp.mine && prefs.get('sprint.reported', false) === true;
     S.sp.closed = prefs.get('sprints.closed', false) === true;
     const spExp = prefs.get('sprints.expanded', {});
     S.sp.expanded = spExp && typeof spExp === 'object' && !Array.isArray(spExp) ? Object.assign({}, spExp) : {};
@@ -517,6 +518,9 @@
   }
 
   const mineFor = (view) => (view === 'board' ? S.boardScope === 'mine' : view === 'sprints' ? S.sp.mine : view === 'epics' ? S.ep.mine : false);
+  // "Reported by me" (backend scope "reported"): Board and Sprints only; exclusive with "Only mine", both off = all
+  const REPORTED_VIEWS = ['board', 'sprints'];
+  const reportedFor = (view) => (view === 'board' ? S.boardScope === 'reported' : view === 'sprints' ? !!S.sp.reported : false);
 
   /** Top-bar tools of the current view: search (text kept per view), "Only mine", project chips, board picker. */
   function renderTools(sectionId) {
@@ -532,6 +536,8 @@
     if (search.value !== S.q[v]) search.value = S.q[v];
     $('#mine-wrap').hidden = !MINE_VIEWS.includes(v);
     $('#mine-toggle').checked = mineFor(v);
+    $('#reported-wrap').hidden = !REPORTED_VIEWS.includes(v);
+    $('#reported-toggle').checked = reportedFor(v);
     $('#create-btn').hidden = !(PROJECT_VIEWS.includes(v) && isConfigured());
     renderChips();
     renderBoardBar();
@@ -539,11 +545,21 @@
 
   function setMine(view, on) {
     if (view === 'board') setBoardScope(on ? 'mine' : 'all');
-    else if (view === 'sprints') {
-      S.sp.mine = on;
-      prefs.set('sprint.mine', on);
-      enterSprints();
-    } else if (view === 'epics') setEpicsOption({ mine: on });
+    else if (view === 'sprints') setSprintScope(on, false);
+    else if (view === 'epics') setEpicsOption({ mine: on });
+  }
+  function setReported(view, on) {
+    if (view === 'board') setBoardScope(on ? 'reported' : 'all');
+    else if (view === 'sprints') setSprintScope(false, on);
+  }
+  function setSprintScope(mine, reported) {
+    S.sp.mine = mine;
+    S.sp.reported = reported && !mine;
+    prefs.set('sprint.mine', S.sp.mine);
+    prefs.set('sprint.reported', S.sp.reported);
+    $('#mine-toggle').checked = S.sp.mine;
+    $('#reported-toggle').checked = S.sp.reported;
+    enterSprints();
   }
 
   function onSearchInput(value) {
@@ -584,7 +600,7 @@
     const id = activeSectionId();
     $$('#views > .view').forEach((sec) => { sec.hidden = sec.id !== id; });
     $('#view-title').textContent = id === 'view-onboarding' ? t('onboarding.viewTitle')
-      : t(S.view === 'board' && S.boardScope === 'all' ? 'title.boardAll' : 'title.' + S.view);
+      : t(S.view === 'board' && S.boardScope !== 'mine' ? (S.boardScope === 'reported' ? 'title.boardReported' : 'title.boardAll') : 'title.' + S.view);
     $('#refresh-btn').hidden = id === 'view-onboarding';
     renderTools(id);
     renderNav(id);
@@ -1141,6 +1157,9 @@
     if (scope === S.boardScope || S.drag) return;
     S.boardScope = scope;
     prefs.set('board.mine', scope === 'mine');
+    prefs.set('board.reported', scope === 'reported');
+    $('#mine-toggle').checked = scope === 'mine';
+    $('#reported-toggle').checked = scope === 'reported';
     switchBoard();
   }
 
@@ -1211,10 +1230,15 @@
       menu.sync();
       return;
     }
-    const all = S.boardScope === 'all';
+    const all = S.boardScope !== 'mine'; // "all" and "reported": assignees shown, mine highlighted
     const total = kbIssues(S.board).length;
     // A project board shows its columns even when they are all empty.
     if (!total && !(S.board.project && S.board.columns.length)) {
+      if (S.boardScope === 'reported') {
+        setHTML(root, stateBlock({ iconName: 'inbox', fill: true, title: t('board.emptyReportedTitle') }));
+        menu.sync();
+        return;
+      }
       setHTML(root, S.board.project
         ? stateBlock({ iconName: 'board', fill: true, title: all ? t('board.emptyAllTitle') : t('board.emptyTitle') })
         : all
@@ -1239,7 +1263,8 @@
    * optionally, the last closed ones), then the Backlog. Rows: dense issue lines with the status dropdown.
    * getSprintGroups { project, scope, includeClosed, force } → { groups, backlog, truncated, available }.
    * ================================================================ */
-  const spKey = () => `${effProject()}|${S.sp.mine ? 'mine' : 'all'}|${S.sp.closed ? 1 : 0}`;
+  const spScope = () => (S.sp.mine ? 'mine' : S.sp.reported ? 'reported' : 'all');
+  const spKey = () => `${effProject()}|${spScope()}|${S.sp.closed ? 1 : 0}`;
   /** Drops cached sprint lists; answers already in flight are not cached afterwards (as invalidateEpics). */
   function invalidateSprints() {
     S.sp.cache.clear();
@@ -1278,7 +1303,7 @@
     if (S.pendingKeys.size) { S.sp.stale = true; renderSprints(); renderRefreshState(); return; } // reloaded when the transition settles
     const key = spKey();
     const gen = S.sp.cacheGen;
-    const params = { scope: S.sp.mine ? 'mine' : 'all', includeClosed: S.sp.closed };
+    const params = { scope: spScope(), includeClosed: S.sp.closed };
     const project = effProject();
     if (project) params.project = project;
     if (force) params.force = true;
@@ -6799,6 +6824,7 @@
     const search = $('#search');
     search.addEventListener('input', () => onSearchInput(search.value));
     $('#mine-toggle').addEventListener('change', (e) => setMine(S.view, e.target.checked));
+    $('#reported-toggle').addEventListener('change', (e) => setReported(S.view, e.target.checked));
     if (typeof ResizeObserver === 'function') new ResizeObserver(() => onResizeWork()).observe($('#project-filter'));
     else window.addEventListener('resize', onResizeWork);
     $('#project-menu-btn').addEventListener('click', (e) => openProjectMenu(e.currentTarget));
@@ -7057,6 +7083,82 @@
     });
   }
 
+  /* ================================================================
+   * TOOLTIPS: one shared glass tooltip instead of native ones. A `title` is moved to `data-tip` when the pointer or the
+   * focus reaches its element (so the native tooltip never shows; an element without another name keeps it as
+   * aria-label). Hover: after 400 ms; keyboard focus: at once. Placed above (flips below), clamped to the viewport;
+   * Esc, scrolling, a press or leaving hides it. While shown the target is aria-describedby the tooltip.
+   * ================================================================ */
+  const TIP_DELAY = 400;
+  const tip = { target: null, timer: 0 };
+  function tipAdopt(el) {
+    const text = el.getAttribute('title');
+    if (text == null) return;
+    el.removeAttribute('title');
+    if (!text) { delete el.dataset.tip; return; }
+    el.dataset.tip = text;
+    if (!el.hasAttribute('aria-label') && !el.hasAttribute('aria-labelledby') && !el.textContent.trim()) el.setAttribute('aria-label', text);
+  }
+  const tipTargetOf = (node) => (node && node.closest ? node.closest('[title], [data-tip]') : null);
+  function tipHide() {
+    clearTimeout(tip.timer);
+    const t0 = tip.target;
+    tip.target = null;
+    const el = $('#tooltip');
+    el.hidden = true;
+    if (t0 && t0.dataset.tipDesc != null) {
+      if (t0.dataset.tipDesc) t0.setAttribute('aria-describedby', t0.dataset.tipDesc); else t0.removeAttribute('aria-describedby');
+      delete t0.dataset.tipDesc;
+    }
+  }
+  function tipShow(target) {
+    const text = target.dataset.tip;
+    if (!text || !target.isConnected) return;
+    tipHide();
+    const el = $('#tooltip');
+    el.textContent = text;
+    el.hidden = false;
+    tip.target = target;
+    const name = (target.getAttribute('aria-label') || target.textContent || '').trim();
+    if (text !== name) { // describe only when the tooltip adds something to the name
+      const d = target.getAttribute('aria-describedby') || '';
+      target.dataset.tipDesc = d;
+      target.setAttribute('aria-describedby', (d + ' tooltip').trim());
+    }
+    const r = target.getBoundingClientRect();
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    let top = r.top - h - 8;
+    if (top < 6) top = Math.min(r.bottom + 8, window.innerHeight - h - 6); // flip below
+    const left = Math.max(6, Math.min(r.left + r.width / 2 - w / 2, window.innerWidth - w - 6));
+    el.style.left = Math.round(left) + 'px';
+    el.style.top = Math.round(top) + 'px';
+  }
+  function bindTooltips() {
+    document.addEventListener('mouseover', (e) => {
+      const t0 = tipTargetOf(e.target);
+      if (!t0) return;
+      tipAdopt(t0);
+      if (t0 === tip.target || !t0.dataset.tip) return;
+      clearTimeout(tip.timer);
+      tip.timer = setTimeout(() => tipShow(t0), TIP_DELAY);
+    });
+    document.addEventListener('mouseout', (e) => {
+      const t0 = tipTargetOf(e.target);
+      if (t0 && !t0.contains(e.relatedTarget)) { if (t0 === tip.target) tipHide(); else clearTimeout(tip.timer); }
+    });
+    document.addEventListener('focusin', (e) => {
+      const t0 = tipTargetOf(e.target);
+      if (!t0 || t0 !== e.target) return;
+      tipAdopt(t0);
+      if (t0.dataset.tip && t0.matches(':focus-visible')) tipShow(t0); // keyboard focus: at once
+    });
+    document.addEventListener('focusout', (e) => { if (tip.target && e.target === tip.target) tipHide(); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && tip.target) tipHide(); }, true);
+    document.addEventListener('mousedown', () => tipHide(), true);
+    document.addEventListener('scroll', () => { if (tip.target) tipHide(); }, true);
+  }
+
   /* Native title bar (SPEC v0.4 §2): dark flag + caption colour = the top bar background. Best effort. */
   const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
   /** "rgb(30, 31, 34)" / "rgb(30 31 34 / 1)" / "color(srgb 0.1 0.2 0.3)" → "#1e1f22"; null if not opaque or unknown. */
@@ -7084,6 +7186,7 @@
     i18n.apply();
     bind();
     bindWindowChrome();
+    bindTooltips();
     loadWindowInfo();
     syncWindowTheme();
     darkQuery.addEventListener('change', syncWindowTheme);

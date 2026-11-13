@@ -430,6 +430,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     if (!PROJECTS.some((x) => x.key === project)) throw new MockError('project_unavailable', `project ${project} is not accessible`);
     let list = all().filter((r) => projOf(r) === project && r.type.kind !== 'epic' && (!isDone(r) || Date.now() - new Date(r.updated).getTime() <= 14 * DAY));
     if (scope === 'mine') list = list.filter(mine);
+    if (scope === 'reported') list = list.filter(reportedByMe);
     list.sort(byRank);
     const boards = boardsOf(project);
     const chosen = boards.find((b) => String(b.id) === String(boardId)) || boards.find((b) => b.location === project) || boards[0] || null;
@@ -474,7 +475,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     if (p.project && !PROJECTS.some((x) => x.key === p.project)) throw new MockError('project_unavailable', `project ${p.project} is not accessible`);
     const projects = p.project ? [p.project] : PROJECTS.map((x) => x.key).filter((k) => isTracked(k + '-1'));
     const scope = scopeOf(p, 'all');
-    const sel = (r) => projects.includes(projOf(r)) && r.type.kind !== 'epic' && (scope !== 'mine' || mine(r));
+    const sel = (r) => projects.includes(projOf(r)) && r.type.kind !== 'epic' && (scope !== 'mine' || mine(r)) && (scope !== 'reported' || reportedByMe(r));
     const open = SPRINTS.filter((sp) => sp.state !== 'closed');
     const openIds = new Set(open.map((sp) => sp.id));
     const inOpen = all().filter((r) => sel(r) && r.sprints.some((id) => openIds.has(id))).sort(byRank);
@@ -1116,7 +1117,8 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
   let boardCalls = 0;
   const maybeFail = (rate, code, message) => { if (Math.random() < rate) throw new MockError(code, message); };
   const requireConfigured = () => { if (!configured()) throw new MockError('not_configured', 'Jira is not configured'); };
-  const scopeOf = (p, def) => (p && (p.scope === 'mine' || p.scope === 'all') ? p.scope : def);
+  const scopeOf = (p, def) => (p && (p.scope === 'mine' || p.scope === 'all' || p.scope === 'reported') ? p.scope : def);
+  const reportedByMe = (r) => !!r.reporter && r.reporter.name === ME.name; // scope "reported"
   /** v0.3 `project` param of getEpics / getStories: that project instead of the tracked ones (children are not filtered). */
   function projectFilter(p) {
     if (!p || !p.project) return (r) => isTracked(r.key);
@@ -1128,6 +1130,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     const open = all().filter((r) => !isDone(r) && r.type.kind !== 'epic');
     let list = open.filter((r) => isTracked(r.key));
     if (scope === 'mine') list = list.filter(mine);
+    if (scope === 'reported') list = list.filter(reportedByMe);
     const truncated = flags.has('truncated') && scope === 'all';
     if (truncated) list = list.slice(0, 20);
     const out = { columns: clone(columnsOf(list)), fetchedAt: rfc(now()), scope, truncated };

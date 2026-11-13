@@ -76,6 +76,7 @@ const (
 	openSprintsClause = " AND (sprint in openSprints() OR sprint in futureSprints())"
 	backlogClause     = " AND statusCategory != Done AND (sprint is EMPTY OR sprint not in (openSprints(), futureSprints()))"
 	mineClause        = " AND assignee = currentUser()"
+	reportedClause    = " AND reporter = currentUser()"
 )
 
 func sprintGroupsKey(project, scope string, includeClosed bool) string {
@@ -129,8 +130,11 @@ func (a *App) getSprintGroups(ctx context.Context, project, scope string, includ
 	}
 	in := "project in (" + quoteKeys(projects) + ")"
 	mine := ""
-	if scope == ScopeMine {
+	switch scope {
+	case ScopeMine:
 		mine = mineClause
+	case ScopeReported:
+		mine = reportedClause
 	}
 	open, err := c.SearchAll(ctx, in+openSprintsClause+mine+rankOrder, opts(maxSprintIssues))
 	if jira.IsCode(err, jira.CodeBadRequest) {

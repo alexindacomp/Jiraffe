@@ -170,6 +170,12 @@
   --warning-soft: rgb(255 196 0 / .18);
   --info: #2f74d0;
   --win-close: #e81123;
+  /* v0.7.2 controls: select chevron, scrollbars, tooltip */
+  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234d525a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  --scroll-thumb: rgb(20 22 26 / .22);
+  --scroll-thumb-hover: rgb(20 22 26 / .40);
+  --tip-bg: rgb(28 30 34 / .94);
+  --tip-text: #f3f4f6;
 
   /* Tag tints (reference): lime, blue, violet, orange — text / background */
   --tag-lime: #5c5600;   --tag-lime-bg: rgb(255 242 0 / .26);
@@ -201,6 +207,11 @@
   :root {
     /* Dark: neutral graphite glass (the reference's structure and alphas, without its green tint) */
     --win-bg: #141518;
+    --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23b8bcc3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    --scroll-thumb: rgb(255 255 255 / .18);
+    --scroll-thumb-hover: rgb(255 255 255 / .34);
+    --tip-bg: rgb(244 245 247 / .96);
+    --tip-text: #16181c;
     --panel: linear-gradient(135deg, rgb(36 37 41 / .76), rgb(20 21 24 / .70));
     --panel-border: rgb(255 255 255 / .11);
     --panel-shadow: 0 24px 70px rgb(0 0 0 / .35), inset 0 1px rgb(255 255 255 / .07);
@@ -591,7 +602,7 @@ html.is-maximized .win-resize { display: none; }
   background: var(--surface-sunken); color: var(--text);
   transition: border-color var(--dur-1) var(--ease-out), background var(--dur-1) var(--ease-out);
 }
-.input:focus { background: var(--surface); }
+.input:focus { background-color: var(--surface); }
 select.input option { background: var(--surface-raised); color: var(--text); }
 .input::placeholder { color: var(--text-3); }
 .input:hover { border-color: var(--control-stroke-strong); }
@@ -601,7 +612,33 @@ select.input option { background: var(--surface-raised); color: var(--text); }
 .input-num { width: 88px; text-align: right; font-variant-numeric: tabular-nums; }
 .input-num-sm { width: 72px; }
 .textarea { height: auto; padding: var(--sp-2) 10px; resize: vertical; line-height: 1.5; }
-.select { padding-right: var(--sp-6); cursor: pointer; width: auto; min-width: 180px; }
+/* v0.7.2: one closed-select look everywhere (glass well + chevron); the native popup follows color-scheme */
+.select {
+  appearance: none; padding-right: 34px; cursor: pointer; width: auto; min-width: 180px;
+  background-image: var(--chev); background-repeat: no-repeat; background-position: right 11px center; background-size: 15px 15px;
+}
+.select:hover { border-color: var(--control-stroke-strong); }
+.select:disabled { opacity: .55; cursor: default; }
+/* number fields: the arrows are keyboard (↑/↓) only — no native spin buttons on the glass */
+input[type="number"].input { appearance: textfield; }
+input[type="number"].input::-webkit-inner-spin-button, input[type="number"].input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
+
+/* Scrollbars (v0.7.2): thin, rounded, translucent; no arrows */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb { min-height: 32px; border: 3px solid transparent; border-radius: var(--r-full); background: var(--scroll-thumb) padding-box; }
+::-webkit-scrollbar-thumb:hover { background-color: var(--scroll-thumb-hover); }
+::-webkit-scrollbar-button { display: none; }
+
+/* Tooltip (v0.7.2): one shared glass element, placed by app.js */
+.tooltip {
+  position: fixed; z-index: calc(var(--z-toast) + 5); top: 0; left: 0; max-width: min(320px, calc(100vw - 12px));
+  padding: 6px 10px; border-radius: var(--r-md); border: 1px solid var(--panel-border);
+  background: var(--tip-bg); color: var(--tip-text); box-shadow: var(--shadow-2);
+  font-size: var(--fs-sm); font-weight: var(--fw-medium); line-height: 1.35; overflow-wrap: anywhere;
+  pointer-events: none; animation: fade-in var(--dur-1) var(--ease-out);
+}
 .input-group { position: relative; display: flex; }
 .input-group .input { padding-right: 40px; }
 .input-addon { position: absolute; right: 0; top: 0; }
@@ -2047,8 +2084,8 @@ body:has(#dlg-issue[open]) .toasts { top: calc(var(--chrome-h) + var(--sp-6) + 7
 @media (max-width: 1100px) {
   .topbar { gap: var(--sp-3); padding-left: var(--sp-5); }
   .search { width: 150px; }
-  #mine-wrap { padding: 0 var(--sp-1); }
-  #mine-wrap > span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  #mine-wrap, #reported-wrap { padding: 0 var(--sp-1); }
+  #mine-wrap > span, #reported-wrap > span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 }
 @media (max-width: 940px) {
   .topbar { padding-left: var(--sp-4); }

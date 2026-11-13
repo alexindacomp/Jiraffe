@@ -1642,3 +1642,8 @@ State (`state.json`, new fields): `firstRunDate` ("YYYY-MM-DD", set once: earlie
 install, else the first start's day), `skippedWorklogDays` (["YYYY-MM-DD"], ascending, max 100). Saves take
 `state.lock` (LockFileEx) and merge as in §1; the log writer rotates under `jiraffe.log.lock`, re-checks the file
 first, never deletes `jiraffe.log.1` (the rename replaces it) and keeps appending when the rotation fails.
+
+- v0.7.1: `scope` of `getBoard` and `getSprintGroups` also accepts **`"reported"`** = issues where I am the reporter
+  (`reporter = currentUser()` wherever "mine" uses its condition: tracked board `reporter = currentUser() AND
+  statusCategory != Done ORDER BY updated DESC`, project board incl. done-in-14-days, sprints/backlog); `hidden` is
+  reported for it like for "mine"; cached per scope. `getEpics`/`getStories` reject it (`bad_params`).
