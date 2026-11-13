@@ -630,6 +630,9 @@ input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
 ::-webkit-scrollbar-thumb { min-height: 32px; border: 3px solid transparent; border-radius: var(--r-full); background: var(--scroll-thumb) padding-box; }
 ::-webkit-scrollbar-thumb:hover { background-color: var(--scroll-thumb-hover); }
 ::-webkit-scrollbar-button { display: none; }
+/* Board: the horizontal scrollbar grows 2.5× while the pointer is on it or just above it (.sb-hot, app.js). */
+.columns.sb-hot::-webkit-scrollbar { height: 25px; }
+.columns.sb-hot::-webkit-scrollbar-thumb { border-width: 5px; background-color: var(--scroll-thumb-hover); }
 
 /* Tooltip (v0.7.2): one shared glass element, placed by app.js */
 .tooltip {

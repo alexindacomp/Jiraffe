@@ -6934,6 +6934,21 @@
     $('#wl-preview-btn').addEventListener('click', () => { S.wl.result = null; loadPreview(); });
     $('#wl-run-btn').addEventListener('click', logNow);
     $('#wl-day').addEventListener('click', (e) => openWorklogDays(e.currentTarget));
+
+    // Board: widen the horizontal scrollbar (CSS .sb-hot) while the pointer is on it or within 12px above it.
+    let sbHot = null;
+    const sbCool = () => { if (sbHot) { sbHot.classList.remove('sb-hot'); sbHot = null; } };
+    $('#view-board').addEventListener('mousemove', (e) => {
+      const cols = $('#view-board .columns');
+      if (!cols || cols.scrollWidth <= cols.clientWidth) { sbCool(); return; }
+      const r = cols.getBoundingClientRect();
+      const bar = cols.offsetHeight - cols.clientHeight; // the scrollbar's current height
+      const hot = e.clientX >= r.left && e.clientX <= r.right && e.clientY <= r.bottom && e.clientY >= r.bottom - bar - 12;
+      if (hot && sbHot !== cols) { sbCool(); cols.classList.add('sb-hot'); sbHot = cols; }
+      else if (!hot && sbHot && !(e.buttons & 1)) sbCool(); // keep it wide while the thumb is being dragged
+    });
+    $('#view-board').addEventListener('mouseleave', (e) => { if (!(e.buttons & 1)) sbCool(); });
+    document.addEventListener('mouseup', (e) => { if (sbHot) { const r = sbHot.getBoundingClientRect(); if (e.clientY < r.bottom - 37 || e.clientY > r.bottom) sbCool(); } });
     $('#missed-notice').addEventListener('click', onMissedClick);
     $('#view-worklog').addEventListener('click', (e) => {
       const a = e.target.closest('[data-action]');
