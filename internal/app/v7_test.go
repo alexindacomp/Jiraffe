@@ -35,7 +35,7 @@ func TestWindowControl(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := json.Marshal(res); string(b) != `{"glass":true,"maximized":false,"active":true}` {
+	if b, _ := json.Marshal(res); string(b) != `{"glass":true,"maximized":false,"active":true,"resizing":false}` {
 		t.Errorf("getWindowInfo %s", b)
 	}
 	tests := []struct {

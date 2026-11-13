@@ -68,6 +68,9 @@ type WindowInfo struct {
 	Glass     bool `json:"glass"`
 	Maximized bool `json:"maximized"`
 	Active    bool `json:"active"`
+	// Resizing is true while the user resizes the window with the mouse:
+	// the page drops costly effects so it can keep up with the frame.
+	Resizing bool `json:"resizing"`
 }
 
 // WindowChrome is implemented by a platform with a frameless window

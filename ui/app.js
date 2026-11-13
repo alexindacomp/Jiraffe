@@ -178,7 +178,7 @@
     appState: null,          // getState result
     stateError: null,
     stateLoading: false,
-    win: null,               // v0.7 getWindowInfo / windowState: { glass, maximized, active }
+    win: null,               // v0.7 getWindowInfo / windowState: { glass, maximized, active, resizing (v0.7.1) }
     settings: null,          // last saved Settings from backend
     langOverride: null,      // language chosen in UI but not yet persisted
 
@@ -216,7 +216,9 @@
 
     wl: { preview: null, previewLoading: false, previewError: null, previewSeq: 0,
           result: null, running: false,
-          history: null, historyLoading: false, historyError: null },
+          history: null, historyLoading: false, historyError: null,
+          date: null, pendingDate: null }, // v0.7.1: the chosen day (null = today); Review from the missed notice sets pendingDate
+    missed: { days: [], dismissed: '', busy: new Set() }, // v0.7.1: missed worklog days (getMissedWorklogDays / worklogMissed)
 
     notif: { list: null, loading: false, error: null, markingAll: false },
 
@@ -586,6 +588,7 @@
     $('#refresh-btn').hidden = id === 'view-onboarding';
     renderTools(id);
     renderNav(id);
+    renderMissed();
     updateToastOffset();
     renderRefreshState();
     // The project chips need the tracked projects; views load with the remembered choice meanwhile.
@@ -724,6 +727,7 @@
     renderChrome();
     if (!prev || !!prev.configured !== !!st.configured) renderView(true);
     else if (S.view === 'worklog' && isConfigured()) renderWorklogToday();
+    if (st.configured && !(prev && prev.configured)) loadMissed();
   }
 
   /* ================================================================
@@ -925,6 +929,22 @@
       const target = $('#project-filter').classList.contains('is-compact') ? $('#project-menu-btn') : box.querySelector('[aria-checked="true"]');
       if (target) target.focus({ preventScroll: true });
     }
+  }
+
+  /** Layout work after a size change, at most once per frame and not while the user is resizing the window
+      (it runs once when the resize ends, see applyWindowState). */
+  let resizeWorkFrame = 0;
+  function onResizeWork() {
+    if (S.win && S.win.resizing) return; // afterResize() runs it at the end
+    if (resizeWorkFrame) return;
+    resizeWorkFrame = requestAnimationFrame(() => { resizeWorkFrame = 0; afterResize(); });
+  }
+  function afterResize() {
+    syncProjectFilter();
+    syncTableScroll($('#drawer'));
+    // the tooltip is placed once: re-place it for the focused row, drop a hover one
+    const a = document.activeElement;
+    dashHighlight(S.ep.dash.el && S.ep.dash.el.contains(a) ? a.closest('.epd-row') : null);
   }
 
   /** Chips, or the compact menu when they do not fit. The container's width does not depend on its content
@@ -5274,6 +5294,8 @@
   }
 
   function enterWorklog() {
+    S.wl.date = S.wl.pendingDate; // a fresh visit shows today; "Review" from the missed notice opens that day
+    S.wl.pendingDate = null;
     renderWorklog();
     ensureSettings().then(() => { if (S.view === 'worklog') renderWorklog(); });
     if (!S.wl.running) S.wl.result = null; // re-entering the view shows a fresh preview
@@ -5287,7 +5309,7 @@
     renderWorklog();
     renderRefreshState();
     try {
-      const run = await api('worklogPreview');
+      const run = await api('worklogPreview', S.wl.date ? { date: S.wl.date } : {});
       if (seq !== S.wl.previewSeq) return;
       S.wl.preview = run;
       S.wl.previewFetchedAt = Date.now();
@@ -5313,6 +5335,7 @@
     } finally {
       S.wl.historyLoading = false;
       renderWorklogHistory();
+      if (S.view === 'worklog' && isConfigured()) renderWorklogDays(); // the day marks ("logged") come from the history
       renderRefreshState();
     }
   }
@@ -5329,8 +5352,54 @@
   }
   const capKnown = (run) => !!S.settings || !!(run && run.capSeconds != null);
 
+  /* --- v0.7.1: worklog for a past day --- */
+  const WL_DAYS_BACK = 30;
+  const todayIso = () => i18n.isoDate(new Date());
+  const dayText = (iso) => i18n.weekdayDate(iso + 'T12:00:00', 'short'); // "Чт, 12 ноября"
+  const dayTextShort = (iso) => i18n.date(iso + 'T12:00:00', { day: 'numeric', month: 'long' }); // "12 ноября"
+  /** Why a day is not a working day by the user's calendar (labels only: the backend decides). */
+  function dayOffReason(iso) {
+    const s = S.settings;
+    if (!s) return null;
+    if ((s.holidays || []).includes(iso)) return 'holiday';
+    if ((s.vacations || []).some((v) => v && v.from <= iso && iso <= v.to)) return 'vacation';
+    const wd = new Date(iso + 'T12:00:00').getDay() || 7;
+    return Array.isArray(s.workDays) && !s.workDays.includes(wd) ? 'weekend' : null;
+  }
+  /** The mark of a past day from its real runs (any trigger but preview): logged, nothing to add, or none. */
+  function dayRunMark(iso) {
+    const runs = (S.wl.history || []).filter((r) => r.date === iso && r.trigger !== 'preview' && !r.skippedReason);
+    if (!runs.length) return '';
+    return runs.some((r) => Number(r.totalSeconds) > 0 || (r.items || []).some((i) => i.result === 'logged')) ? t('worklog.dayLogged') : t('worklog.dayNothing');
+  }
+  function renderWorklogDays() {
+    const sel = $('#wl-day');
+    const today = todayIso();
+    const missed = new Set(S.missed.days.map((d) => d.date));
+    const opt = (iso, label) => html`<option value="${iso}"${iso === (S.wl.date || today) ? html` selected` : ''}>${label}</option>`;
+    const past = [];
+    for (let i = 1; i <= WL_DAYS_BACK; i++) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const iso = i18n.isoDate(d);
+      const off = (S.wl.preview && S.wl.preview.date === iso && S.wl.preview.nonWorkingDay) || dayOffReason(iso);
+      const mark = missed.has(iso) ? t('worklog.dayMissed') : off ? reasonText(off) : dayRunMark(iso);
+      past.push(opt(iso, mark ? `${dayText(iso)} · ${mark}` : dayText(iso)));
+    }
+    setHTML(sel, html`<optgroup label="${t('worklog.today')}">${opt(today, `${t('worklog.today')}, ${dayText(today)}`)}</optgroup><optgroup label="${t('worklog.pastDays')}">${past}</optgroup>`);
+    sel.disabled = S.wl.running;
+  }
+  function chooseWorklogDay(iso) {
+    const date = !iso || iso >= todayIso() ? null : iso;
+    if (date === S.wl.date) return;
+    S.wl.date = date;
+    S.wl.result = null;
+    S.wl.preview = null; // the old day's table must not stay under the new title
+    loadPreview();
+  }
+
   function renderWorklog() {
     if (S.view !== 'worklog' || !isConfigured()) return;
+    renderWorklogDays();
     renderWorklogToday();
     renderWorklogPreview();
     renderWorklogHistory();
@@ -5345,9 +5414,13 @@
     const st = S.appState || {};
     const s = S.settings;
     const p = S.wl.preview;
+    const todayP = S.wl.date ? null : p; // a past day's preview says nothing about today
     let chip;
-    if (!p && S.wl.previewLoading) chip = html`<span class="skeleton sk-line" style="width:120px;height:22px"></span>`;
-    else if (!p) chip = html`<span class="chip">${t('worklog.dayUnknown')}</span>`;
+    if (S.wl.date) {
+      const off = dayOffReason(todayIso());
+      chip = off ? html`<span class="chip chip-warn">${icon('info')}${reasonText(off)}</span>` : s ? html`<span class="chip chip-good">${icon('check')}${t('worklog.workingDay')}</span>` : html`<span class="chip">${t('worklog.dayUnknown')}</span>`;
+    } else if (!todayP && S.wl.previewLoading) chip = html`<span class="skeleton sk-line" style="width:120px;height:22px"></span>`;
+    else if (!todayP) chip = html`<span class="chip">${t('worklog.dayUnknown')}</span>`;
     else if (p.skippedReason) chip = html`<span class="chip chip-warn">${icon('info')}${reasonText(p.skippedReason)}</span>`;
     else chip = html`<span class="chip chip-good">${icon('check')}${t('worklog.workingDay')}</span>`;
 
@@ -5457,14 +5530,17 @@
     const items = (run && Array.isArray(run.items)) ? run.items : [];
     const todo = sumOf(items, 'todoSeconds');
 
-    $('#wl-preview-title').textContent = result ? t('worklog.resultTitle') : t('worklog.previewTitle');
+    const pastDay = S.wl.date;
+    $('#wl-preview-title').textContent = result ? (pastDay ? t('worklog.resultTitleDay', { date: dayTextShort(pastDay) }) : t('worklog.resultTitle'))
+      : pastDay ? t('worklog.previewTitleDay', { date: dayTextShort(pastDay) }) : t('worklog.previewTitle');
     $('#wl-preview-sub').textContent = run && run.at
       ? (result ? t('worklog.ranAt', { time: i18n.time(run.at) }) : t('worklog.calculatedAt', { time: i18n.time(run.at) }))
       : '';
     setBusy($('#wl-preview-btn'), previewLoading);
     $('#wl-preview-btn').disabled = previewLoading || running;
     setBusy($('#wl-run-btn'), running || S.wl.refreshingForRun);
-    $('#wl-run-btn').disabled = running || S.wl.refreshingForRun || previewLoading || !!result || !preview || !!preview.skippedReason || !!preview.error || todo <= 0;
+    // v0.7.1: a non-working day that has time (past day, by hand) can be logged; without items there is nothing to log
+    $('#wl-run-btn').disabled = running || S.wl.refreshingForRun || previewLoading || !!result || !preview || !!preview.error || todo <= 0;
 
     if (!run && previewLoading) {
       setHTML(el, html`<div role="status" aria-label="${t('common.loading')}" style="display:flex;flex-direction:column;gap:8px">${[0, 1, 2, 3].map(() => html`<div class="skeleton" style="height:36px"></div>`)}</div>`);
@@ -5475,19 +5551,23 @@
       return;
     }
     if (!run) { el.textContent = ''; return; }
-    if (run.skippedReason) {
-      setHTML(el, stateBlock({ iconName: 'calendar', tone: 'warn', title: reasonText(run.skippedReason), text: t('worklog.skippedText.' + run.skippedReason) }));
+    if (run.skippedReason && !items.length) {
+      setHTML(el, stateBlock({ iconName: 'calendar', tone: 'warn', title: reasonText(run.skippedReason),
+        text: pastDay ? t('worklog.skippedPastText', { date: dayTextShort(pastDay) }) : t('worklog.skippedText.' + run.skippedReason) }));
       return;
     }
+    // v0.7.1: a past day is logged retroactively; a past non-working day (nonWorkingDay) is computed, by hand only
+    const offNote = run.nonWorkingDay ? html`<p class="wl-note">${icon('calendar')}<span>${t('worklog.offDayNote', { reason: reasonText(run.nonWorkingDay) })}</span></p>` : '';
+    const dayNote = html`${pastDay && !result ? html`<p class="wl-note wl-past">${icon('history')}<span>${t('worklog.pastNote', { date: dayTextShort(pastDay) })}</span></p>` : ''}${offNote}`;
     const errBanner = run.error ? html`<div class="inline-error" style="margin-bottom:12px">${icon('alert')}<span>${run.error}</span></div>` : '';
     if (!items.length) {
-      setHTML(el, html`${errBanner}${otherNote(run)}${stateBlock({ iconName: 'inbox', title: t('worklog.nothingTitle'), text: t('worklog.nothingText') })}`);
+      setHTML(el, html`${errBanner}${offNote}${otherNote(run)}${stateBlock({ iconName: 'inbox', title: t('worklog.nothingTitle'), text: pastDay ? t('worklog.nothingTextDay') : t('worklog.nothingText') })}`);
       return;
     }
     const allDone = !result && todo <= 0
       ? html`<div class="inline-error inline-success">${icon('check-circle')}<span>${t('worklog.allLogged')}</span></div>`
       : '';
-    setHTML(el, html`${errBanner}${allDone}${otherNote(run)}${itemsTable(items, { showResult: !!result })}${capBar(run, items, !!result)}`);
+    setHTML(el, html`${errBanner}${allDone}${todo > 0 ? dayNote : offNote}${otherNote(run)}${itemsTable(items, { showResult: !!result })}${capBar(run, items, !!result)}`);
   }
 
   function runSummary(run) {
@@ -5518,17 +5598,20 @@
     setHTML(el, html`<ul class="history" role="list">${history.map((run) => {
       const items = run.items || [];
       const failed = items.some((i) => i.result === 'error') || run.error;
+      const nothing = !run.skippedReason && !failed && !items.some((i) => i.result === 'logged') && !(Number(run.totalSeconds) > 0);
       const statusChip = run.skippedReason ? html`<span class="chip">${t('worklog.skipped')}</span>`
         : failed ? html`<span class="chip chip-bad">${icon('alert')}${t('worklog.hasErrors')}</span>`
+        : nothing ? html`<span class="chip">${t('worklog.nothingToAdd')}</span>` // v0.7.1: e.g. a catch-up check that found everything logged
         : html`<span class="chip chip-good">${icon('check')}${t('worklog.done')}</span>`;
-      const total = run.skippedReason ? '—' : dur(run.totalSeconds != null ? run.totalSeconds : sumOf(items, 'todoSeconds'));
+      const trigger = ['schedule', 'manual', 'catchup', 'preview'].includes(run.trigger) ? run.trigger : 'schedule';
+      const total = run.skippedReason || nothing ? '—' : dur(run.totalSeconds != null ? run.totalSeconds : sumOf(items, 'todoSeconds'));
       const dateStr = i18n.weekdayDate(run.date ? run.date + 'T12:00:00' : run.at, 'short');
       return html`<li><details class="run" data-at="${run.at || ''}" ${open.has(run.at) ? html`open` : ''}>
         <summary>
           ${icon('chevron-down', 'chev')}
           <span class="run-date">${dateStr}</span>
-          <span class="run-trigger"><span class="chip ${run.trigger === 'manual' ? 'chip-accent' : ''}">${t('worklog.trigger.' + (run.trigger || 'schedule'))}</span></span>
-          <span class="run-meta">${i18n.time(run.at)} · ${runSummary(run)}</span>
+          <span class="run-trigger"><span class="chip${trigger === 'manual' ? ' chip-accent' : trigger === 'catchup' ? ' chip-catchup' : ''}">${t('worklog.trigger.' + trigger)}</span></span>
+          <span class="run-meta">${i18n.time(run.at)}${nothing ? '' : ' · ' + runSummary(run)}</span>
           <span class="run-total">${total}</span>
           <span class="run-status">${statusChip}</span>
         </summary>
@@ -5556,17 +5639,14 @@
     const total = sumOf(items, 'todoSeconds');
     if (!total) return; // the refreshed preview now shows "all logged"
     const calcTime = i18n.time(p.at) || i18n.time(new Date(S.wl.previewFetchedAt));
-    const ok = await confirmDialog({
-      title: t('worklog.confirmTitle'),
-      body: t('worklog.confirmBody', { total: dur(total), n: items.length, date: i18n.date(new Date(), { day: 'numeric', month: 'long' }) }) +
-        ' ' + t('worklog.confirmCalc', { time: calcTime }),
-      okLabel: t('worklog.logNow'),
-    });
-    if (!ok || S.wl.running) return;
+    const date = S.wl.date;
+    const ok = await confirmRun(date, total, items.length, t('worklog.confirmCalc', { time: calcTime }));
+    if (!ok || S.wl.running || date !== S.wl.date) return;
     S.wl.running = true;
     renderWorklogPreview();
+    renderWorklogDays();
     try {
-      const res = await api('worklogRun');
+      const res = await api('worklogRun', date ? { date } : {});
       S.wl.result = res; // preview is kept for the "working day" chip; the result view replaces the table
       const ritems = (res && res.items) || [];
       const errors = ritems.filter((i) => i.result === 'error').length;
@@ -5576,6 +5656,7 @@
       else toast(t('worklog.runDone', { total: dur(loggedSec || res.totalSeconds || 0) }), { tone: 'success' });
       loadHistory();
       loadState();
+      if (date) loadMissed(); // a logged past day is no longer missed
     } catch (e) {
       // CR-7: the Go side may still be working (e.g. waiting for a scheduled run); its `worklog` event fills history.
       if (e.code === 'timeout') toast(t('worklog.runStillRunning'), { timeout: 15000 });
@@ -5585,6 +5666,135 @@
       renderWorklog();
       // CR-8: refresh the preview after the run (keeps the result view, updates the Today card).
       loadPreview();
+    }
+  }
+
+  /** The "writes to Jira" confirm: today as before; a past day says it is logged retroactively, on that date. */
+  function confirmRun(date, total, n, extra) {
+    const dateText = date ? dayTextShort(date) : i18n.date(new Date(), { day: 'numeric', month: 'long' });
+    return confirmDialog({
+      title: date ? t('worklog.confirmTitleDay', { date: dateText }) : t('worklog.confirmTitle'),
+      body: [t('worklog.confirmBody', { total: dur(total), n, date: dateText }), date ? t('worklog.confirmPast', { date: dateText }) : '', extra || ''].filter(Boolean).join(' '),
+      okLabel: t('worklog.logNow'),
+    });
+  }
+
+  /* ================================================================
+   * MISSED WORKLOG DAYS (SPEC v0.7.1): working days of the last week that the scheduled run missed and that still have
+   * time to add. An app-level notice on Board and Worklog: Review (Worklog on that day), Log now (confirm, then
+   * worklogRun {date}), Skip (skipWorklogDay: never asked again); dismissible for this session.
+   * ================================================================ */
+  const MISSED_MAX = 5;
+  const runTodo = (run) => (run && Number(run.totalSeconds) > 0 ? Number(run.totalSeconds) : sumOf(run && run.items, 'todoSeconds'));
+  function setMissed(days) {
+    S.missed.days = (Array.isArray(days) ? days : []).filter((d) => d && /^\d{4}-\d{2}-\d{2}$/.test(d.date) && runTodo(d) > 0)
+      .sort((a, b) => (a.date < b.date ? -1 : 1)).slice(0, MISSED_MAX);
+    renderMissed();
+    if (S.view === 'worklog' && isConfigured()) renderWorklogDays();
+  }
+  async function loadMissed() {
+    if (!isConfigured()) return;
+    try { const r = await api('getMissedWorklogDays'); setMissed(r && r.days); } catch { /* older backend: no catch-up */ }
+  }
+  const missedKey = () => S.missed.days.map((d) => d.date).join(',');
+  function renderMissed() {
+    const el = $('#missed-notice');
+    const id = activeSectionId();
+    const days = S.missed.days;
+    const show = days.length > 0 && (id === 'view-board' || id === 'view-worklog') && S.missed.dismissed !== missedKey();
+    const hadFocus = el.contains(document.activeElement);
+    el.hidden = !show;
+    if (!show) {
+      el.textContent = '';
+      if (hadFocus) $('#view-title').focus({ preventScroll: true }); // the notice went away under the focus
+      return;
+    }
+    const keep = document.activeElement && el.contains(document.activeElement) ? document.activeElement.dataset : null;
+    const actions = (d) => {
+      const busy = S.missed.busy.has(d.date);
+      return html`<span class="missed-actions">
+        <button type="button" class="btn btn-sm" data-missed="review" data-date="${d.date}"${busy ? html` disabled` : ''}>${t('missed.review')}</button>
+        <button type="button" class="btn btn-sm btn-primary" data-missed="log" data-date="${d.date}"${busy ? html` aria-busy="true" disabled` : ''}><span>${t('missed.log')}</span></button>
+        <button type="button" class="btn btn-sm btn-ghost" data-missed="skip" data-date="${d.date}"${busy ? html` disabled` : ''}>${t('missed.skip')}</button>
+      </span>`;
+    };
+    const body = days.length === 1
+      ? html`<div class="missed-body"><span class="notice-text">${t('missed.one', { date: dayText(days[0].date), total: dur(runTodo(days[0])) })}</span>${actions(days[0])}</div>`
+      : html`<div class="notice-text"><p>${t('missed.many', { n: days.length })}</p>
+          <ul class="missed-list" role="list">${days.map((d) => html`<li><span class="missed-day">${dayText(d.date)}</span><span class="missed-total">${dur(runTodo(d))}</span>${actions(d)}</li>`)}</ul></div>`;
+    setHTML(el, html`<div class="notice notice-missed${days.length > 1 ? ' is-multi' : ''}" role="region" aria-label="${t('missed.label')}">
+      ${icon('alert')}${body}
+      <button type="button" class="icon-btn icon-btn-sm missed-close" data-missed="dismiss" aria-label="${t('missed.dismiss')}" title="${t('missed.dismiss')}">${icon('x')}</button>
+    </div>`);
+    if (keep && keep.missed) { // re-rendered under the focus (busy state): keep it on the same control
+      const again = $(`[data-missed="${keep.missed}"]${keep.date ? `[data-date="${keep.date}"]` : ''}`, el);
+      (again && !again.disabled ? again : $('[data-missed]:not(:disabled)', el) || $('#view-title')).focus({ preventScroll: true });
+    }
+  }
+  async function onMissedClick(e) {
+    const b = e.target.closest('[data-missed]');
+    if (!b || b.disabled) return;
+    const date = b.dataset.date;
+    switch (b.dataset.missed) {
+      case 'dismiss':
+        S.missed.dismissed = missedKey();
+        renderMissed(); // moves the focus to the view title
+        break;
+      case 'review':
+        if (S.view === 'worklog' && activeSectionId() === 'view-worklog') chooseWorklogDay(date);
+        else { S.wl.pendingDate = date; showView('worklog'); }
+        break;
+      case 'log': await logMissedDay(date); break;
+      case 'skip': await skipMissedDay(date); break;
+      default:
+    }
+  }
+  /** Log now: a fresh preview for that day (never totals from an old one), the confirm, then the run. */
+  async function logMissedDay(date) {
+    if (S.missed.busy.has(date)) return;
+    S.missed.busy.add(date);
+    renderMissed();
+    try {
+      let p;
+      try { p = await api('worklogPreview', { date }); } catch (e) { toastError(t('worklog.previewError'), e); return; }
+      const items = ((p && p.items) || []).filter((i) => i.todoSeconds > 0);
+      const total = sumOf(items, 'todoSeconds');
+      if (!total || (p && p.error)) { toast(p && p.error ? p.error : t('missed.nothingNow', { date: dayTextShort(date) })); loadMissed(); return; }
+      const ok = await confirmRun(date, total, items.length);
+      if (!ok) return;
+      const res = await api('worklogRun', { date });
+      const ritems = (res && res.items) || [];
+      const errors = ritems.filter((i) => i.result === 'error').length;
+      const loggedSec = ritems.filter((i) => i.result === 'logged').reduce((s1, i) => s1 + (i.todoSeconds || 0), 0);
+      if (res && res.error) toast(t('worklog.runFailed') + ': ' + res.error, { tone: 'error' });
+      else if (errors) toast(t('worklog.runPartial', { total: dur(loggedSec), n: errors }), { tone: 'warn' });
+      else toast(t('missed.logged', { date: dayTextShort(date), total: dur(loggedSec || res.totalSeconds || 0) }), { tone: 'success' });
+      loadState();
+      if (S.view === 'worklog') { loadHistory(); if (S.wl.date === date && !S.wl.running) { S.wl.result = res; renderWorklog(); } }
+    } catch (e) {
+      if (e.code === 'timeout') toast(t('worklog.runStillRunning'), { timeout: 15000 });
+      else toastError(t('worklog.runFailed'), e);
+    } finally {
+      S.missed.busy.delete(date);
+      await loadMissed();
+      renderMissed();
+    }
+  }
+  async function skipMissedDay(date) {
+    if (S.missed.busy.has(date)) return;
+    S.missed.busy.add(date);
+    renderMissed();
+    try {
+      const r = await api('skipWorklogDay', { date }); // → the remaining MissedDays
+      S.missed.days = S.missed.days.filter((d) => d.date !== date);
+      if (r && Array.isArray(r.days)) setMissed(r.days);
+      toast(t('missed.skipped', { date: dayTextShort(date) }));
+    } catch (e) {
+      toastError(t('missed.skipFailed'), e);
+    } finally {
+      S.missed.busy.delete(date);
+      renderMissed();
+      if (S.view === 'worklog' && isConfigured()) renderWorklogDays();
     }
   }
 
@@ -6544,6 +6754,7 @@
       case 'updated': if (payload && payload.to) showUpdated(payload.to); loadUpdateStatus(false); break;
       case 'state': S.stateError = null; applyState(payload); break;
       case 'windowState': applyWindowState(payload); break;
+      case 'worklogMissed': setMissed(payload && payload.days); break; // v0.7.1 MissedDays; { days: [] } hides the notice
       case 'board': {
         // Board data, tracked projects or issues changed on the Go side: everything issue-based may be stale.
         const here = (v) => S.view === v && activeSectionId() === 'view-' + v;
@@ -6562,6 +6773,7 @@
             toast(payload.skippedReason ? t('worklog.autoSkipped', { reason: reasonText(payload.skippedReason) })
               : t('worklog.autoDone', { total: dur(payload.totalSeconds || 0) }), { tone: payload.error ? 'error' : 'success' });
           }
+          if (S.missed.days.some((d) => d.date === payload.date)) loadMissed(); // v0.7.1: logged elsewhere (e.g. a catch-up)
           // CR-8: keep the preview (Today card) intact; during a manual run logNow reloads it when the call resolves.
           if (S.view === 'worklog') {
             renderWorklogHistory();
@@ -6587,8 +6799,8 @@
     const search = $('#search');
     search.addEventListener('input', () => onSearchInput(search.value));
     $('#mine-toggle').addEventListener('change', (e) => setMine(S.view, e.target.checked));
-    if (typeof ResizeObserver === 'function') new ResizeObserver(() => syncProjectFilter()).observe($('#project-filter'));
-    else window.addEventListener('resize', syncProjectFilter);
+    if (typeof ResizeObserver === 'function') new ResizeObserver(() => onResizeWork()).observe($('#project-filter'));
+    else window.addEventListener('resize', onResizeWork);
     $('#project-menu-btn').addEventListener('click', (e) => openProjectMenu(e.currentTarget));
     $('#project-chips').addEventListener('click', (e) => {
       const b = e.target.closest('[data-project]');
@@ -6624,11 +6836,7 @@
     $('#ep-done').addEventListener('change', (e) => setEpicsOption({ includeDone: e.target.checked }));
     $('#ep-list').addEventListener('click', onTreeClick);
     $('#ep-list').addEventListener('keydown', onTreeKey);
-    window.addEventListener('resize', () => syncTableScroll($('#drawer')));
-    window.addEventListener('resize', () => { // the tooltip is placed once: re-place it for the focused row, drop a hover one
-      const a = document.activeElement;
-      dashHighlight(S.ep.dash.el && S.ep.dash.el.contains(a) ? a.closest('.epd-row') : null);
-    });
+    window.addEventListener('resize', onResizeWork);
 
     // Projects
     $('#pj-bulk').addEventListener('click', trackOnlyMine);
@@ -6682,6 +6890,8 @@
     // Worklog
     $('#wl-preview-btn').addEventListener('click', () => { S.wl.result = null; loadPreview(); });
     $('#wl-run-btn').addEventListener('click', logNow);
+    $('#wl-day').addEventListener('change', (e) => chooseWorklogDay(e.target.value));
+    $('#missed-notice').addEventListener('click', onMissedClick);
     $('#view-worklog').addEventListener('click', (e) => {
       const a = e.target.closest('[data-action]');
       if (!a) return;
@@ -6804,11 +7014,15 @@
   const DRAG_SKIP = 'button, a, input, select, textarea, label, summary, [role="radio"], [role="tab"], [role="switch"], [tabindex], .chips, .search';
   function applyWindowState(st) {
     if (!st || typeof st !== 'object') return;
-    S.win = { glass: !!st.glass, maximized: !!st.maximized, active: st.active !== false };
+    const wasResizing = !!(S.win && S.win.resizing);
+    S.win = { glass: !!st.glass, maximized: !!st.maximized, active: st.active !== false, resizing: !!st.resizing };
     const root = document.documentElement;
     root.classList.toggle('is-glass', S.win.glass);
     root.classList.toggle('is-maximized', S.win.maximized);
     root.classList.toggle('is-inactive', !S.win.active);
+    // While the user resizes the window, costly effects are off (CSS) and resize work waits for the end.
+    root.classList.toggle('is-resizing', S.win.resizing);
+    if (wasResizing && !S.win.resizing) afterResize();
     const max = $('#win-max');
     const label = t(S.win.maximized ? 'win.restore' : 'win.maximize');
     max.setAttribute('aria-label', label);

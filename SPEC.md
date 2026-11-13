@@ -1432,7 +1432,7 @@ gradients over a darkened photo — Jiraffe uses the real OS backdrop):
   (`ACCENT_ENABLE_ACRYLICBLURBEHIND`, default tint `0x40141518`), `C` plain blur (the default). Otherwise (Windows
   10, older 11, transparency off): no backdrop, opaque WebView background (current `--bg` colours), the page uses
   opaque surfaces.
-- **Window state for the page**: method `getWindowInfo` → `{ glass: bool, maximized: bool, active: bool }`; event
+- **Window state for the page**: method `getWindowInfo` → `{ glass: bool, maximized: bool, active: bool, resizing: bool }`; event
   `windowState` with the same shape on maximize/restore, activate/deactivate (WM_ACTIVATE) and when the transparency
   setting changes (WM_SETTINGCHANGE "ImmersiveColorSet").
 - **Window controls**: method `windowControl { action }` with `action` ∈ `minimize | toggleMaximize | close | drag |
@@ -1512,3 +1512,133 @@ null
 2. Without glass support: same layout, opaque surfaces, everything works.
 3. The UI uses Manrope, Lucide-style icons, accent yellow, glass surfaces; both themes; AA contrast; reduced motion.
 4. `./build.sh --check` passes; exe ≤ 5 MB; no network resources.
+
+## v0.7.1 — smooth interactive resize
+- With a real mouse, resizing a window with the accent blur made the frame lag far behind the cursor (DWM recomputes
+  the blur per size step), and the page could not re-render fast enough either. Now, from the first `WM_SIZING` to
+  `WM_EXITSIZEMOVE`: the accent blur is swapped for a cheap tinted surface (`ACCENT_ENABLE_TRANSPARENTGRADIENT`,
+  dark graphite `#3A3C41` / light `#EFF1F3` at 80 % by theme — user's choice: dark but not black) and restored afterwards; the WebView keeps its size
+  (`WM_SIZE` held back) and is resized once when the resize ends — WebView2 could not follow a real mouse even
+  throttled to 50/s; `windowState.resizing` is true, the page sets `.is-resizing` (no box-shadow / backdrop-filter /
+  filter / transitions / animations) and its resize work (project filter fit, table scroll state, dashboard tooltip)
+  is coalesced per frame and skipped until the resize ends. Moving the window keeps the blur.
+
+## v0.7.1 — missed worklog days, safe state saves
+
+Incident (2026-11-12/13): the 12 Nov worklog *was* posted at 18:00 and recorded in `state.json`, but the entry was
+later lost — another Jiraffe process holding an older in-memory state saved over the file (last writer wins). The
+log lines of that evening were lost the same way. Jira was fine. User decisions: restore the entry (done by hand) and
+add **catch-up for missed days** (asking first).
+
+### 1. State saves never lose other writers' data
+- Every save takes an exclusive lock (`LockFileEx` on `%APPDATA%\Jiraffe\state.lock`; a no-op/flock in tests), re-reads
+  `state.json`, **merges** and writes atomically:
+  - `history`: union by `(date, at)`, newest first, cap 60; `notifications`: union by id, cap 200;
+    `seenComments`: union, cap 5000; `skippedWorklogDays` (new): union; `lastWorklogDate`: the max;
+  - other fields: this process's values win (as today).
+- Log a line when the merge picked up entries this process did not have (`state: merged N foreign entries`).
+- The log writer: before rotating, re-check the file under the same lock; never delete a `.log.1` it did not create in
+  this rotation step (best effort; keep it simple).
+
+### 2. Worklog for a past day
+- `computeWorklog` gains a target **date D** (default today). For D < today:
+  - Issues JQL with absolute bounds: `status WAS IN (<inProgressStatuses>) DURING ("D 00:00", "D 23:59") AND
+    (assignee WAS currentUser() DURING ("D 00:00", "D 23:59") OR status CHANGED BY currentUser() DURING ("D 00:00", "D 23:59"))`
+    (status names from settings, quoted/escaped; keep the existing validateQuery/limits). Verify against the real Jira
+    the MCP is connected to (read-only search) that this JQL is accepted and returns RBI-1028 for 2026-11-12.
+  - In-progress intervals from the changelog as today, clipped to D's workday (`workdayStart..workdayEnd` minus lunch,
+    local time) — "now" for an interval still open at the end of D is D's `workdayEnd`.
+  - Already logged = my worklogs with `started` on D; cap = `dailyCapHours × loadFactor`; worklog `started` on D.
+  - Idempotent like today's run (re-running for D adds only the missing part).
+  - Calendar: a manual run for a non-working D is allowed but the preview says so; automatic catch-up only checks
+    working days.
+- Methods: `worklogPreview { date? }`, `worklogRun { date? }` — `date` = `YYYY-MM-DD`, not in the future, at most 30
+  days back (else `bad_params`). History entries keep `date` = D and get `trigger` `"manual"` / `"catchup"`.
+
+### 3. Missed days (catch-up, asks first)
+- On start (after the first successful Jira call) and once a day, look at **working days D in the last 7 days before
+  today** (not before the first day Jiraffe ever ran on this machine — `firstRunDate`, new state field set once;
+  migrate: earliest history date, else today) for which there is **no history entry** (any trigger except "preview")
+  and D is not in `skippedWorklogDays`.
+- For each such D (oldest first, max 5): compute a preview. Nothing to add (already logged by hand, by another run, or
+  no in-progress time) ⇒ store a history entry for D with `trigger: "catchup"` and the "nothing to add" result, silently.
+  Something to add ⇒ the day is **missed**.
+- Missed days ⇒ event `worklogMissed { days: [WorklogRun preview per day] }`, a single tray balloon
+  ("Worklog not recorded for 12 Nov — open Jiraffe"), and `getMissedWorklogDays` returns them.
+- New method `skipWorklogDay { date }` ⇒ adds D to `skippedWorklogDays` (never asked again).
+- UI:
+  - an app-level notice (dismissible) on Board/Worklog: "Worklog was not recorded for Wed 12 Nov (5h 36m)" with
+    **Review** (opens the Worklog screen on that day's preview), **Log now** (runs `worklogRun {date}` after a
+    confirm), **Skip** (`skipWorklogDay`);
+  - Worklog screen: a **day selector** (today by default, up to 30 days back, past days marked) — Preview / Log run
+    for the chosen day, with a clear "writes to Jira" confirm for past days; history list shows the trigger
+    ("by schedule", "manually", "catch-up").
+- i18n ru/uk/en; both themes; accessible.
+
+### Acceptance v0.7.1
+1. Two Jiraffe processes saving alternately never lose each other's history/notifications (test with two App
+   instances on one data dir).
+2. A missed working day within the last 7 days is detected after start; the user can review, log or skip it; logging
+   writes only the missing time for that day.
+3. Manual preview/run for a past day works; JQL verified against the real Jira (read-only).
+4. The resize changes of 0.7.1 (paused blur, frozen WebView size, dark graphite tint) stay.
+5. `./build.sh --check` passes; exe ≤ 5 MB.
+
+## Contract additions (v0.7.1)
+
+Types (additions in **bold**; everything else as before):
+```
+WorklogRun {
+  at, date ("YYYY-MM-DD" — the computed day D), trigger: "schedule"|"manual"|"preview"|**"catchup"**,
+  items: [WorklogItem], totalSeconds, otherLoggedSeconds, capSeconds, total, skippedReason?, error?,
+  **nonWorkingDay?: "weekend"|"holiday"|"vacation"**   // only for a past day computed on request
+}
+MissedDays { days: [WorklogRun] }   // previews (trigger "preview") of the missed days, oldest first; never null
+```
+- `trigger: "catchup"` appears only in the history: a past day the missed-day check found with nothing to add
+  (`totalSeconds: 0`), recorded silently. UI label "catch-up".
+- `nonWorkingDay`: a past weekend/holiday/vacation day previewed or run on request is computed normally (no
+  `skippedReason`); show "not a working day" next to it. Today keeps the old behaviour (`skippedReason`).
+
+Methods (changed / new):
+```
+worklogPreview { date?: "YYYY-MM-DD" } → WorklogRun            // trigger "preview"; nothing written
+worklogRun     { date?: "YYYY-MM-DD" } → WorklogRun            // trigger "manual"; writes to Jira; recorded in history
+getMissedWorklogDays {}                → MissedDays
+skipWorklogDay { date: "YYYY-MM-DD" }  → MissedDays           // the remaining missed days
+```
+- `date` omitted, `""` or today ⇒ today exactly as before. Otherwise a real date, not in the future and at most 30 days
+  back, else `bad_params` (also for a non-string). A past run logs only the missing part (my worklogs started on D
+  are subtracted; cap = dailyCapHours × loadFactor covers all my worklogs of D; `started` on D) and never changes
+  `nextWorklogAt`/the scheduled day.
+- `skipWorklogDay`: same date rule; the day is stored in `skippedWorklogDays` (state) and never reported again.
+- `getMissedWorklogDays` re-filters the last check's days: a day logged or skipped meanwhile (also by another
+  process) is not returned.
+
+Events (new):
+```
+worklogMissed MissedDays
+```
+- Sent after each missed-day check whose result differs from the previous one (the first check of a session always
+  sends, also `{ "days": [] }`), and whenever a day leaves the list (`worklogRun {date}` or `skipWorklogDay`).
+- The tray balloon is shown once per check that finds missed days (not while notifications are paused):
+  en "Worklog not recorded for 12 Nov — open Jiraffe" (several days: "10 Nov, 12 Nov"); ru "Время не списано за
+  12 нояб. — откройте Jiraffe"; uk "Час не списано за 12 лист. — відкрийте Jiraffe". Clicking it opens the window.
+
+Missed-day check (Go):
+- Runs after the first successful Jira call of the session and then once a day (scheduler tick), only while
+  configured and `worklogEnabled`; after a failure (Jira unreachable) it is retried after 15 min.
+- Days: working days among the 7 days before today, not before `firstRunDate`, oldest first, at most 5, without a
+  *completed* history entry (trigger ≠ "preview" and no `error`; a failed scheduled run does not count as done) and
+  not in `skippedWorklogDays`.
+- Past-day issue query (verified against the real Jira 2026-11-13, read-only headless preview: accepted, returns
+  RBI-1028 for 2026-11-12, preview "nothing to add" — 5h 36m logged = cap 8h × 0.7):
+  `status WAS IN ("In Progress", "В работе", "В роботі") DURING ("2026-11-12 00:00", "2026-11-12 23:59") AND (assignee
+  WAS currentUser() DURING ("2026-11-12 00:00", "2026-11-12 23:59") OR status CHANGED BY currentUser() DURING
+  ("2026-11-12 00:00", "2026-11-12 23:59"))` — statuses from settings (trimmed, de-duplicated, `"`/`\` escaped).
+- Headless: `jiraffe.exe --worklog-preview out.json --worklog-date YYYY-MM-DD` previews a past day (read-only).
+
+State (`state.json`, new fields): `firstRunDate` ("YYYY-MM-DD", set once: earliest history date of an existing
+install, else the first start's day), `skippedWorklogDays` (["YYYY-MM-DD"], ascending, max 100). Saves take
+`state.lock` (LockFileEx) and merge as in §1; the log writer rotates under `jiraffe.log.lock`, re-checks the file
+first, never deletes `jiraffe.log.1` (the rename replaces it) and keeps appending when the rotation fails.

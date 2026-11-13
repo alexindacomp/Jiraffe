@@ -95,7 +95,7 @@ Requires the Microsoft Edge WebView2 Runtime (preinstalled on Windows 10/11).
 | `jiraffe.exe` | starts in the tray and opens the window (or shows the running instance) |
 | `jiraffe.exe --minimized` | tray only (used by autostart) |
 | `jiraffe.exe --updated-from X.Y.Z --wait-pid N` | used by the updater for the restart: waits up to 15 s for the old process, then starts normally |
-| `jiraffe.exe --worklog-preview out.json` | headless: computes today's worklog preview, writes `WorklogRun` JSON, exits 0/1; never writes to Jira. `JIRAFFE_URL` / `JIRAFFE_TOKEN` override the saved settings (from WSL pass them with `WSLENV=JIRAFFE_URL:JIRAFFE_TOKEN`) |
+| `jiraffe.exe --worklog-preview out.json [--worklog-date YYYY-MM-DD]` | headless: computes today's (or a past day's, up to 30 days back) worklog preview, writes `WorklogRun` JSON, exits 0/1; never writes to Jira. `JIRAFFE_URL` / `JIRAFFE_TOKEN` override the saved settings (from WSL pass them with `WSLENV=JIRAFFE_URL:JIRAFFE_TOKEN`) |
 
 Files:
 

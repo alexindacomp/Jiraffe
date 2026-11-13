@@ -127,7 +127,7 @@
     <header class="topbar" data-drag>
       <div class="view-head">
         <p class="view-eyebrow"><span class="eyebrow-dot" id="eyebrow-dot" aria-hidden="true"></span><span id="eyebrow-text">Jiraffe</span></p>
-        <h1 class="view-title" id="view-title"></h1>
+        <h1 class="view-title" id="view-title" tabindex="-1"></h1>
       </div>
       <div class="view-tools" id="view-tools" hidden>
         <div class="search" id="search-wrap">
@@ -152,6 +152,9 @@
       </div>
       <span class="win-btns-room" aria-hidden="true"></span><!-- the window buttons (.win-btns) sit here, outside #app -->
     </header>
+
+    <!-- v0.7.1: missed worklog days (Board and Worklog), rendered by app.js -->
+    <div id="missed-notice" hidden></div>
 
     <main class="views" id="views">
       <!-- App-level loading / fatal error -->
@@ -217,6 +220,7 @@
                 <p class="section-sub" id="wl-preview-sub"></p>
               </div>
               <div class="section-actions">
+                <label class="wl-day" for="wl-day"><span class="wl-day-label" data-i18n="worklog.dayLabel"></span><select class="input select" id="wl-day"></select></label>
                 <button type="button" class="btn" id="wl-preview-btn"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span data-i18n="worklog.preview"></span></button>
                 <button type="button" class="btn btn-primary" id="wl-run-btn"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="worklog.logNow"></span></button>
               </div>

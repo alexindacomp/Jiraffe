@@ -26,7 +26,55 @@ var errRunFailed = errors.New("worklog run had failures")
 // ComputeWorklog computes the preview for now without writing anything.
 // Used by the headless --worklog-preview mode.
 func (a *App) ComputeWorklog(ctx context.Context) (worklog.Run, error) {
-	return a.computeWorklog(ctx, worklog.TriggerPreview, time.Time{})
+	return a.computeWorklog(ctx, worklog.TriggerPreview, time.Time{}, "")
+}
+
+// ComputeWorklogFor computes the preview for a day ("2006-01-02"; "" =
+// today) without writing anything; the date is validated like the
+// worklogPreview parameter. Used by the headless preview mode.
+func (a *App) ComputeWorklogFor(ctx context.Context, date string) (worklog.Run, error) {
+	d, err := a.runDate(date)
+	if err != nil {
+		return worklog.Run{}, err
+	}
+	return a.computeWorklog(ctx, worklog.TriggerPreview, time.Time{}, d)
+}
+
+// MaxPastDays is how far back a worklog run may compute a day.
+const MaxPastDays = 30
+
+// runDate validates the optional date of worklogPreview/worklogRun: a real
+// "YYYY-MM-DD" date, not in the future and at most MaxPastDays back. Today
+// is returned as "" (the normal run for today).
+func (a *App) runDate(date string) (string, error) {
+	if date == "" {
+		return "", nil
+	}
+	now := a.clock.Now()
+	d, err := parseDay(date, now.Location())
+	if err != nil || d.After(now) || d.Before(dayStart(now).AddDate(0, 0, -MaxPastDays)) {
+		return "", a.newErr(CodeBadParams, "err_bad_date", MaxPastDays)
+	}
+	if date == now.Format(worklog.DateLayout) {
+		return "", nil
+	}
+	return date, nil
+}
+
+// parseDay parses a strict "YYYY-MM-DD" date as the start of that day in loc.
+func parseDay(date string, loc *time.Location) (time.Time, error) {
+	// The layout's fixed-width fields (4-digit year, 2-digit month and day)
+	// plus the length make the parse strict; no regexp (≈250 KB in the exe).
+	if len(date) != len(worklog.DateLayout) {
+		return time.Time{}, fmt.Errorf("bad date %q", date)
+	}
+	return time.ParseInLocation(worklog.DateLayout, date, loc)
+}
+
+// dayStart is midnight of t's day.
+func dayStart(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
 }
 
 // effectiveNow returns the moment a run computes for. due is the moment the
@@ -45,9 +93,11 @@ func effectiveNow(now, due time.Time) time.Time {
 }
 
 // computeWorklog computes (preview) or performs (manual/schedule) a worklog
-// run. A fatal error (e.g. search failed) is returned as err with run.Error
-// set; per-issue failures only set item errors and run.Error.
-func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time) (worklog.Run, error) {
+// run. date ("2006-01-02", validated, before today) selects a past day; ""
+// is today (or the day the scheduler decided, see effectiveNow). A fatal
+// error (e.g. search failed) is returned as err with run.Error set;
+// per-issue failures only set item errors and run.Error.
+func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time, date string) (worklog.Run, error) {
 	if trigger != worklog.TriggerPreview {
 		a.runMu.Lock()
 		defer a.runMu.Unlock()
@@ -57,6 +107,16 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time)
 	}
 	realNow := a.clock.Now()
 	now := effectiveNow(realNow, due)
+	past := false
+	if date != "" {
+		d, err := parseDay(date, realNow.Location())
+		if err != nil {
+			return worklog.Run{}, a.newErr(CodeBadParams, "err_bad_date", MaxPastDays)
+		}
+		// The day as of its end: intervals still open then end at the
+		// workday end after clipping.
+		now, past = time.Date(d.Year(), d.Month(), d.Day(), 23, 59, 59, 0, d.Location()), true
+	}
 	s := a.cfg.Get()
 	run := worklog.Run{
 		At:         realNow.Format(time.RFC3339),
@@ -74,13 +134,21 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time)
 		return run, nil
 	}
 	if ok, reason := calendarOf(s).Check(now); !ok {
-		run.SkippedReason = reason
-		return run, nil
+		if !past {
+			run.SkippedReason = reason
+			return run, nil
+		}
+		// A past day is computed on request anyway; the result says so.
+		run.NonWorkingDay = reason
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
-	planned, other, err := a.plan(ctx, c, identity, s, now, realNow)
+	jql := WorklogJQLFor(now, realNow)
+	if past {
+		jql = PastWorklogJQL(run.Date, s.InProgressStatuses)
+	}
+	planned, other, err := a.plan(ctx, c, identity, s, now, jql)
 	if err != nil {
 		var ce *capCheckError
 		if errors.As(err, &ce) {
@@ -163,10 +231,37 @@ type capCheckError struct{ err error }
 func (e *capCheckError) Error() string { return "daily cap check: " + e.err.Error() }
 func (e *capCheckError) Unwrap() error { return e.err }
 
-// plan fetches today's issues and allocates the time between them. It also
-// returns my time logged today on other (non-candidate) issues, which
-// reduces the daily cap: the cap covers all my worklogs of the day.
-func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s config.Settings, now, realNow time.Time) ([]worklog.Planned, int64, error) {
+// PastWorklogJQL selects the issues that were in progress on a past day
+// (date "2006-01-02") and were mine or moved by me then; absolute bounds,
+// so it does not depend on today. "" when no in-progress status is set.
+func PastWorklogJQL(date string, inProgress []string) string {
+	var names []string
+	seen := map[string]bool{}
+	for _, n := range inProgress {
+		n = strings.TrimSpace(n)
+		if k := strings.ToLower(n); n != "" && !seen[k] {
+			seen[k] = true
+			names = append(names, jqlString(n))
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	during := fmt.Sprintf(`DURING ("%s 00:00", "%s 23:59")`, date, date)
+	return `status WAS IN (` + strings.Join(names, ", ") + `) ` + during +
+		` AND (assignee WAS currentUser() ` + during + ` OR status CHANGED BY currentUser() ` + during + `)`
+}
+
+// jqlString quotes a JQL string literal.
+func jqlString(s string) string {
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
+}
+
+// plan fetches the day's issues (jql) and allocates the time between them.
+// It also returns my time logged that day on other (non-candidate) issues,
+// which reduces the daily cap: the cap covers all my worklogs of the day.
+// now is the moment computed for (the end of a past day).
+func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s config.Settings, now time.Time, jql string) ([]worklog.Planned, int64, error) {
 	day := worklog.Day{Start: config.At(now, s.WorkdayStart), End: config.At(now, s.WorkdayEnd)}
 	if now.Before(day.End) {
 		day.End = now
@@ -174,14 +269,14 @@ func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s confi
 	if s.LunchStart != "" && s.LunchEnd != "" {
 		day.HasLunch, day.LunchStart, day.LunchEnd = true, config.At(now, s.LunchStart), config.At(now, s.LunchEnd)
 	}
-	if !day.End.After(day.Start) {
+	if !day.End.After(day.Start) || jql == "" {
 		return nil, 0, nil
 	}
 	me, err := a.me(ctx, c, identity)
 	if err != nil {
 		return nil, 0, err
 	}
-	issues, err := c.Search(ctx, WorklogJQLFor(now, realNow), jira.SearchOptions{Fields: worklogFields, Expand: "changelog", Limit: 200})
+	issues, err := c.Search(ctx, jql, jira.SearchOptions{Fields: worklogFields, Expand: "changelog", Limit: 200})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -329,9 +424,15 @@ func (a *App) record(run worklog.Run, scheduledOK bool) {
 	a.emitState()
 }
 
-// ManualWorklog performs a worklog run requested by the user.
+// ManualWorklog performs a worklog run for today requested by the user.
 func (a *App) ManualWorklog(ctx context.Context) (worklog.Run, error) {
-	run, err := a.computeWorklog(ctx, worklog.TriggerManual, time.Time{})
+	return a.manualWorklog(ctx, "")
+}
+
+// manualWorklog performs a worklog run requested by the user for date
+// (validated by runDate; "" = today).
+func (a *App) manualWorklog(ctx context.Context, date string) (worklog.Run, error) {
+	run, err := a.computeWorklog(ctx, worklog.TriggerManual, time.Time{}, date)
 	if errors.Is(err, errUpdateRestart) {
 		return run, a.newErr(CodeConflict, "err_update_restarting")
 	}
@@ -342,6 +443,9 @@ func (a *App) ManualWorklog(ctx context.Context) (worklog.Run, error) {
 		return run, nil // not a working day: reported, nothing written, not recorded
 	}
 	a.record(run, false)
+	if date != "" {
+		a.refreshMissed() // the day may no longer be missed
+	}
 	if err != nil {
 		return run, err
 	}
@@ -372,7 +476,7 @@ func (a *App) ScheduledWorklog(ctx context.Context) error {
 // meanwhile, and the day is only marked done if its worklog time had been
 // reached. It returns an error when the run should be retried.
 func (a *App) ScheduledWorklogAt(ctx context.Context, due time.Time) error {
-	run, err := a.computeWorklog(ctx, worklog.TriggerSchedule, due)
+	run, err := a.computeWorklog(ctx, worklog.TriggerSchedule, due, "")
 	if errors.Is(err, errUpdateRestart) {
 		return nil // not recorded: the new version catches up
 	}

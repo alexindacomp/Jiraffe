@@ -120,6 +120,9 @@ type Hooks struct {
 	// due (the run computes that day). It records LastRunDate on success.
 	RunWorklog   func(ctx context.Context, due time.Time) error
 	PollComments func(ctx context.Context) error
+	// CatchUp (optional) runs on every tick while configured; it decides
+	// itself whether its daily check is due (missed worklog days).
+	CatchUp func(ctx context.Context) error
 }
 
 // Scheduler runs Hooks at the right time. Tick does one evaluation; Run
@@ -165,6 +168,10 @@ func (s *Scheduler) Tick(ctx context.Context) {
 			s.retryAt = now.Add(RetryDelay)
 		}
 		s.mu.Unlock()
+	}
+
+	if cfg.Configured && s.hooks.CatchUp != nil {
+		_ = s.safe(ctx, "missed worklog days", s.hooks.CatchUp)
 	}
 
 	if cfg.Configured && cfg.NotifyComments && cfg.PollEvery > 0 {

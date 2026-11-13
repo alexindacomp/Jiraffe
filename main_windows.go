@@ -69,6 +69,7 @@ func run(args []string) int {
 	fs.SetOutput(io.Discard)
 	minimized := fs.Bool("minimized", false, "start in the tray without a window")
 	previewOut := fs.String("worklog-preview", "", "write today's worklog preview JSON to this file and exit")
+	previewDate := fs.String("worklog-date", "", "with --worklog-preview: preview this past day (YYYY-MM-DD) instead of today")
 	updatedFrom := fs.String("updated-from", "", "started by the updater of this version")
 	waitPid := fs.Int("wait-pid", 0, "wait up to 15 s for this process (the updated instance) to exit")
 	if err := fs.Parse(args); err != nil {
@@ -86,7 +87,7 @@ func run(args []string) int {
 	log.Printf("Jiraffe %s starting (minimized=%v, preview=%v, updatedFrom=%q)", app.Version, *minimized, *previewOut != "", *updatedFrom)
 
 	if *previewOut != "" {
-		return headlessPreview(dataDir, *previewOut)
+		return headlessPreview(dataDir, *previewOut, *previewDate)
 	}
 
 	// --updated-from is only trusted as a version; anything else is ignored.
@@ -256,8 +257,11 @@ type ui struct {
 	// the UI thread, read by getWindowInfo from any goroutine.
 	stateMu  sync.Mutex
 	state    app.WindowInfo
-	acrylic  bool    // a glass backdrop was set on the current window
-	chromeOn uintptr // the window the chrome was applied to
+	acrylic  bool            // a glass backdrop was set on the current window
+	backdrop winapi.Backdrop // the glass backdrop applied (when acrylic)
+	tint     uint32          // its tint (accent acrylic)
+	paused   bool            // the accent blur is paused while resizing
+	chromeOn uintptr         // the window the chrome was applied to
 
 	// main thread only
 	w          webview2.WebView
@@ -324,7 +328,7 @@ func (u *ui) loop() {
 			u.w.Run() // returns when the window is closed (PostQuitMessage)
 			u.w, u.hwnd = nil, 0
 			u.setState(func(s *app.WindowInfo) { *s = app.WindowInfo{} }, false)
-			u.acrylic, u.chromeOn = false, 0
+			u.acrylic, u.chromeOn, u.paused = false, 0, false
 			u.shown.Store(false)
 			continue
 		}
@@ -364,6 +368,7 @@ func (u *ui) applyChrome(hwnd uintptr, dark, glass bool) {
 			log.Printf("glass backdrop: %v (opaque surfaces)", err)
 		} else {
 			u.acrylic, backdrop = true, got
+			u.backdrop, u.tint, u.paused = got, tint, false
 			if fallback != nil {
 				log.Printf("glass backdrop: %v; using %s", fallback, got)
 			}
@@ -386,6 +391,13 @@ func (u *ui) applyChrome(hwnd uintptr, dark, glass bool) {
 	}, true)
 }
 
+// resizeTintDark / resizeTintLight (ABGR) replace the blur while the window
+// is resized: dark graphite #3A3C41 (not black) / light #EFF1F3, both at 80 %.
+const (
+	resizeTintDark  uint32 = 0xCC413C3A
+	resizeTintLight uint32 = 0xCCF3F1EF
+)
+
 // onWindowMessage follows maximize/restore, activation and the
 // transparency setting for the page (UI thread).
 func (u *ui) onWindowMessage(msg uint32, wParam, lParam uintptr) {
@@ -396,6 +408,29 @@ func (u *ui) onWindowMessage(msg uint32, wParam, lParam uintptr) {
 			u.setState(func(s *app.WindowInfo) { s.Maximized = true }, true)
 		case winapi.SizeRestored:
 			u.setState(func(s *app.WindowInfo) { s.Maximized = false }, true)
+		}
+	case winapi.WMSizing:
+		// The page drops costly effects while resizing (see WindowInfo).
+		u.setState(func(s *app.WindowInfo) { s.Resizing = true }, true)
+		// Resizing with a real mouse makes DWM recompute the accent blur for
+		// every step and the frame lags far behind the cursor: show a plain
+		// tint until the resize ends (moving is fine and keeps the blur).
+		if u.acrylic && !u.paused && u.backdrop != winapi.BackdropAcrylic {
+			tint := resizeTintLight
+			if winapi.AppsUseDarkTheme() {
+				tint = resizeTintDark
+			}
+			if err := winapi.PauseBackdrop(u.hwnd, tint); err == nil {
+				u.paused = true
+			}
+		}
+	case winapi.WMExitSizeMove:
+		u.setState(func(s *app.WindowInfo) { s.Resizing = false }, true)
+		if u.paused {
+			u.paused = false
+			if err := winapi.ResumeBackdrop(u.hwnd, u.backdrop, u.tint); err != nil {
+				log.Printf("glass backdrop after resize: %v", err)
+			}
 		}
 	case winapi.WMActivate:
 		active := wParam&0xFFFF != 0 // WA_ACTIVE / WA_CLICKACTIVE
@@ -779,7 +814,7 @@ func (headlessPlatform) SetWindowTheme(app.WindowTheme)        {}
 
 // headlessPreview computes today's worklog preview and writes it as JSON to
 // out. JIRAFFE_URL / JIRAFFE_TOKEN override the saved configuration.
-func headlessPreview(dataDir, out string) (code int) {
+func headlessPreview(dataDir, out, date string) (code int) {
 	code = 1
 	var result any
 	defer func() {
@@ -819,8 +854,11 @@ func headlessPreview(dataDir, out string) (code int) {
 	a := app.New(cfg, st, headlessPlatform{t: transport}, scheduler.SystemClock{}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	run, err := a.ComputeWorklog(ctx)
+	run, err := a.ComputeWorklogFor(ctx, date)
 	result = run
+	if e := (*app.Error)(nil); errors.As(err, &e) && e.Code == app.CodeBadParams {
+		result = map[string]string{"code": e.Code, "error": e.Message}
+	}
 	if err == nil && run.SkippedReason != "not-configured" && run.Error == "" {
 		code = 0
 	}

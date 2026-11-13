@@ -184,10 +184,17 @@ type App struct {
 	// layoutBuilds marks the projects whose board layout is being built
 	// (closed when done); guarded by mu.
 	layoutBuilds map[string]chan struct{}
-	epics        epicCache  // epic names/colours for epic chips
-	trackMu      sync.Mutex // serializes the lazy trackedProjects initialisation
-	runMu        sync.Mutex // serializes worklog runs that write to Jira
-	pollMu       sync.Mutex // serializes comment polls
+	epics        epicCache   // epic names/colours for epic chips
+	trackMu      sync.Mutex  // serializes the lazy trackedProjects initialisation
+	runMu        sync.Mutex  // serializes worklog runs that write to Jira
+	catchMu      sync.Mutex  // one missed-day check at a time
+	jiraOK       atomic.Bool // a Jira call succeeded this session (catchup.go)
+	started      atomic.Bool // Start ran: background behaviour (catch-up) is on
+	// missed-day detection (catchup.go), guarded by mu
+	missed       []worklog.Run // previews of the missed days, oldest first
+	catchDay     string        // day of the last completed check
+	catchRetryAt time.Time     // no check before this (after a failure)
+	pollMu       sync.Mutex    // serializes comment polls
 	bgWG         sync.WaitGroup
 	bgCtx        context.Context
 	bgCancel     context.CancelFunc
@@ -224,6 +231,7 @@ func New(cfg *config.Store, st *state.Store, plat Platform, clock scheduler.Cloc
 		LastRunDate:  func() string { return a.st.Snapshot().LastWorklogDate },
 		RunWorklog:   a.ScheduledWorklogAt,
 		PollComments: a.PollComments,
+		CatchUp:      a.CatchUp,
 	})
 	return a
 }
@@ -237,6 +245,8 @@ func (a *App) Start() {
 			log.Printf("autostart: %v", err)
 		}
 		a.plat.SettingsChanged(s, a.Paused())
+		a.ensureFirstRunDate()
+		a.started.Store(true)
 		a.goBackground("refresh user", func(ctx context.Context) { a.refreshUser(ctx) })
 		a.goBackground("scheduler", func(ctx context.Context) { a.sched.Run(ctx, 30*time.Second) })
 		if a.upd != nil {
@@ -545,14 +555,35 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 			return a.skipUpdate(p.Version)
 		}
 		return nil, a.installUpdate(p.Version)
-	case "worklogPreview":
-		run, err := a.computeWorklog(ctx, worklog.TriggerPreview, time.Time{})
+	case "worklogPreview", "worklogRun":
+		var p struct {
+			Date string `json:"date"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		date, err := a.runDate(p.Date)
+		if err != nil {
+			return nil, err
+		}
+		if method == "worklogRun" {
+			return a.manualWorklog(ctx, date)
+		}
+		run, err := a.computeWorklog(ctx, worklog.TriggerPreview, time.Time{}, date)
 		if err != nil {
 			return nil, err
 		}
 		return run, nil
-	case "worklogRun":
-		return a.ManualWorklog(ctx)
+	case "getMissedWorklogDays":
+		return a.missedDays(), nil
+	case "skipWorklogDay":
+		var p struct {
+			Date string `json:"date"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.skipWorklogDay(p.Date)
 	case "getWorklogHistory":
 		h := a.st.Snapshot().History
 		if h == nil {
@@ -719,6 +750,7 @@ func (a *App) me(ctx context.Context, c *jira.Client, identity string) (*jira.Us
 	a.mu.Lock()
 	a.user, a.userFor = u, identity
 	a.mu.Unlock()
+	a.noteJiraOK()
 	return u, nil
 }
 

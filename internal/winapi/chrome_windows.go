@@ -28,6 +28,8 @@ var (
 	procFillRect                     = modUser32.NewProc("FillRect")
 	procSetWindowCompositionAttr     = modUser32.NewProc("SetWindowCompositionAttribute") // undocumented
 	procGetStockObject               = modGdi32.NewProc("GetStockObject")
+	procSetTimer                     = modUser32.NewProc("SetTimer")
+	procKillTimer                    = modUser32.NewProc("KillTimer")
 
 	modGdi32 = windows.NewLazySystemDLL("gdi32.dll")
 )
@@ -37,11 +39,22 @@ const (
 	WMSize          = 0x0005
 	WMActivate      = 0x0006
 	WMSettingChange = 0x001A
+	WMSizing        = 0x0214 // the user is resizing (inside the size/move loop)
+	WMExitSizeMove  = 0x0232 // the size/move loop ended
 	wmPaint         = 0x000F
 	wmEraseBkgnd    = 0x0014
 	wmNCDestroy     = 0x0082
 	wmNCCalcSize    = 0x0083
 	wmNCLButtonDown = 0x00A1
+	wmTimer         = 0x0113
+
+	// While the user resizes the window, the WebView keeps its size and is
+	// resized once when the resize ends: with a real mouse there are hundreds
+	// of WM_SIZE per second and WebView2 cannot follow them (even throttled
+	// to 50/s the page trailed far behind the frame). sizeTimerID is kept for
+	// a throttled mode (sizeThrottleMs > 0).
+	sizeTimerID    = 0x4A53 // "JS"
+	sizeThrottleMs = 0
 
 	SizeRestored  = 0
 	SizeMaximized = 2
@@ -57,6 +70,7 @@ const (
 	blackBrush = 4 // GetStockObject
 
 	wcaAccentPolicy               = 19
+	accentEnableTransparentGrad   = 2 // a tinted surface without blur (cheap)
 	accentEnableBlurBehind        = 3
 	accentEnableAcrylicBlurBehind = 4
 
@@ -83,6 +97,10 @@ var subclass struct {
 	orig  uintptr
 	hook  MessageHook
 	clear bool // glass: paint the window transparent black
+
+	sizing  bool // inside an interactive resize (WM_SIZING .. WM_EXITSIZEMOVE)
+	pending bool // a WM_SIZE was held back during the resize
+	timer   bool // the size timer is running
 }
 
 // framelessProcPtr is created once: windows.NewCallback has a process-wide
@@ -134,15 +152,86 @@ func framelessProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	if hook != nil {
 		hook(uint32(msg), wParam, lParam)
 	}
+	switch msg {
+	case WMSizing:
+		subclass.Lock()
+		subclass.sizing = true
+		subclass.Unlock()
+	case WMSize:
+		// Hold the WebView resize back while the user drags an edge; the
+		// timer below forwards the latest size every sizeThrottleMs.
+		if wParam == SizeRestored && throttleSize(hwnd) {
+			return 0
+		}
+	case wmTimer:
+		if wParam == sizeTimerID {
+			flushSize(hwnd, orig, false)
+			return 0
+		}
+	case WMExitSizeMove:
+		subclass.Lock()
+		subclass.sizing = false
+		subclass.Unlock()
+		flushSize(hwnd, orig, true)
+	}
 	r, _, _ := procCallWindowProcW.Call(orig, hwnd, msg, wParam, lParam)
 	if msg == wmNCDestroy {
 		subclass.Lock()
 		if subclass.hwnd == hwnd {
 			subclass.hwnd, subclass.orig, subclass.hook, subclass.clear = 0, 0, nil, false
+			subclass.sizing, subclass.pending, subclass.timer = false, false, false
 		}
 		subclass.Unlock()
 	}
 	return r
+}
+
+// throttleSize reports whether a WM_SIZE is held back (an interactive
+// resize is in progress) and starts the size timer if needed.
+func throttleSize(hwnd uintptr) bool {
+	subclass.Lock()
+	defer subclass.Unlock()
+	if !subclass.sizing || subclass.hwnd != hwnd {
+		return false
+	}
+	subclass.pending = true
+	if sizeThrottleMs == 0 {
+		return true // frozen until WM_EXITSIZEMOVE
+	}
+	if !subclass.timer {
+		if r, _, _ := procSetTimer.Call(hwnd, sizeTimerID, sizeThrottleMs, 0); r != 0 {
+			subclass.timer = true
+		} else {
+			return false // no timer: resize directly
+		}
+	}
+	return true
+}
+
+// flushSize forwards a held-back WM_SIZE with the current client size to the
+// original window procedure (which resizes the WebView). final stops the
+// timer (the resize ended); otherwise the timer stops once nothing is pending.
+func flushSize(hwnd, orig uintptr, final bool) {
+	subclass.Lock()
+	pending := subclass.pending
+	subclass.pending = false
+	stop := subclass.timer && (final || !pending)
+	if stop {
+		subclass.timer = false
+	}
+	subclass.Unlock()
+	if stop {
+		procKillTimer.Call(hwnd, sizeTimerID)
+	}
+	if !pending {
+		return
+	}
+	var rc Rect
+	if r, _, _ := procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc))); r == 0 {
+		return
+	}
+	w, h := uint32(rc.Right-rc.Left)&0xFFFF, uint32(rc.Bottom-rc.Top)&0xFFFF
+	procCallWindowProcW.Call(orig, hwnd, WMSize, SizeRestored, uintptr(h<<16|w))
 }
 
 // paintStruct is PAINTSTRUCT.
@@ -346,6 +435,35 @@ func enableAccent(hwnd uintptr, b Backdrop, tint uint32) error {
 		return fmt.Errorf("SetWindowCompositionAttribute: %w", err)
 	}
 	_ = dwmSet(hwnd, dwmwaSystemBackdropType, dwmsbtNone) // Windows 11 22H2+ only; the default anyway
+	return nil
+}
+
+// PauseBackdrop swaps the accent blur of hwnd for a plain tinted surface
+// (ABGR tint, no blur). DWM recomputes the accent blur for every size step,
+// and with a real mouse (hundreds of steps per second) the window frame then
+// falls far behind the cursor; the tinted surface is cheap. ResumeBackdrop
+// puts the blur back when the resize ends.
+func PauseBackdrop(hwnd uintptr, tint uint32) error {
+	return setAccent(hwnd, accentPolicy{accentState: accentEnableTransparentGrad, accentFlags: 2, gradientColor: tint})
+}
+
+// ResumeBackdrop restores the accent backdrop b after PauseBackdrop.
+func ResumeBackdrop(hwnd uintptr, b Backdrop, tint uint32) error {
+	policy := accentPolicy{accentState: accentEnableBlurBehind}
+	if b == BackdropAccentAcrylic {
+		policy = accentPolicy{accentState: accentEnableAcrylicBlurBehind, gradientColor: tint}
+	}
+	return setAccent(hwnd, policy)
+}
+
+func setAccent(hwnd uintptr, policy accentPolicy) error {
+	if err := procSetWindowCompositionAttr.Find(); err != nil {
+		return err
+	}
+	data := windowCompositionAttribData{attrib: wcaAccentPolicy, data: unsafe.Pointer(&policy), size: unsafe.Sizeof(policy)}
+	if r, _, err := procSetWindowCompositionAttr.Call(hwnd, uintptr(unsafe.Pointer(&data))); r == 0 {
+		return fmt.Errorf("SetWindowCompositionAttribute: %w", err)
+	}
 	return nil
 }
 

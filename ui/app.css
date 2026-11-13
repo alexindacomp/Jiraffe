@@ -409,6 +409,7 @@ html.is-maximized .main { border-radius: var(--r-panel) 0 0 var(--r-panel); bord
 .eyebrow-dot[data-tone="warn"] { background: var(--warning); }
 .eyebrow-dot[data-tone="error"] { background: var(--danger); }
 .view-title { font-size: 22px; font-weight: 650; line-height: 1.2; letter-spacing: -.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.view-title:focus { outline: none; box-shadow: none; } /* a programmatic focus target (v0.7.1: after the missed-days notice goes away) */
 .view-tools { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; flex: 1; }
 .topbar-end { display: flex; align-items: center; gap: var(--sp-2); margin-left: auto; }
 .win-btns-room { flex: none; width: calc(3 * var(--win-btn-w) + 2px); }
@@ -812,6 +813,19 @@ select.input option { background: var(--surface-raised); color: var(--text); }
 .notice-hidden .icon-btn { flex: none; align-self: flex-start; }
 .notice-hidden .icon-btn .icon { width: 14px; height: 14px; color: currentColor; }
 .board > .state-fill { flex: 1; height: auto; }
+
+/* ---------- Missed worklog days (v0.7.1): an app-level notice under the top bar ---------- */
+.notice-missed { align-items: flex-start; border-color: color-mix(in srgb, var(--warning) 45%, transparent); background: var(--warning-soft); }
+.notice-missed > .icon { flex: none; margin-top: 5px; color: var(--warning); }
+.notice-missed .notice-text { flex: 1 1 240px; min-width: 0; padding-top: 3px; }
+.missed-body { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); } /* the actions wrap under the text; × stays top-right */
+.missed-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.missed-body .missed-actions { margin-left: auto; }
+.missed-close { flex: none; }
+.missed-list { display: flex; flex-direction: column; gap: 6px; margin-top: var(--sp-2); }
+.missed-list li { display: flex; align-items: center; flex-wrap: wrap; gap: 4px var(--sp-3); }
+.missed-day { min-width: 140px; font-weight: var(--fw-semibold); }
+.missed-total { min-width: 72px; color: var(--text-2); font-variant-numeric: tabular-nums; }
 
 /* ---------- Kanban (Board) ---------- */
 .view-board, .view-sprints { display: flex; flex-direction: column; }
@@ -1292,6 +1306,13 @@ select.input option { background: var(--surface-raised); color: var(--text); }
 .capbar-other { background: var(--capbar-other-fill); box-shadow: inset -1px 0 0 var(--surface); }
 .wl-note { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-3); font-size: var(--fs-md); color: var(--text-2); }
 .wl-note .icon { width: 16px; height: 16px; color: var(--text-3); }
+/* v0.7.1: the worklog day selector and the past-day note */
+.wl-day { display: inline-flex; align-items: center; gap: var(--sp-2); }
+.wl-day-label { font-size: var(--fs-xs); font-weight: var(--fw-bold); text-transform: uppercase; letter-spacing: .12em; color: var(--text-3); }
+.wl-day .select { min-width: 230px; }
+.wl-past { padding: var(--sp-2) var(--sp-3); border-radius: var(--r-lg); background: var(--accent-soft); color: var(--text); }
+.wl-past .icon { color: var(--accent-text); }
+.chip-catchup { background: var(--tag-blue-bg); color: var(--tag-blue); }
 .capbar-todo { background: linear-gradient(90deg, var(--accent), var(--accent-end)); }
 .capbar-legend { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-4); font-size: var(--fs-md); color: var(--text-2); }
 .capbar-legend .lg { display: inline-flex; align-items: center; gap: 6px; }
@@ -1306,7 +1327,7 @@ select.input option { background: var(--surface-raised); color: var(--text); }
 .run { border-bottom: 1px solid var(--border); }
 .history li:last-child .run { border-bottom: 0; }
 .run summary {
-  display: grid; grid-template-columns: 18px minmax(140px, 1fr) 88px minmax(0, 1.2fr) 64px 112px; align-items: center; gap: var(--sp-3);
+  display: grid; grid-template-columns: 18px minmax(140px, 1fr) 132px minmax(0, 1.2fr) 64px 132px; align-items: center; gap: var(--sp-3);
   padding: var(--sp-2) var(--sp-2); border-radius: var(--r-md); cursor: pointer; list-style: none;
 }
 .run summary::-webkit-details-marker { display: none; }
@@ -1318,6 +1339,7 @@ select.input option { background: var(--surface-raised); color: var(--text); }
 .run-total { font-weight: var(--fw-semibold); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .run-meta { color: var(--text-3); font-size: var(--fs-md); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-trigger, .run-status { display: flex; min-width: 0; }
+.run-trigger .chip, .run-status .chip { max-width: 100%; overflow: hidden; text-overflow: ellipsis; } /* v0.7.1: longer trigger names */
 .run-status { justify-content: flex-end; }
 .run-body { padding: var(--sp-1) var(--sp-2) var(--sp-4) calc(18px + var(--sp-5)); }
 .run-body .table-wrap { border-radius: var(--r-md); }
@@ -2041,4 +2063,15 @@ body:has(#dlg-issue[open]) .toasts { top: calc(var(--chrome-h) + var(--sp-6) + 7
   .search:focus-within, .search:has(input:not(:placeholder-shown)) { width: 150px; }
   .search:focus-within input { padding-right: var(--sp-2); }
   .search:focus-within input::placeholder { color: var(--text-3); }
+}
+
+/* While the user resizes the window with the mouse (windowState.resizing) the page must keep up with the
+   frame: no shadows, blurs, filters, transitions or animations until the resize ends (v0.7.1).
+   !important: like the reduced-motion switch, this kill switch must win over every component rule. */
+.is-resizing *, .is-resizing *::before, .is-resizing *::after {
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  filter: none !important;
+  transition: none !important;
+  animation-play-state: paused !important;
 }

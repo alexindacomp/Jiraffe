@@ -596,7 +596,51 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     return null;
   }
 
-  function buildRun(trigger) {
+  /* v0.7.1 past days: D's in-progress shares; logged time per day; missed days (?mock=nomissed: none, missed2: two). */
+  const PAST_SHARES = [['RBI-1028', 3 * 3600 + 36 * 60, '09:00'], ['CMA-412', 2 * 3600, '14:00']]; // 5h 36m: the missed day
+  const loggedPast = new Map(); // date → Map(key → seconds), runs made for past days
+  const skippedDays = new Set();
+  const missedDays = new Set(); // set by seedHistory: working days without a run that still have time to add
+  const isoOk = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+  function checkDay(p) {
+    const date = p && p.date;
+    if (date == null || date === '') return isoDay(now()); // omitted, "" or today: today exactly as before
+    if (typeof date !== 'string' || !isoOk(date)) throw new MockError('bad_params', 'date must be YYYY-MM-DD');
+    const back = Math.round((new Date(isoDay(now()) + 'T12:00:00') - new Date(date + 'T12:00:00')) / 86400000);
+    if (back < 0) throw new MockError('bad_params', 'date is in the future');
+    if (back > 30) throw new MockError('bad_params', 'date is more than 30 days back');
+    return date;
+  }
+  function buildPastRun(trigger, date) {
+    const d = new Date(date + 'T12:00:00');
+    const run = { at: rfc(now()), date, trigger, items: [], totalSeconds: 0, total: '', capSeconds: capSec() };
+    const reason = dayReason(d);
+    if (reason === 'weekend' || reason === 'holiday' || reason === 'vacation') {
+      run.nonWorkingDay = reason;
+      if (d.getDay() !== 6 || history.some((r) => r.date === date && r.trigger === 'manual')) return run; // Saturday: 1 h on RBI-1028
+      const is = rec('RBI-1028') || {};
+      run.items = [{ key: 'RBI-1028', summary: is.summary || 'RBI-1028', status: (is.status || ST.inprog).name, shareSeconds: 3600, loggedSeconds: 0, todoSeconds: 3600, duration: fmt(3600), started: rfc(atTime(d, '11:00')) }];
+      run.totalSeconds = 3600; run.total = fmt(3600);
+      return run;
+    }
+    if (reason) { run.skippedReason = reason; return run; }
+    const done = history.find((r) => r.date === date && r.trigger !== 'preview' && r.trigger !== 'catchup');
+    const quiet = history.some((r) => r.date === date && r.trigger === 'catchup'); // the "nothing to add" day
+    if (quiet && !done) return run;
+    const logged = loggedPast.get(date) || new Map();
+    run.items = PAST_SHARES.map(([key, share, start]) => {
+      const is = rec(key) || {};
+      const prior = done ? share : logged.get(key) || 0;
+      return { key, summary: is.summary || key, status: (is.status || ST.inprog).name, shareSeconds: share, loggedSeconds: prior, todoSeconds: Math.max(0, share - prior), started: rfc(atTime(d, start)) };
+    });
+    run.items.forEach((i) => { i.duration = fmt(i.todoSeconds); });
+    run.totalSeconds = run.items.reduce((a, i) => a + i.todoSeconds, 0);
+    run.total = fmt(run.totalSeconds);
+    return run;
+  }
+
+  function buildRun(trigger, date) {
+    if (date && date !== isoDay(now())) return buildPastRun(trigger, date);
     const d = now();
     const run = { at: rfc(d), date: isoDay(d), trigger, items: [], totalSeconds: 0, total: '', capSeconds: capSec() };
     const reason = dayReason(d);
@@ -626,6 +670,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
   (function seedHistory() {
     if (fresh) return;
     const d = now();
+    let workIdx = 0;
     for (let back = 1; history.length < 9; back++) {
       const day = new Date(d); day.setDate(d.getDate() - back); day.setHours(18, 0, 3, 0);
       const wd = day.getDay();
@@ -638,6 +683,17 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
         [['CMA-415', 4 * 3600], ['EDS-230', 4 * 3600]],
       ];
       const v = variants[back % variants.length];
+      workIdx += 1;
+      if (!flags.has('nomissed') && back <= 7 && (workIdx === 1 || (workIdx === 4 && flags.has('missed2')))) { missedDays.add(run.date); continue; }
+      if (back <= 7 && workIdx === 3) { // the catch-up found nothing to add (logged by hand / no in-progress time) and stored it
+        run.trigger = 'catchup'; run.at = rfc(atTime(new Date(), '09:05'));
+        run.items = v.map(([key, sec], i) => {
+          const is = rec(key) || { summary: key };
+          return { key, summary: is.summary, status: 'В работе', shareSeconds: sec, loggedSeconds: sec, todoSeconds: 0, duration: fmt(0), started: rfc(atTime(day, i ? '13:00' : '09:00')), result: 'skipped' };
+        });
+        history.push(run);
+        continue;
+      }
       run.items = v.map(([key, sec], i) => {
         const is = rec(key) || { summary: key };
         const item = { key, summary: is.summary, status: 'В работе', shareSeconds: sec, loggedSeconds: 0, todoSeconds: sec, duration: fmt(sec), started: rfc(atTime(day, i ? '13:00' : '09:00')), result: 'logged' };
@@ -1479,19 +1535,27 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       console.info('[jiraffe mock] openUrl →', u); // eslint-disable-line no-console
       return null;
     },
-    worklogPreview() {
+    worklogPreview(p) {
+      const date = checkDay(p);
       maybeFail(ERROR_RATE / 2, 'network', 'WinHTTP 12002: the operation timed out');
-      return buildRun('preview');
+      return buildRun('preview', date);
     },
-    worklogRun() {
+    worklogRun(p) {
       requireConfigured();
-      const run = buildRun('manual');
+      const date = checkDay(p);
+      const past = date !== isoDay(now());
+      const run = buildRun('manual', date);
+      const logged = past ? (loggedPast.get(date) || new Map()) : loggedToday;
       run.items.forEach((i) => {
         if (i.todoSeconds < 60) { i.result = 'skipped'; return; }
         if (Math.random() < ERROR_RATE) { i.result = 'error'; i.error = 'Jira 403: You do not have the permission to log work on this issue'; return; }
         i.result = 'logged';
-        loggedToday.set(i.key, (loggedToday.get(i.key) || 0) + i.todoSeconds);
+        logged.set(i.key, (logged.get(i.key) || 0) + i.todoSeconds);
       });
+      if (past) {
+        loggedPast.set(date, logged);
+        if (missedDays.delete(date)) setTimeout(() => emit('worklogMissed', METHODS.getMissedWorklogDays()), 30); // a day left the list
+      }
       run.totalSeconds = run.items.filter((i) => i.result === 'logged').reduce((a, i) => a + i.todoSeconds, 0);
       run.total = fmt(run.totalSeconds);
       history.unshift(clone(run));
@@ -1500,6 +1564,19 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       return run;
     },
     getWorklogHistory: () => clone(history),
+    /* --- v0.7.1 missed days --- */
+    getMissedWorklogDays() { // → MissedDays { days }, re-filtered (logged / skipped meanwhile are dropped)
+      requireConfigured();
+      return { days: clone([...missedDays].filter((d) => !skippedDays.has(d)).sort().map((d) => buildRun('preview', d)).filter((r) => r.totalSeconds > 0)) };
+    },
+    skipWorklogDay(p) { // → the remaining MissedDays
+      const date = checkDay(p);
+      skippedDays.add(date);
+      console.info('[jiraffe mock] skipWorklogDay →', date); // eslint-disable-line no-console
+      const left = METHODS.getMissedWorklogDays();
+      setTimeout(() => emit('worklogMissed', left), 30); // a day left the list
+      return left;
+    },
     getUiPrefs() {
       if (flags.has('noprefs')) throw new MockError('unknown_method', 'unknown method getUiPrefs');
       try { const v = JSON.parse(localStorage.getItem(PREFS_KEY) || '{}'); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; } catch { return {}; }
@@ -1551,6 +1628,11 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     return Promise.resolve(null);
   };
   window.__jiraffeMock = { flags: [...flags], emit };
+  // v0.7.1: the missed-day check runs after start (the UI also asks getMissedWorklogDays)
+  setTimeout(() => {
+    if (!configured()) return;
+    emit('worklogMissed', METHODS.getMissedWorklogDays()); // the first check of a session always sends, also { days: [] }
+  }, 2500);
 
   /* v0.7: a stand-in for the desktop seen through the window (?mock=noglass: the opaque fallback). The real backdrop is
      an untinted blur measured as ≈ 6 + 0.6 × desktop; here: soft colour fields under that dimming. Worst cases:
@@ -1585,5 +1667,5 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     emit('state', state());
   }, flags.has('fast') ? 10000 : 45000);
 
-  console.info('[jiraffe mock] fake backend installed. Flags: ?mock=unconfigured,empty,errors,noerrors,slow,fast,warnings,noagile,truncated,untracked,limit,noprefs,closedfail,timepartial,update,update-fail,update-nowrite,update-badsig,update-checkfail,noupdate,devbuild,updated,noglass,desk-white,desk-black'); // eslint-disable-line no-console
+  console.info('[jiraffe mock] fake backend installed. Flags: ?mock=unconfigured,empty,errors,noerrors,slow,fast,warnings,noagile,truncated,untracked,limit,noprefs,closedfail,timepartial,update,update-fail,update-nowrite,update-badsig,update-checkfail,noupdate,devbuild,updated,noglass,desk-white,desk-black,nomissed,missed2'); // eslint-disable-line no-console
 })();

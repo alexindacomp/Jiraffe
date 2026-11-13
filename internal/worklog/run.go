@@ -5,6 +5,9 @@ const (
 	TriggerSchedule = "schedule"
 	TriggerManual   = "manual"
 	TriggerPreview  = "preview"
+	// TriggerCatchup marks a past day handled by missed-day detection
+	// ("nothing to add" found automatically).
+	TriggerCatchup = "catchup"
 )
 
 // Item results.
@@ -42,5 +45,8 @@ type Run struct {
 	CapSeconds    int64  `json:"capSeconds"`
 	Total         string `json:"total"`
 	SkippedReason string `json:"skippedReason,omitempty"`
+	// NonWorkingDay is set when a past day that is not a working day
+	// ("weekend", "holiday", "vacation") was computed on request anyway.
+	NonWorkingDay string `json:"nonWorkingDay,omitempty"`
 	Error         string `json:"error,omitempty"`
 }
