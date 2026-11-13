@@ -1347,6 +1347,8 @@ input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
 .wl-day { display: inline-flex; align-items: center; gap: var(--sp-2); }
 .wl-day-label { font-size: var(--fs-xs); font-weight: var(--fw-bold); text-transform: uppercase; letter-spacing: .12em; color: var(--text-3); }
 .wl-day .select { min-width: 230px; }
+.wl-day-btn { min-width: 230px; justify-content: space-between; }
+.mi-sub.is-missed { color: var(--warning-text, var(--warning)); }
 .wl-past { padding: var(--sp-2) var(--sp-3); border-radius: var(--r-lg); background: var(--accent-soft); color: var(--text); }
 .wl-past .icon { color: var(--accent-text); }
 .chip-catchup { background: var(--tag-blue-bg); color: var(--tag-blue); }

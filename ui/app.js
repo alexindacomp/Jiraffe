@@ -5397,21 +5397,38 @@
     if (!runs.length) return '';
     return runs.some((r) => Number(r.totalSeconds) > 0 || (r.items || []).some((i) => i.result === 'logged')) ? t('worklog.dayLogged') : t('worklog.dayNothing');
   }
-  function renderWorklogDays() {
-    const sel = $('#wl-day');
+  /** The day picker: a button with the chosen day that opens the app menu (not a native select). */
+  function worklogDayItems() {
     const today = todayIso();
     const missed = new Set(S.missed.days.map((d) => d.date));
-    const opt = (iso, label) => html`<option value="${iso}"${iso === (S.wl.date || today) ? html` selected` : ''}>${label}</option>`;
-    const past = [];
+    const items = [{ iso: today, title: `${t('worklog.today')}, ${dayText(today)}`, sub: '' }];
     for (let i = 1; i <= WL_DAYS_BACK; i++) {
       const d = new Date(); d.setDate(d.getDate() - i);
       const iso = i18n.isoDate(d);
       const off = (S.wl.preview && S.wl.preview.date === iso && S.wl.preview.nonWorkingDay) || dayOffReason(iso);
       const mark = missed.has(iso) ? t('worklog.dayMissed') : off ? reasonText(off) : dayRunMark(iso);
-      past.push(opt(iso, mark ? `${dayText(iso)} · ${mark}` : dayText(iso)));
+      items.push({ iso, title: dayText(iso), sub: mark || '', missed: missed.has(iso) });
     }
-    setHTML(sel, html`<optgroup label="${t('worklog.today')}">${opt(today, `${t('worklog.today')}, ${dayText(today)}`)}</optgroup><optgroup label="${t('worklog.pastDays')}">${past}</optgroup>`);
-    sel.disabled = S.wl.running;
+    return items;
+  }
+  function renderWorklogDays() {
+    const btn = $('#wl-day');
+    const cur = S.wl.date || todayIso();
+    const it = worklogDayItems().find((x) => x.iso === cur);
+    setHTML(btn, html`<span class="picker-value">${it ? it.title : dayText(cur)}</span>${icon('chevron-down', 'icon-xs')}`);
+    btn.disabled = S.wl.running;
+  }
+  function openWorklogDays(btn) {
+    const cur = S.wl.date || todayIso();
+    menu.open(btn, {
+      label: t('worklog.dayLabel'),
+      radio: true,
+      items: worklogDayItems(),
+      isSelected: (x) => x.iso === cur,
+      item: (x) => html`<span class="mi-main"><span class="mi-title">${x.title}</span>${x.sub ? html`<span class="mi-sub${x.missed ? ' is-missed' : ''}">${x.sub}</span>` : ''}</span>`,
+      onPick: (x) => chooseWorklogDay(x.iso),
+      anchorSel: '#wl-day',
+    });
   }
   function chooseWorklogDay(iso) {
     const date = !iso || iso >= todayIso() ? null : iso;
@@ -6916,7 +6933,7 @@
     // Worklog
     $('#wl-preview-btn').addEventListener('click', () => { S.wl.result = null; loadPreview(); });
     $('#wl-run-btn').addEventListener('click', logNow);
-    $('#wl-day').addEventListener('change', (e) => chooseWorklogDay(e.target.value));
+    $('#wl-day').addEventListener('click', (e) => openWorklogDays(e.currentTarget));
     $('#missed-notice').addEventListener('click', onMissedClick);
     $('#view-worklog').addEventListener('click', (e) => {
       const a = e.target.closest('[data-action]');
