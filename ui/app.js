@@ -178,6 +178,7 @@
     appState: null,          // getState result
     stateError: null,
     stateLoading: false,
+    win: null,               // v0.7 getWindowInfo / windowState: { glass, maximized, active }
     settings: null,          // last saved Settings from backend
     langOverride: null,      // language chosen in UI but not yet persisted
 
@@ -613,6 +614,7 @@
   }
 
   function renderChrome() {
+    if (S.win) applyWindowState(S.win); // labels in the current language
     const st = S.appState;
     const avatar = $('#avatar');
     const dot = $('#avatar-dot');
@@ -640,6 +642,8 @@
     }
     btn.setAttribute('aria-label', label + '. ' + t('chrome.openSettings'));
     btn.title = label;
+    $('#eyebrow-text').textContent = st && st.configured && st.user ? `Jiraffe · ${st.user.displayName || st.user.name}` : 'Jiraffe';
+    $('#eyebrow-dot').dataset.tone = dot.dataset.tone || '';
     // Rail shows only the semver core ("v0.1.0"); the full build string goes to the tooltip.
     const version = st && st.version ? String(st.version).replace(/^v/, '') : '';
     const core = (version.match(/^\d+\.\d+\.\d+/) || [version])[0];
@@ -1302,7 +1306,7 @@
     if (sp.state === 'active' && sp.endDate) {
       const n = dayDiff(sp.endDate);
       rel = n > 0 ? t('sprints.daysLeft', { n }) : n === 0 ? t('sprints.endsToday') : t('sprints.overdue', { n: -n });
-      tone = n < 0 ? 'chip-bad' : 'chip-accent';
+      tone = n < 0 ? 'chip-bad' : ''; // DR-42: the active badge is the yellow; "N days left" stays neutral
     } else if (sp.state === 'future' && sp.startDate) {
       const n = dayDiff(sp.startDate);
       rel = n > 0 ? t('sprints.startsIn', { n }) : t('sprints.notStarted');
@@ -6539,6 +6543,7 @@
       case 'updateFailed': onUpdateFailed(payload); break;
       case 'updated': if (payload && payload.to) showUpdated(payload.to); loadUpdateStatus(false); break;
       case 'state': S.stateError = null; applyState(payload); break;
+      case 'windowState': applyWindowState(payload); break;
       case 'board': {
         // Board data, tracked projects or issues changed on the Go side: everything issue-based may be stale.
         const here = (v) => S.view === v && activeSectionId() === 'view-' + v;
@@ -6791,6 +6796,53 @@
     });
   }
 
+  /* ================================================================
+   * WINDOW CHROME (SPEC v0.7): the window is frameless; the page draws the window buttons, drags the window by the
+   * empty areas of the top bar and the sidebar, resizes it by its edges, and follows getWindowInfo / windowState
+   * (glass = translucent page over the OS acrylic; maximized = no window padding, no resize edges).
+   * ================================================================ */
+  const DRAG_SKIP = 'button, a, input, select, textarea, label, summary, [role="radio"], [role="tab"], [role="switch"], [tabindex], .chips, .search';
+  function applyWindowState(st) {
+    if (!st || typeof st !== 'object') return;
+    S.win = { glass: !!st.glass, maximized: !!st.maximized, active: st.active !== false };
+    const root = document.documentElement;
+    root.classList.toggle('is-glass', S.win.glass);
+    root.classList.toggle('is-maximized', S.win.maximized);
+    root.classList.toggle('is-inactive', !S.win.active);
+    const max = $('#win-max');
+    const label = t(S.win.maximized ? 'win.restore' : 'win.maximize');
+    max.setAttribute('aria-label', label);
+    max.title = label;
+    $('use', max).setAttribute('href', S.win.maximized ? '#i-win-restore' : '#i-win-max');
+  }
+  async function loadWindowInfo() {
+    try { applyWindowState(await api('getWindowInfo')); } catch { applyWindowState({ glass: false, maximized: false, active: true }); } // older backend: opaque
+  }
+  function windowControl(action, edge) {
+    api('windowControl', edge ? { action, edge } : { action }).catch(() => { /* not Windows / older backend: no-op */ });
+  }
+  /** A press on an empty area of a drag region (not on one of its controls). */
+  function onDragRegion(e) {
+    const region = e.target.closest && e.target.closest('[data-drag]');
+    if (!region || e.button !== 0) return null;
+    const hit = e.target.closest(DRAG_SKIP);
+    return hit && region.contains(hit) ? null : region;
+  }
+  function bindWindowChrome() {
+    document.addEventListener('mousedown', (e) => {
+      const edge = e.button === 0 && e.target.closest && e.target.closest('.win-resize [data-edge]');
+      if (edge) { e.preventDefault(); windowControl('resize', edge.dataset.edge); return; }
+      if (!onDragRegion(e)) return;
+      e.preventDefault(); // no text selection; the OS move loop takes over
+      if (e.detail < 2) windowControl('drag');
+    });
+    document.addEventListener('dblclick', (e) => { if (onDragRegion(e)) windowControl('toggleMaximize'); });
+    $('.win-btns').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-win]');
+      if (b) windowControl(b.dataset.win);
+    });
+  }
+
   /* Native title bar (SPEC v0.4 §2): dark flag + caption colour = the top bar background. Best effort. */
   const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
   /** "rgb(30, 31, 34)" / "rgb(30 31 34 / 1)" / "color(srgb 0.1 0.2 0.3)" → "#1e1f22"; null if not opaque or unknown. */
@@ -6817,6 +6869,8 @@
   async function init() {
     i18n.apply();
     bind();
+    bindWindowChrome();
+    loadWindowInfo();
     syncWindowTheme();
     darkQuery.addEventListener('change', syncWindowTheme);
     renderChrome();

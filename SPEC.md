@@ -1374,3 +1374,141 @@ null   // only a link listed on `key` (source or destination); else bad_params
    edited in place; links can be added and removed; conflicts and errors are shown inline.
 3. Comments can be written (HTML or wiki per the issue) and appear immediately.
 4. `go vet`, `go test`, `./build.sh --check` pass; exe ≤ 5 MB; ru/uk/en; light/dark; keyboard accessible.
+
+# v0.7 — glass redesign (reference: oats-os-04122735.figma.site)
+
+User request: restyle the app after the reference board: **rounded window corners; a translucent, blurred
+("frosted glass") window; the sidebar visually separate from the main panel with a gap (two parts of one window);
+no classic title bar, but window buttons on the right; the reference's fonts and icon style; neutral (not greenish)
+glass**. Pipeline: code review + design review.
+
+Reference tokens (measured in Edge from the live site; the site itself only *imitates* blur with translucent
+gradients over a darkened photo — Jiraffe uses the real OS backdrop):
+- Font **Manrope** (SIL OFL), variable 400–800. Embedded subsets in `assets/fonts/`: `manrope-latin.woff2`
+  (U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC,
+  U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD) and `manrope-cyrillic.woff2` (U+0301, U+0400-045F,
+  U+0490-0491, U+04B0-04B1, U+2116). Fallback `"Segoe UI Variable", "Segoe UI", system-ui, sans-serif`.
+- Accent `#fff200` (hover `#fff652`, gradient end `#fff78a`), text on accent `#12180c`; lavender `#adb5ff`,
+  violet `#7d8cff`, pink `#f0a8ff`.
+- Glass panel: `linear-gradient(135deg, a .78, b .65)` + 1px `rgba(255,255,255,.11)` + `0 24px 70px rgba(0,0,0,.35),
+  inset 0 1px rgba(255,255,255,.07)`; card: `linear-gradient(145deg, …57, …62)` + `rgba(255,255,255,.114)` border,
+  `inset 0 1px rgba(255,255,255,.055), 0 12px 26px rgba(0,0,0,.12)`, hover border `.20` + `translateY(-2px)`;
+  stat tile `linear-gradient(145deg, rgba(255,255,255,.075), rgba(255,255,255,.024))`; wells (search, segmented)
+  `rgba(…, .25)`; columns `rgba(…, .18)` + `.07` border.
+  **Jiraffe: same structure and alphas, neutral greys instead of the green-tinted ones** (e.g. panel
+  `rgba(40,41,44,.62)→rgba(22,23,26,.52)`, card `rgba(78,80,84,.45)→rgba(34,35,38,.55)` — final values tuned on the
+  real acrylic so contrast holds).
+- Radii: main panel 28–34, sidebar 24, column 21, stat 19, card 16, nav/icon button 14, controls 13, segmented 12/9,
+  pill 7, tag 6. Sidebar 64px wide, nav items 42×42 (active = accent square with dark icon), gap sidebar→panel 16–20px,
+  column gap 12, card gap 9, controls 42px tall.
+- Tags: lime `#fff78a`/`rgba(255,242,0,.11)`, blue `#a8d9ff`/`rgba(98,177,255,.12)`, violet `#d0c5ff`/
+  `rgba(154,129,255,.13)`, orange `#ffc39e`/`rgba(255,141,78,.13)`. Avatars pastel `#d5ff78 #c6c8ff #ffc3a7` with
+  text `#273024`. Progress 4px, track `rgba(255,255,255,.10)`, fill `linear-gradient(90deg,#fff200,#fff78a)`.
+- Icons: Lucide-style inline SVG, 24 viewBox, `stroke-width 1.8`, round caps/joins; sizes 19 (nav), 18, 17, 15.
+- Motion: `.2s` transitions, entrance fade-up `.55s`; Jiraffe keeps `prefers-reduced-motion` and its focus rings.
+- **Do not copy** the reference's tiny type (8–12px) or its muted text alphas (.40–.45 fail AA): keep Jiraffe's
+  scale (≥ 11px, body 13–14px) and text ≥ AA (muted ≥ .60 on cards). Keep the light theme (light frosted glass,
+  same structure).
+
+## Window (Go, Windows)
+- **Frameless**: keep `WS_OVERLAPPEDWINDOW` (snap, min/max animations, Alt+Space) but remove the non-client area:
+  subclass the go-webview2 window (`SetWindowLongPtrW(GWLP_WNDPROC)`, forward everything else to the original proc)
+  and answer `WM_NCCALCSIZE(wParam=TRUE)` with 0; when maximized, inset the client rect by the frame thickness
+  (`GetSystemMetricsForDpi(SM_CXFRAME)+SM_CXPADDEDBORDER`) so content doesn't spill off-screen. Trigger a frame
+  change after subclassing (`SetWindowPos(SWP_FRAMECHANGED)`).
+- **Rounded corners**: `DWMWA_WINDOW_CORNER_PREFERENCE (33) = DWMWCP_ROUND (2)` (Windows 11; ignored on 10).
+- **Glass**: when the OS supports it (build ≥ 22621) and the user's Windows transparency setting
+  (`HKCU\…\Personalize\EnableTransparency`) is on, the window gets a see-through blur backdrop and the WebView2
+  default background is **fully transparent** (`WEBVIEW2_DEFAULT_BACKGROUND_COLOR=0x00000000` before creation).
+  Default backdrop (v0.7b): plain blur, `SetWindowCompositionAttribute(WCA_ACCENT_POLICY,
+  ACCENT_ENABLE_BLURBEHIND)` (undocumented API) with `DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_NONE (1)` and the 1 px frame
+  extension for the shadow. It is **untinted**: the page supplies the tint (measured gap colour with the v0.7 CSS:
+  over black `#060606`, over `#808080` `#535353`, over white `#A0A0A0`), and it **stays while the window is
+  inactive**. If the accent call fails, fallback: the documented system acrylic, `DwmExtendFrameIntoClientArea(-1)` +
+  `DWMWA_SYSTEMBACKDROP_TYPE (38) = DWMSBT_TRANSIENTWINDOW (3)` (strongly tinted, opaque while inactive; known
+  residual: faint DWM caption-button glyphs at the top right). With glass the subclass paints the window's own
+  surface black (`WM_ERASEBKGND`/`WM_PAINT`; black is transparent for DWM) — unpainted it showed as a pale layer.
+  Test switch `JIRAFFE_BACKDROP` (not for users): `A` system acrylic, `B[:<ABGR hex>]` accent acrylic
+  (`ACCENT_ENABLE_ACRYLICBLURBEHIND`, default tint `0x40141518`), `C` plain blur (the default). Otherwise (Windows
+  10, older 11, transparency off): no backdrop, opaque WebView background (current `--bg` colours), the page uses
+  opaque surfaces.
+- **Window state for the page**: method `getWindowInfo` → `{ glass: bool, maximized: bool, active: bool }`; event
+  `windowState` with the same shape on maximize/restore, activate/deactivate (WM_ACTIVATE) and when the transparency
+  setting changes (WM_SETTINGCHANGE "ImmersiveColorSet").
+- **Window controls**: method `windowControl { action }` with `action` ∈ `minimize | toggleMaximize | close | drag |
+  resize`, plus `edge` for resize (`n s e w ne nw se sw`). `drag`/`resize` run on the UI thread:
+  `ReleaseCapture(); PostMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION | HTLEFT…, 0)` (the Wails approach); only valid
+  while the left button is down (`GetAsyncKeyState`); `close` = the existing close-to-tray behaviour. Bad action/edge ⇒
+  `bad_params`. Headless/non-Windows: no-op.
+- Minimum window size stays; DPI awareness unchanged.
+
+## UI
+- **Shell**: `html, body` transparent when `glass`, else opaque `--bg`. Layout = window padding (12px; 0 when
+  maximized) + **sidebar panel** (64px, radius 24, glass) + **gap 14–16px** + **main panel** (radius 28; 0 outer radius
+  when maximized) — the gap and the padding show the bare window glass, so the two panels read as separate parts.
+- **Sidebar** (the current nav rail): Jiraffe mark on an accent square at the top (40×40, radius 14), nav items
+  42×42 radius 14 (hover `rgba(255,255,255,.08)`, active = accent square, dark icon), bottom group (notifications,
+  settings, avatar). Labels as tooltips (`title` + `aria-label`); keyboard and current-page semantics as today.
+- **Top bar** (inside the main panel, replaces the window title bar): eyebrow (uppercase, letter-spacing .16em) +
+  page title (Manrope 600–650, ~22px, -0.02em) on the left; on the right the existing controls (project filter,
+  search, refresh, "+ Create" as the accent button) **then the window buttons** (minimize, maximize/restore, close —
+  40×32 icon buttons, close hover red `#e81123` with white icon; tooltips; keyboard reachable; maximize icon swaps
+  with state). The empty areas of the top bar and of the sidebar are **drag regions** (`mousedown` primary button
+  on a `[data-drag]` element and not on an interactive child ⇒ `windowControl drag`; `dblclick` ⇒ toggleMaximize).
+  Invisible 6px **resize handles** on the window edges and 12px corners (hidden when maximized) ⇒ `windowControl
+  resize`. In the mock (browser) the buttons are present but log only.
+- **Surfaces**: board columns, cards, sprint rows, epics tree, dashboard cards, drawer, dialogs, menus, toasts,
+  settings — all restyled with the tokens above (glass panel / card / well / stat tile), Manrope, Lucide-style icons
+  (stroke 1.8; redraw the sprite in that style), accent yellow for primary actions, focus rings, selected states,
+  progress bars; status/category colours keep their meaning (todo/in-progress/done), mapped onto the reference
+  palette (dots `#fff200`/`#7d8cff`/`#f0a8ff`-like, done calmer). Tag-like chips (epic, labels) use the four tag
+  tints. Avatars pastel.
+- **Drawer and modals** float as glass panels over the main panel (radius 24/28), scrim darker+blur.
+- **Light theme**: the same structure with light frosted glass (white tints, dark text, accent darkened for contrast
+  where it is text — e.g. `#8a8000`-ish on light; the accent square keeps `#fff200` with dark icon).
+- **Performance**: use CSS `backdrop-filter` only for the drawer/modal scrim and floating menus (where there is page
+  content behind), not on every card; the window blur comes from the OS.
+- Fonts embedded as base64 `@font-face` in `app.css` (CSP already allows `font-src data:`), `font-display: block`,
+  both subsets with their unicode ranges; `assets/fonts/OFL.txt` with the licence + a README "Third-party" note.
+- Size budget: exe ≤ 5 MB (fonts ≈ 39 KB).
+
+## Contract additions (v0.7)
+
+```jsonc
+// getWindowInfo            (no params)
+{ "glass": true, "maximized": false, "active": true }
+
+// event "windowState" — same shape; sent when one of the values changes:
+// maximize/restore (WM_SIZE), activate/deactivate (WM_ACTIVATE), transparency
+// setting (WM_SETTINGCHANGE "ImmersiveColorSet")
+{ "type": "windowState", "payload": { "glass": false, "maximized": true, "active": true } }
+
+// windowControl {"action":"minimize"|"toggleMaximize"|"close"|"drag"}
+// windowControl {"action":"resize","edge":"n"|"s"|"e"|"w"|"ne"|"nw"|"se"|"sw"}
+null
+```
+- `glass`: the glass backdrop is on (Windows 11 build ≥ 22621, transparency effects on at window creation, and the
+  backdrop accepted) **and** transparency is still on. When it is false the page must paint opaque
+  surfaces: the WebView2 background is transparent whenever the window was created for glass, so turning
+  transparency off at runtime only flips `glass` (the backdrop stays until the window is reopened); turning it on at
+  runtime takes effect the next time the window opens.
+- `windowControl` errors: `bad_params` for another action, a missing/unknown `edge` on resize, or an `edge` on any
+  other action. `drag`/`resize` only start while the primary mouse button is down (call them from `mousedown`);
+  `close` = the window's close (to the tray). Without a frameless window (headless, tests, non-Windows): `getWindowInfo`
+  ⇒ `{glass:false, maximized:false, active:false}`, `windowControl` ⇒ `null`, nothing happens.
+- The window has no title bar or frame; resizing is only through `windowControl resize` (the page's edge handles).
+  Without glass the DWM frame is extended 1 px into the top of the client area (`DwmExtendFrameIntoClientArea
+  {0,0,1,0}`) so Windows draws the standard window shadow and border; the page covers that row. Maximized, the client
+  rect leaves 1 px free on each monitor edge with an auto-hide taskbar (`ABM_GETAUTOHIDEBAREX`) so the taskbar can
+  still slide out.
+  `setWindowTheme` keeps working (its `dark` flag tints the fallback system acrylic, not the default blur; `caption`
+  no longer shows).
+
+## Acceptance criteria v0.7
+1. On Windows 11 with transparency on: frameless window with rounded corners, acrylic (blurred desktop) visible
+   through the translucent panels and in the gap between sidebar and main panel; window buttons top-right work
+   (min / max-restore / close-to-tray), drag by empty header/sidebar areas, double-click maximizes, edges resize,
+   Aero Snap works.
+2. Without glass support: same layout, opaque surfaces, everything works.
+3. The UI uses Manrope, Lucide-style icons, accent yellow, glass surfaces; both themes; AA contrast; reduced motion.
+4. `./build.sh --check` passes; exe ≤ 5 MB; no network resources.

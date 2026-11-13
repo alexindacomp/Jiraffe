@@ -54,6 +54,8 @@ const (
 	// ui/app.css (light #f7f5ef, dark #1e1f22), so opening never flashes white.
 	webviewBgLight = "0xFFF7F5EF"
 	webviewBgDark  = "0xFF1E1F22"
+	// webviewBgClear lets the acrylic backdrop show through the page (glass).
+	webviewBgClear = "0x00000000"
 )
 
 func init() {
@@ -250,6 +252,13 @@ type ui struct {
 	// shown mirrors "a window is open" for other goroutines (WindowOpen).
 	shown atomic.Bool
 
+	// Frameless chrome (v0.7): the window state the page sees; written on
+	// the UI thread, read by getWindowInfo from any goroutine.
+	stateMu  sync.Mutex
+	state    app.WindowInfo
+	acrylic  bool    // a glass backdrop was set on the current window
+	chromeOn uintptr // the window the chrome was applied to
+
 	// main thread only
 	w          webview2.WebView
 	hwnd       uintptr
@@ -314,6 +323,8 @@ func (u *ui) loop() {
 			}
 			u.w.Run() // returns when the window is closed (PostQuitMessage)
 			u.w, u.hwnd = nil, 0
+			u.setState(func(s *app.WindowInfo) { *s = app.WindowInfo{} }, false)
+			u.acrylic, u.chromeOn = false, 0
 			u.shown.Store(false)
 			continue
 		}
@@ -322,6 +333,101 @@ func (u *ui) loop() {
 }
 
 func (u *ui) windowOpen() bool { return u.w != nil && winapi.IsWindow(u.hwnd) }
+
+// applyChrome makes the window frameless with rounded corners, the dark
+// tint and (wanted and supported) the acrylic backdrop. UI thread; runs
+// again harmlessly for the same window.
+func (u *ui) applyChrome(hwnd uintptr, dark, glass bool) {
+	if err := winapi.MakeFrameless(hwnd, u.onWindowMessage); err != nil {
+		log.Printf("frameless window: %v", err)
+	}
+	if u.chromeOn == hwnd {
+		return
+	}
+	u.chromeOn = hwnd
+	_ = winapi.SetRoundCorners(hwnd) // Windows 11 only
+	if dark {
+		if err := winapi.SetDarkTitleBar(hwnd, true); err != nil {
+			log.Printf("dark title bar: %v", err)
+		}
+	}
+	u.acrylic = false
+	var backdrop winapi.Backdrop
+	if glass {
+		// JIRAFFE_BACKDROP is a test switch for comparing the backdrops.
+		want, tint, ok := winapi.ParseBackdrop(os.Getenv("JIRAFFE_BACKDROP"))
+		if !ok {
+			log.Printf("JIRAFFE_BACKDROP %q ignored", os.Getenv("JIRAFFE_BACKDROP"))
+		}
+		got, fallback, err := winapi.EnableBackdrop(hwnd, want, tint)
+		if err != nil {
+			log.Printf("glass backdrop: %v (opaque surfaces)", err)
+		} else {
+			u.acrylic, backdrop = true, got
+			if fallback != nil {
+				log.Printf("glass backdrop: %v; using %s", fallback, got)
+			}
+		}
+	}
+	if !u.acrylic { // no glass: a 1 px frame extension brings back the DWM shadow
+		if err := winapi.ExtendFrameForShadow(hwnd); err != nil {
+			log.Printf("window shadow: %v", err)
+		}
+	}
+	if u.acrylic {
+		log.Printf("window chrome: build %d, glass %v (%s)", winapi.BuildNumber(), u.acrylic, backdrop)
+	} else {
+		log.Printf("window chrome: build %d, glass %v", winapi.BuildNumber(), u.acrylic)
+	}
+	u.setState(func(s *app.WindowInfo) {
+		s.Glass = u.acrylic && winapi.TransparencyEnabled()
+		s.Maximized = winapi.IsMaximized(hwnd)
+		s.Active = true
+	}, true)
+}
+
+// onWindowMessage follows maximize/restore, activation and the
+// transparency setting for the page (UI thread).
+func (u *ui) onWindowMessage(msg uint32, wParam, lParam uintptr) {
+	switch msg {
+	case winapi.WMSize:
+		switch wParam {
+		case winapi.SizeMaximized:
+			u.setState(func(s *app.WindowInfo) { s.Maximized = true }, true)
+		case winapi.SizeRestored:
+			u.setState(func(s *app.WindowInfo) { s.Maximized = false }, true)
+		}
+	case winapi.WMActivate:
+		active := wParam&0xFFFF != 0 // WA_ACTIVE / WA_CLICKACTIVE
+		u.setState(func(s *app.WindowInfo) { s.Active = active }, true)
+	case winapi.WMSettingChange:
+		if winapi.SettingChangeArea(lParam) == "ImmersiveColorSet" {
+			// The backdrop stays; with transparency off the page paints
+			// opaque surfaces over it.
+			glass := u.acrylic && winapi.TransparencyEnabled()
+			u.setState(func(s *app.WindowInfo) { s.Glass = glass }, true)
+		}
+	}
+}
+
+// setState changes the window state and, if it changed and emit, sends
+// the "windowState" event.
+func (u *ui) setState(change func(*app.WindowInfo), emit bool) {
+	u.stateMu.Lock()
+	before := u.state
+	change(&u.state)
+	after := u.state
+	u.stateMu.Unlock()
+	if emit && after != before {
+		u.emit("windowState", after)
+	}
+}
+
+func (u *ui) windowInfo() app.WindowInfo {
+	u.stateMu.Lock()
+	defer u.stateMu.Unlock()
+	return u.state
+}
 
 func (u *ui) show() {
 	if u.windowOpen() {
@@ -356,10 +462,18 @@ func (u *ui) openWindow() bool {
 	_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--lang="+lang)
 	// The webview's background before the page paints; WebView2 reads it
 	// when the controller is created.
+	// Glass (Windows 11 22H2+, transparency effects on): the WebView2
+	// background must be transparent from its creation, so the decision is
+	// made before it, from the build number (the product name says
+	// "Windows 10" on 11) and the user's setting.
 	dark := winapi.AppsUseDarkTheme()
+	glass := winapi.GlassCandidate(winapi.BuildNumber(), winapi.TransparencyEnabled())
 	bg := webviewBgLight
 	if dark {
 		bg = webviewBgDark
+	}
+	if glass {
+		bg = webviewBgClear
 	}
 	_ = os.Setenv("WEBVIEW2_DEFAULT_BACKGROUND_COLOR", bg)
 	var w webview2.WebView
@@ -377,28 +491,20 @@ func (u *ui) openWindow() bool {
 		})
 	}
 	// go-webview2 creates and shows the window in one call and then pumps
-	// messages while WebView2 starts. With a dark system app theme the title
-	// bar is switched to dark from the first message dispatched on this
-	// thread (a few milliseconds after the window appears), and again once
-	// the call returns; the page refines it with setWindowTheme once loaded.
-	if dark {
-		thread := uint32(windows.GetCurrentThreadId())
-		darken := func() {
-			if hwnd := winapi.ThreadWindow(thread, webviewClass); hwnd != 0 {
-				if err := winapi.SetDarkTitleBar(hwnd, true); err != nil {
-					log.Printf("dark title bar: %v", err)
-					return
-				}
-				winapi.RedrawFrame(hwnd)
-			}
+	// messages while WebView2 starts. The frameless chrome (no title bar,
+	// rounded corners, dark tint, acrylic) is applied from the first message
+	// dispatched on this thread (a few milliseconds after the window
+	// appears), and again once the call returns (idempotent).
+	thread := uint32(windows.GetCurrentThreadId())
+	chrome := func() {
+		if hwnd := winapi.ThreadWindow(thread, webviewClass); hwnd != 0 {
+			u.applyChrome(hwnd, dark, glass)
 		}
-		u.post(darken)
-		create()
-		if w != nil {
-			darken()
-		}
-	} else {
-		create()
+	}
+	u.post(chrome)
+	create()
+	if w != nil {
+		chrome()
 	}
 	if w == nil {
 		log.Printf("WebView2 runtime is not available")
@@ -578,6 +684,34 @@ func (p *platform) OpenURL(u string) error {
 }
 
 func (p *platform) SetAutostart(enabled bool) error { return winapi.SetAutostart(appName, enabled) }
+
+// WindowInfo implements app.WindowChrome.
+func (p *platform) WindowInfo() app.WindowInfo { return p.u.windowInfo() }
+
+// WindowControl implements app.WindowChrome: the action runs on the UI
+// thread; drag/resize only while the primary mouse button is still down.
+func (p *platform) WindowControl(action, edge string) {
+	p.u.post(func() {
+		if !p.u.windowOpen() {
+			return
+		}
+		h := p.u.hwnd
+		switch action {
+		case "minimize":
+			winapi.Minimize(h)
+		case "toggleMaximize":
+			winapi.ToggleMaximize(h)
+		case "close": // as the close button: the window goes, the tray stays
+			winapi.PostClose(h)
+		case "drag":
+			winapi.StartNonClientDrag(h, winapi.HTCaption)
+		case "resize":
+			if ht, ok := winapi.EdgeHitTest(edge); ok {
+				winapi.StartNonClientDrag(h, ht)
+			}
+		}
+	})
+}
 
 // WindowOpen implements app.UpdateHost.
 func (p *platform) WindowOpen() bool { return p.u.shown.Load() }

@@ -342,6 +342,13 @@
     'drawer.subtasks': 'Подзадачи',
     'drawer.links': 'Связанные задачи',
     'drawer.related': 'Связана с',
+    // v0.7: window buttons (frameless window)
+    'win.label': 'Окно',
+    'win.minimize': 'Свернуть',
+    'win.maximize': 'Развернуть',
+    'win.restore': 'Восстановить',
+    'win.close': 'Закрыть',
+    'win.closeTitle': 'Закрыть — Jiraffe продолжит работать в трее',
     // v0.6: issue panel — inline editing, development, links, comments
     'drawer.developer': 'Разработчик',
     'drawer.reviewer': 'Ревьюер',
@@ -1008,6 +1015,13 @@
     'drawer.subtasks': 'Підзадачі',
     'drawer.links': 'Пов’язані задачі',
     'drawer.related': 'Пов’язана з',
+    // v0.7: window buttons (frameless window)
+    'win.label': 'Вікно',
+    'win.minimize': 'Згорнути',
+    'win.maximize': 'Розгорнути',
+    'win.restore': 'Відновити',
+    'win.close': 'Закрити',
+    'win.closeTitle': 'Закрити — Jiraffe працюватиме далі в треї',
     // v0.6: issue panel — inline editing, development, links, comments
     'drawer.developer': 'Розробник',
     'drawer.reviewer': 'Рев’юер',
@@ -1669,6 +1683,13 @@
     'drawer.subtasks': 'Sub-tasks',
     'drawer.links': 'Linked issues',
     'drawer.related': 'Related to',
+    // v0.7: window buttons (frameless window)
+    'win.label': 'Window',
+    'win.minimize': 'Minimize',
+    'win.maximize': 'Maximize',
+    'win.restore': 'Restore',
+    'win.close': 'Close',
+    'win.closeTitle': 'Close — Jiraffe keeps running in the tray',
     // v0.6: issue panel — inline editing, development, links, comments
     'drawer.developer': 'Developer',
     'drawer.reviewer': 'Reviewer',

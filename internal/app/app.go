@@ -519,6 +519,17 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 			return nil, err
 		}
 		return a.addComment(ctx, p.Key, p.Body, p.Format)
+	case "getWindowInfo":
+		return a.getWindowInfo(), nil
+	case "windowControl":
+		var p struct {
+			Action string `json:"action"`
+			Edge   string `json:"edge"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, a.windowControl(p.Action, p.Edge)
 	case "getUpdateStatus":
 		return a.updateStatus(), nil
 	case "checkForUpdates":

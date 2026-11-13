@@ -1457,6 +1457,17 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       r.updated = rfc(new Date(Math.max(Date.now(), new Date(r.updated).getTime() + 1000)));
       return clone(c); // no event (SPEC v0.6)
     },
+    /* --- v0.7 window chrome: the browser has no frameless window; state is simulated, controls are logged --- */
+    getWindowInfo: () => clone(win),
+    windowControl(p) {
+      const action = p && p.action;
+      if (!['minimize', 'toggleMaximize', 'close', 'drag', 'resize'].includes(action)) throw new MockError('bad_params', 'action must be minimize | toggleMaximize | close | drag | resize');
+      if (action === 'resize' && !['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].includes(p.edge)) throw new MockError('bad_params', 'edge must be n s e w ne nw se sw');
+      if (action !== 'resize' && p.edge != null) throw new MockError('bad_params', 'edge is only for resize');
+      console.info('[jiraffe mock] windowControl →', action, p.edge || ''); // eslint-disable-line no-console
+      if (action === 'toggleMaximize') { win.maximized = !win.maximized; setTimeout(() => emit('windowState', clone(win)), 30); }
+      return null;
+    },
     setWindowTheme(p) { // v0.4: the native title bar; nothing to paint in a browser
       if (!p || typeof p.dark !== 'boolean' || (p.caption != null && !/^#[0-9a-f]{6}$/i.test(String(p.caption)))) throw new MockError('bad_params', 'dark must be a boolean, caption "#rrggbb"');
       console.info('[jiraffe mock] setWindowTheme →', p.dark ? 'dark' : 'light', p.caption || ''); // eslint-disable-line no-console
@@ -1541,6 +1552,27 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
   };
   window.__jiraffeMock = { flags: [...flags], emit };
 
+  /* v0.7: a stand-in for the desktop seen through the window (?mock=noglass: the opaque fallback). The real backdrop is
+     an untinted blur measured as ≈ 6 + 0.6 × desktop; here: soft colour fields under that dimming. Worst cases:
+     ?mock=desk-white (≈ #9f9f9f behind the page: dark theme) and ?mock=desk-black (≈ #060606: light theme).
+     Browser only (mock.js is never embedded). */
+  const win = { glass: !flags.has('noglass'), maximized: false, active: true };
+  if (win.glass) {
+    const desk = document.createElement('style');
+    const plain = flags.has('desk-white') ? '#9f9f9f' : flags.has('desk-black') ? '#060606' : '';
+    desk.textContent = plain ? `html.is-glass { background: ${plain}; }` : `html.is-glass {
+  --mock-tint: rgb(15 15 15 / .4);
+  background:
+    linear-gradient(var(--mock-tint), var(--mock-tint)),
+    radial-gradient(42% 55% at 14% 24%, #3f7fd9, transparent 72%),
+    radial-gradient(38% 48% at 86% 18%, #e0874f, transparent 70%),
+    radial-gradient(55% 50% at 62% 92%, #2fa98a, transparent 72%),
+    radial-gradient(30% 40% at 40% 50%, #c9c2b4, transparent 70%),
+    linear-gradient(135deg, #1f2c3d, #4d3d60 48%, #24463a);
+}`;
+    document.head.append(desk);
+  }
+
   /* ---------- periodic comment notifications (tracked projects only, like the Go post-filter) ---------- */
   setInterval(() => {
     const mineOpen = all().filter((r) => mine(r) && isTracked(r.key));
@@ -1553,5 +1585,5 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     emit('state', state());
   }, flags.has('fast') ? 10000 : 45000);
 
-  console.info('[jiraffe mock] fake backend installed. Flags: ?mock=unconfigured,empty,errors,noerrors,slow,fast,warnings,noagile,truncated,untracked,limit,noprefs,closedfail,timepartial,update,update-fail,update-nowrite,update-badsig,update-checkfail,noupdate,devbuild,updated'); // eslint-disable-line no-console
+  console.info('[jiraffe mock] fake backend installed. Flags: ?mock=unconfigured,empty,errors,noerrors,slow,fast,warnings,noagile,truncated,untracked,limit,noprefs,closedfail,timepartial,update,update-fail,update-nowrite,update-badsig,update-checkfail,noupdate,devbuild,updated,noglass,desk-white,desk-black'); // eslint-disable-line no-console
 })();

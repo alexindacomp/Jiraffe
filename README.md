@@ -129,7 +129,14 @@ tools/sign              CI release signer (ed25519, key from env)
 tools/uibundle          build-time UI bundler (gzip JSON of ui/ files)
 internal/uibundle       bundle format: Build / Open (fs.FS)
 assets/winres.json      go-winres resource definition
+assets/fonts            Manrope subsets (embedded in ui/app.css as base64) + OFL.txt
 ```
+
+## Third-party
+
+- **Manrope** (The Manrope Project Authors), SIL Open Font License 1.1 — see
+  `assets/fonts/OFL.txt`. The Latin and Cyrillic `woff2` subsets are embedded in
+  `ui/app.css` as `data:` URLs (no network).
 
 ## Design notes
 

@@ -61,3 +61,51 @@ func hexDigit(c byte) (uint8, bool) {
 	}
 	return 0, false
 }
+
+// WindowInfo is the getWindowInfo result and the "windowState" event: the
+// page draws glass surfaces only when glass, and its own window controls.
+type WindowInfo struct {
+	Glass     bool `json:"glass"`
+	Maximized bool `json:"maximized"`
+	Active    bool `json:"active"`
+}
+
+// WindowChrome is implemented by a platform with a frameless window
+// (Windows). Without it the methods are no-ops ({glass:false,…}).
+type WindowChrome interface {
+	// WindowInfo is the current state (safe from any goroutine).
+	WindowInfo() WindowInfo
+	// WindowControl performs a validated action on the UI thread: minimize,
+	// toggleMaximize, close, drag, resize (with edge). It never fails.
+	WindowControl(action, edge string)
+}
+
+// windowEdges are the resize edges of windowControl.
+var windowEdges = map[string]bool{"n": true, "s": true, "e": true, "w": true, "ne": true, "nw": true, "se": true, "sw": true}
+
+func (a *App) getWindowInfo() WindowInfo {
+	if wc, ok := a.plat.(WindowChrome); ok {
+		return wc.WindowInfo()
+	}
+	return WindowInfo{}
+}
+
+// windowControl validates {action, edge?} and hands it to the platform.
+func (a *App) windowControl(action, edge string) error {
+	switch action {
+	case "minimize", "toggleMaximize", "close", "drag":
+		if edge != "" {
+			return a.badParams("edge is only for resize")
+		}
+	case "resize":
+		if !windowEdges[edge] {
+			return a.badParams("edge must be n, s, e, w, ne, nw, se or sw")
+		}
+	default:
+		return a.badParams("action must be minimize, toggleMaximize, close, drag or resize")
+	}
+	if wc, ok := a.plat.(WindowChrome); ok {
+		wc.WindowControl(action, edge)
+	}
+	return nil
+}
