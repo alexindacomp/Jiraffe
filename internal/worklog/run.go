@@ -24,10 +24,11 @@ const (
 	RoleReviewer  = "reviewer"
 	RoleAuthor    = "author"
 	RoleCommenter = "commenter"
+	RoleManual    = "manual" // v0.8.5: manual entries
 )
 
 // RoleOrder is the order of roles in WorklogItem.roles / RelatedItem.roles.
-var RoleOrder = []string{RoleDev, RoleQA, RoleReviewer, RoleAuthor, RoleCommenter}
+var RoleOrder = []string{RoleDev, RoleQA, RoleReviewer, RoleAuthor, RoleCommenter, RoleManual}
 
 // Sources of a fixed-time part (createSource / commentSource).
 const (
@@ -51,6 +52,8 @@ type Item struct {
 	CreateSource   string `json:"createSource,omitempty"`
 	CommentSource  string `json:"commentSource,omitempty"`
 	FixedSeconds   int64  `json:"fixedSeconds"`
+	// ManualSeconds is the issue's manual time of the day (v0.8.5).
+	ManualSeconds int64 `json:"manualSeconds,omitempty"`
 	// ShareSeconds is the status share (time in my status roles' statuses).
 	ShareSeconds  int64  `json:"shareSeconds"`
 	LoggedSeconds int64  `json:"loggedSeconds"`

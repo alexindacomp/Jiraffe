@@ -227,10 +227,12 @@
               </div>
               <div class="section-actions">
                 <span class="wl-day"><span class="wl-day-label" id="wl-day-label" data-i18n="worklog.dayLabel"></span><button type="button" class="picker-btn wl-day-btn" id="wl-day" aria-haspopup="menu" aria-expanded="false" aria-labelledby="wl-day-label wl-day"></button></span>
+                <button type="button" class="btn" id="wl-add-btn" aria-controls="wl-manual" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="worklog.man.add"></span></button>
                 <button type="button" class="btn" id="wl-preview-btn"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span data-i18n="worklog.preview"></span></button>
                 <button type="button" class="btn btn-primary" id="wl-run-btn"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="worklog.logNow"></span></button>
               </div>
             </header>
+            <div id="wl-manual" hidden></div>
             <div id="wl-preview"></div>
           </section>
 

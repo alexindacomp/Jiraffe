@@ -607,7 +607,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
   /* v0.8 worklog by role. Status roles of the share rows; issues I created / commented that day (today, or any past
      working day); "related" issues without activity (preview only); per-day overrides as in state.json. Roles switch
      off like the Go side: empty QA / Reviewer statuses, 0 author / comment minutes. */
-  const ROLE_ORDER = ['dev', 'qa', 'reviewer', 'author', 'commenter'];
+  const ROLE_ORDER = ['dev', 'qa', 'reviewer', 'author', 'commenter', 'manual'];
   const SHARE_ROLES = { 'RBI-1028': 'dev', 'CMA-412': 'dev', 'EDS-230': 'qa' };
   const FIXED = flags.has('empty') ? { today: { authored: [], comments: {} }, past: { authored: [], comments: {} } }
     : { today: { authored: ['MB-90'], comments: { 'CMA-412': 1, 'RBI-1019': 2 } }, past: { authored: [], comments: { 'EDS-233': 1 } } };
@@ -647,6 +647,13 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     const fixed = fixedParts(isoDay(day), spec);
     const rows = shares.filter(([key]) => roleOn(SHARE_ROLES[key] || 'dev')).map(([key, share, start]) => ({ key, share, start }));
     fixed.forEach((_, key) => { if (!rows.some((r) => r.key === key)) rows.push({ key, share: 0, start: '10:00' }); });
+    // v0.8.5: manual entries, split evenly (remaining minutes to the first keys)
+    const manual = new Map();
+    ((worklogOverrides.get(isoDay(day)) || {}).manual || []).forEach((e) => {
+      const mins = e.seconds / 60; const each = Math.floor(mins / e.keys.length); const extra = mins % e.keys.length;
+      e.keys.forEach((k, i) => manual.set(k, (manual.get(k) || 0) + (each + (i < extra ? 1 : 0)) * 60));
+    });
+    manual.forEach((_, key) => { if (!rows.some((r) => r.key === key)) rows.push({ key, share: 0, start: '09:00' }); });
     return rows.map(({ key, share, start }) => {
       const is = rec(key) || {};
       const f = fixed.get(key) || { comments: 0, createSeconds: 0, commentSeconds: 0 };
@@ -654,18 +661,20 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       if (share > 0) roles.push(SHARE_ROLES[key] || 'dev');
       if (f.createSource) roles.push('author');
       if (f.comments > 0) roles.push('commenter');
+      if (manual.has(key)) roles.push('manual');
       const item = { key, summary: is.summary || key, status: (is.status || ST.inprog).name, roles: ROLE_ORDER.filter((r) => roles.includes(r)),
         comments: f.comments, createSeconds: f.createSeconds, commentSeconds: f.commentSeconds, fixedSeconds: f.createSeconds + f.commentSeconds,
         shareSeconds: share, loggedSeconds: 0, todoSeconds: 0, started: rfc(atTime(day, start)) };
       if (f.createSource) item.createSource = f.createSource;
       if (f.comments > 0) item.commentSource = f.commentSource;
+      if (manual.has(key)) item.manualSeconds = manual.get(key);
       return item;
     });
   }
   /** SPEC v0.8 budget: fixed time first, status time gets the rest; floored to whole minutes. */
   function allocate(items, budget) {
     const sum = (a) => a.reduce((x, y) => x + y, 0);
-    const fixedTodo = items.map((i) => Math.max(0, i.fixedSeconds - i.loggedSeconds));
+    const fixedTodo = items.map((i) => Math.max(0, i.fixedSeconds + (i.manualSeconds || 0) - i.loggedSeconds)); // v0.8.5: manual counted with fixed
     const fScale = sum(fixedTodo) > budget ? (sum(fixedTodo) ? Math.max(0, budget) / sum(fixedTodo) : 0) : 1;
     const ft = fixedTodo.map((v) => v * fScale);
     const rest = Math.max(0, budget - sum(ft));
@@ -1690,7 +1699,24 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
         });
         if (Object.keys(e).length) out.issues[k] = e;
       });
-      if (out.createTotalSeconds == null && out.commentTotalSeconds == null && !Object.keys(out.issues).length) worklogOverrides.delete(date);
+      if (o.manual != null) { // v0.8.5
+        if (!Array.isArray(o.manual) || o.manual.length > 50) throw new MockError('bad_params', 'manual must be a list of at most 50');
+        const ids = new Set();
+        out.manual = o.manual.map((e) => {
+          const ok = e && /^[A-Za-z0-9_-]{1,40}$/.test(e.id) && !ids.has(e.id) && Array.isArray(e.keys) && e.keys.length >= 1 && e.keys.length <= 20 &&
+            e.keys.every((k) => /^[A-Z][A-Z0-9_]*-\d+$/.test(k)) && new Set(e.keys).size === e.keys.length &&
+            Number.isInteger(e.seconds) && e.seconds >= 60 && e.seconds <= 86400 && e.seconds % 60 === 0 &&
+            [undefined, '', 'grooming', 'estimation', 'questions'].includes(e.activity) && String(e.note || '').length <= 200;
+          if (!ok) throw new MockError('bad_params', 'bad manual entry');
+          ids.add(e.id);
+          const x = { id: e.id, keys: e.keys.slice(), seconds: e.seconds };
+          if (e.activity) x.activity = e.activity;
+          if (String(e.note || '').trim()) x.note = String(e.note).trim();
+          return x;
+        });
+        if (!out.manual.length) delete out.manual;
+      }
+      if (out.createTotalSeconds == null && out.commentTotalSeconds == null && !Object.keys(out.issues).length && !out.manual) worklogOverrides.delete(date);
       else worklogOverrides.set(date, out);
       console.info('[jiraffe mock] setWorklogOverrides →', date, out); // eslint-disable-line no-console
       return clone(out);

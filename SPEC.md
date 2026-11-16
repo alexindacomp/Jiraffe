@@ -1839,3 +1839,36 @@ Methods:
   matching Jira's status list.
 - The worklog description names only the status roles whose own statuses had time that day (QA + Reviewer of an
   issue in testing ⇒ "Тестирование", not "Тестирование; код-ревью").
+
+## v0.8.5 — manual time on any issue
+
+For work that left no trace in Jira (a meeting about an issue still in the backlog): on the Worklog screen the user
+adds **manual entries** for the selected day — one or several issues found by search, a time, an optional activity
+and an optional note. A group's time is split evenly between its issues.
+
+```
+ManualEntry {
+  id: string                      // client-made, 1…40 chars [A-Za-z0-9_-]
+  keys: string[]                  // 1…20 issue keys, unique
+  seconds: int                    // 60…86400, whole minutes: the entry's total time
+  activity?: "grooming" | "estimation" | "questions"
+  note?: string                   // ≤ 200 chars, trimmed
+}
+DayOverrides.manual?: ManualEntry[]   // ≤ 50 entries; same get/setWorklogOverrides, storage and validation rules
+```
+- Split: `seconds ÷ len(keys)` in whole minutes, the remaining minutes one each to the first issues. Several entries on
+  one issue add up.
+- Budget: manual time is the user's explicit word and comes **first** (before author / comment time, then status
+  time); only if it alone exceeds the remaining cap it is scaled down. Re-runs subtract what is already logged (logged
+  time covers manual, then fixed, then status time).
+- Manual time applies also to excluded issues (explicit); their automatic time stays off.
+- Items: role `"manual"` (last in `roles`), `manualSeconds` (the issue's manual target); issues not otherwise found
+  that day are read by `key in (…)` (summary, status); a key Jira does not return is skipped (logged).
+- `started`: the first status span, else the creation / first comment, else the workday start.
+- Description (`comment`): after the role parts, the activities of the issue's entries — ru «груминг», «оценка»,
+  «уточняющие вопросы»; uk «грумінг», «оцінка», «уточнюючі питання»; en "grooming", "estimation", "clarifying
+  questions" — and the notes, unique, "; "-joined.
+- Search: `searchIssuesFor {purpose: "link", query}` (any project, by key or summary).
+- UI: "Добавить время" on the Worklog screen opens a panel: issue search (several picks shown as chips), time (Jira
+  format), activity (— / Груминг / Оценка / Уточняющие вопросы), note; the day's entries are listed above the table
+  with edit / delete; rows show the role chip «Вручную».

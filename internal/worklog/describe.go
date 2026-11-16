@@ -8,6 +8,23 @@ import (
 )
 
 // describePhrases are the worklog description parts per language (v0.8.2).
+// activityPhrases name the manual entry activities per language (v0.8.5).
+var activityPhrases = map[string]map[string]string{
+	"en": {ActivityGrooming: "grooming", ActivityEstimation: "estimation", ActivityQuestions: "clarifying questions"},
+	"ru": {ActivityGrooming: "груминг", ActivityEstimation: "оценка", ActivityQuestions: "уточняющие вопросы"},
+	"uk": {ActivityGrooming: "грумінг", ActivityEstimation: "оцінка", ActivityQuestions: "уточнюючі питання"},
+}
+
+// ActivityPhrase is the description text of a manual activity in lang
+// (anything else: en); "" for an unknown activity.
+func ActivityPhrase(activity, lang string) string {
+	ph, ok := activityPhrases[lang]
+	if !ok {
+		ph = activityPhrases["en"]
+	}
+	return ph[activity]
+}
+
 var describePhrases = map[string]map[string]string{
 	"en": {RoleDev: "development", RoleQA: "testing", RoleReviewer: "code review", RoleAuthor: "issue creation", RoleCommenter: "comments"},
 	"ru": {RoleDev: "разработка", RoleQA: "тестирование", RoleReviewer: "код-ревью", RoleAuthor: "создание задачи", RoleCommenter: "комментарии"},
@@ -19,7 +36,7 @@ var describePhrases = map[string]map[string]string{
 // min), "issue creation" with create time, "comments (n)" with comment time.
 // Parts are joined with "; ", the first one capitalised; lang is ru, uk or
 // en (anything else: en). "" when there is nothing to describe.
-func Describe(roles []string, shareSeconds, createSeconds, commentSeconds int64, comments int, lang string) string {
+func Describe(roles []string, shareSeconds, createSeconds, commentSeconds int64, comments int, lang string, extra ...string) string {
 	ph, ok := describePhrases[lang]
 	if !ok {
 		ph = describePhrases["en"]
@@ -45,6 +62,17 @@ func Describe(roles []string, shareSeconds, createSeconds, commentSeconds int64,
 			p += " (" + strconv.Itoa(comments) + ")"
 		}
 		parts = append(parts, p)
+	}
+	for _, x := range extra { // v0.8.5: manual activities / notes
+		if x = strings.TrimSpace(x); x != "" {
+			dup := false
+			for _, p := range parts {
+				dup = dup || strings.EqualFold(p, x)
+			}
+			if !dup {
+				parts = append(parts, x)
+			}
+		}
 	}
 	if len(parts) == 0 {
 		return ""

@@ -236,11 +236,13 @@ type Candidate struct {
 	// Worked are the status roles whose own statuses had time that day
 	// (v0.8.4: the description names only these; nil = all status roles).
 	Worked []string
+	// Manual is the issue's manual time (v0.8.5); it comes first.
+	Manual int64
 }
 
 // hasFixedRole reports whether the candidate is author or commenter.
 func (c Candidate) hasFixedRole() bool {
-	return c.Fixed.CreateSource != "" || c.Fixed.CommentSource != ""
+	return c.Fixed.CreateSource != "" || c.Fixed.CommentSource != "" || c.Manual > 0
 }
 
 // Planned is the allocation result for one candidate.
@@ -279,21 +281,30 @@ func Plan(cands []Candidate, capSeconds int64) []Planned {
 	}
 	share := Shares(spans)
 
-	var already, fixedNeed float64
+	// Tiers, each scaled into what the previous left of the budget: manual
+	// time (v0.8.5, the user's explicit word), fixed time, status time.
+	// Logged time covers the tiers in that order.
+	var already, manualNeed, fixedNeed float64
+	manualTodo := make(map[string]float64, len(kept))
 	fixedTodo := make(map[string]float64, len(kept))
 	for _, c := range kept {
 		already += float64(c.Logged)
-		fixedTodo[c.Key] = math.Max(0, float64(c.Fixed.Seconds()-c.Logged))
+		manualTodo[c.Key] = math.Max(0, float64(c.Manual-c.Logged))
+		manualNeed += manualTodo[c.Key]
+		over := math.Max(0, float64(c.Logged-c.Manual)) // logged beyond the manual part
+		fixedTodo[c.Key] = math.Max(0, float64(c.Fixed.Seconds())-over)
 		fixedNeed += fixedTodo[c.Key]
 	}
 	budget := math.Max(0, float64(capSeconds)-already)
-	scaleInto(fixedTodo, fixedNeed, budget)
-	rest := math.Max(0, budget-fixedNeed)
+	scaleInto(manualTodo, manualNeed, budget)
+	rest := math.Max(0, budget-manualNeed)
+	scaleInto(fixedTodo, fixedNeed, rest)
+	rest = math.Max(0, rest-fixedNeed)
 
 	statusTodo := make(map[string]float64, len(kept))
 	var statusNeed float64
 	for _, c := range kept {
-		over := math.Max(0, float64(c.Logged-c.Fixed.Seconds())) // logged beyond the fixed part
+		over := math.Max(0, float64(c.Logged-c.Manual-c.Fixed.Seconds())) // logged beyond manual + fixed
 		statusTodo[c.Key] = math.Max(0, share[c.Key]-over)
 		statusNeed += statusTodo[c.Key]
 	}
@@ -305,7 +316,7 @@ func Plan(cands []Candidate, capSeconds int64) []Planned {
 		if len(c.Spans) > 0 {
 			started = c.Spans[0].Start
 		}
-		out = append(out, Planned{Candidate: c, Share: share[c.Key], Todo: floorMinutes(fixedTodo[c.Key] + statusTodo[c.Key]), Started: started})
+		out = append(out, Planned{Candidate: c, Share: share[c.Key], Todo: floorMinutes(manualTodo[c.Key] + fixedTodo[c.Key] + statusTodo[c.Key]), Started: started})
 	}
 	return out
 }

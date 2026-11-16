@@ -1,5 +1,7 @@
 package worklog
 
+import "strings"
+
 // Limits of DayOverrides (SPEC v0.8).
 const (
 	MaxOverrideSeconds = 86400
@@ -19,6 +21,8 @@ type DayOverrides struct {
 	CreateTotalSeconds  *int64                   `json:"createTotalSeconds,omitempty"`
 	CommentTotalSeconds *int64                   `json:"commentTotalSeconds,omitempty"`
 	Issues              map[string]IssueOverride `json:"issues"`
+	// Manual are the day's manual entries (v0.8.5).
+	Manual []ManualEntry `json:"manual,omitempty"`
 }
 
 // Normalize drops issues without values and makes Issues non-nil.
@@ -30,11 +34,17 @@ func (d *DayOverrides) Normalize() {
 		}
 	}
 	d.Issues = out
+	for i := range d.Manual {
+		d.Manual[i].Note = strings.TrimSpace(d.Manual[i].Note)
+	}
+	if len(d.Manual) == 0 {
+		d.Manual = nil
+	}
 }
 
 // Empty reports whether nothing is set.
 func (d DayOverrides) Empty() bool {
-	if d.CreateTotalSeconds != nil || d.CommentTotalSeconds != nil {
+	if d.CreateTotalSeconds != nil || d.CommentTotalSeconds != nil || len(d.Manual) > 0 {
 		return false
 	}
 	for _, v := range d.Issues {
@@ -54,6 +64,9 @@ func (d DayOverrides) Clone() DayOverrides {
 	}
 	for k, v := range d.Issues {
 		c.Issues[k] = IssueOverride{CreateSeconds: clonePtr(v.CreateSeconds), CommentSeconds: clonePtr(v.CommentSeconds)}
+	}
+	for _, e := range d.Manual {
+		c.Manual = append(c.Manual, e.clone())
 	}
 	return c
 }
@@ -82,7 +95,7 @@ func (d DayOverrides) Valid() bool {
 			return false
 		}
 	}
-	return true
+	return validManual(d.Manual)
 }
 
 // ValidKey checks an issue key against ^[A-Z][A-Z0-9_]*-\d+$ (by hand: the

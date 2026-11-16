@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -200,6 +201,7 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time,
 	}
 	ov := a.st.Snapshot().Overrides(run.Date)
 	planned, other, err := a.plan(ctx, c, identity, s, now, jql, ov)
+	manualOf := worklog.ManualTime(ov.Manual) // v0.8.5: for the descriptions
 	if err != nil {
 		var ce *capCheckError
 		if errors.As(err, &ce) {
@@ -232,7 +234,8 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time,
 			Duration:       worklog.FormatDuration(float64(p.Todo), s.HoursPerDay),
 			Started:        started.Format(time.RFC3339),
 		}
-		item.Comment = worklog.Describe(describedRoles(p.Candidate), int64(math.Round(p.Share)), p.Fixed.CreateSeconds, p.Fixed.CommentSeconds, p.Comments, commentLang(s))
+		item.ManualSeconds = p.Manual
+		item.Comment = worklog.Describe(describedRoles(p.Candidate), int64(math.Round(p.Share)), p.Fixed.CreateSeconds, p.Fixed.CommentSeconds, p.Comments, commentLang(s), manualParts(manualOf[p.Key], commentLang(s))...)
 		switch {
 		case p.Todo < worklog.MinSeconds:
 			item.TodoSeconds = 0
@@ -375,6 +378,21 @@ func statusList(names []string) string {
 		}
 	}
 	return strings.Join(out, ", ")
+}
+
+// manualParts are the description parts of an issue's manual entries:
+// activities in lang, then notes.
+func manualParts(m *worklog.ManualShare, lang string) []string {
+	if m == nil {
+		return nil
+	}
+	var out []string
+	for _, act := range m.Activities {
+		if p := worklog.ActivityPhrase(act, lang); p != "" {
+			out = append(out, p)
+		}
+	}
+	return append(out, m.Notes...)
 }
 
 // describedRoles are the roles a worklog description names: the fixed
@@ -637,8 +655,15 @@ func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s confi
 		}
 	}
 
-	// Issues taken out of the worklog get nothing (their time logged that
-	// day still counts against the cap, as "other" time).
+	// v0.8.5: manual entries; their issues may have had no activity at all.
+	manual := worklog.ManualTime(ov.Manual)
+	if err := a.manualIssues(ctx, c, manual, &found); err != nil {
+		return nil, 0, err
+	}
+
+	// Issues taken out of the worklog get no automatic time (their time
+	// logged that day still counts against the cap, as "other" time); manual
+	// time is explicit and still applies.
 	excluded := a.st.Snapshot().Excluded()
 	var fixedIn []worklog.FixedIssue
 	for _, d := range found.order {
@@ -655,7 +680,9 @@ func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s confi
 	ws, we := config.At(now, s.WorkdayStart), config.At(now, s.WorkdayEnd).Add(-time.Minute)
 	var cands []worklog.Candidate
 	for _, d := range found.order {
-		if excluded[d.key] || len(d.spans) == 0 && !d.created && d.comments == 0 {
+		m := manual[d.key]
+		auto := !excluded[d.key] && (len(d.spans) > 0 || d.created || d.comments > 0)
+		if !auto && m == nil {
 			continue
 		}
 		start := d.fixedAt.In(now.Location())
@@ -665,8 +692,15 @@ func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s confi
 		if start.After(we) {
 			start = we
 		}
-		cands = append(cands, worklog.Candidate{Key: d.key, Summary: d.summary, Status: d.status, Spans: d.spans,
-			Roles: d.roles(), Comments: d.comments, Fixed: fixed[d.key], FixedStart: start, Worked: d.worked})
+		cand := worklog.Candidate{Key: d.key, Summary: d.summary, Status: d.status, FixedStart: start}
+		if auto {
+			cand.Spans, cand.Roles, cand.Comments, cand.Fixed, cand.Worked = d.spans, d.roles(), d.comments, fixed[d.key], d.worked
+		}
+		if m != nil {
+			cand.Manual = m.Seconds
+			cand.Roles = append(cand.Roles, worklog.RoleManual)
+		}
+		cands = append(cands, cand)
 	}
 	isCand := map[string]bool{}
 	for i := range cands {
@@ -739,6 +773,45 @@ func (a *App) statusIssues(ctx context.Context, c *jira.Client, me *jira.User, s
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// manualIssues adds the issues of manual entries not found otherwise (no
+// activity that day) with their summary and status; keys Jira does not
+// return (deleted, no access) are skipped.
+func (a *App) manualIssues(ctx context.Context, c *jira.Client, manual map[string]*worklog.ManualShare, found *dayIssues) error {
+	var missing []string
+	for k := range manual {
+		if _, ok := found.byKey[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	opts := jira.SearchOptions{Fields: []string{"summary", "status"}, Limit: len(missing)}
+	issues, err := c.Search(ctx, "key in ("+strings.Join(missing, ", ")+")", opts)
+	if jira.IsCode(err, jira.CodeBadRequest) { // a key that does not exist fails the whole query: one by one
+		issues, err = nil, nil
+		for _, k := range missing {
+			one, e := c.Search(ctx, "key = "+k, jira.SearchOptions{Fields: opts.Fields, Limit: 1})
+			if e != nil {
+				if !jira.IsCode(e, jira.CodeBadRequest) {
+					return e
+				}
+				log.Printf("worklog manual %s: %v", k, e)
+				continue
+			}
+			issues = append(issues, one...)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	for _, is := range issues {
+		found.get(is)
 	}
 	return nil
 }

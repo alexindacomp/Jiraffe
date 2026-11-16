@@ -1,7 +1,11 @@
 package app
 
 import (
+	"context"
+	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	"jiraffe/internal/jira"
 	"jiraffe/internal/worklog"
@@ -49,5 +53,44 @@ func TestDescribedRoles(t *testing.T) {
 	c.Worked = nil
 	if got := describedRoles(c); len(got) != 3 {
 		t.Errorf("nil worked: %v", got)
+	}
+}
+
+// v0.8.5: manual entries on issues without activity (read by key), split,
+// described by activity and note, saved per day, logged first.
+func TestV85ManualEntries(t *testing.T) {
+	backlog := issueJSON("B-9", "Backlog", "2026-11-01T10:00:00.000+0200")
+	fj := &fakeJira{
+		issues:   issuesJSON(allDayA1),
+		routes:   map[string]string{"key in (B-9)": issuesJSON(backlog)},
+		worklogs: map[string][]jira.Worklog{},
+	}
+	a := openApp(t, t.TempDir(), fj, &fakeClock{t: time.Date(2026, 11, 11, 18, 0, 0, 0, zone)}, nil)
+	ctx := context.Background()
+	ov := `{"overrides":{"issues":{},"manual":[` +
+		`{"id":"m1","keys":["B-9","A-1"],"seconds":3600,"activity":"grooming","note":" спринт 115 "}]}}`
+	res, err := a.Call(ctx, "setWorklogOverrides", json.RawMessage(ov))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := json.Marshal(res); !strings.Contains(string(b), `"manual":[{"id":"m1","keys":["B-9","A-1"],"seconds":3600,"activity":"grooming","note":"спринт 115"}]`) {
+		t.Errorf("saved %s", b)
+	}
+	items := itemsByKey(preview(t, a))
+	b9, a1 := items["B-9"], items["A-1"]
+	if b9.ManualSeconds != 1800 || b9.TodoSeconds != 1800 || strings.Join(b9.Roles, ",") != "manual" || b9.Comment != "Груминг; спринт 115" || b9.Summary == "" {
+		t.Errorf("B-9 %+v", b9)
+	}
+	// A-1: 30m manual first, the rest of the 8h cap is its status share.
+	if a1.ManualSeconds != 1800 || a1.TodoSeconds != 8*3600-1800 || strings.Join(a1.Roles, ",") != "dev,manual" || a1.Comment != "Разработка; груминг; спринт 115" {
+		t.Errorf("A-1 %+v", a1)
+	}
+	for _, bad := range []string{
+		`{"overrides":{"issues":{},"manual":[{"id":"m1","keys":["B-9"],"seconds":90}]}}`,
+		`{"overrides":{"issues":{},"manual":[{"id":"m1","keys":["B-9"],"seconds":600,"activity":"party"}]}}`,
+	} {
+		if _, err := a.Call(ctx, "setWorklogOverrides", json.RawMessage(bad)); ToError(err).Code != CodeBadParams {
+			t.Errorf("%s: %v", bad, err)
+		}
 	}
 }

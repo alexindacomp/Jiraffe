@@ -223,7 +223,9 @@
           // (drafts / errors by field id "total:create" | "issue:KEY:comment", debounce timers, one save queue)
           ov: { date: null, data: null, loading: false, error: null, seq: 0 },
           fx: { drafts: {}, errors: {}, timers: {}, saving: false, queue: Promise.resolve(), rendering: false },
-          relatedOpen: false },
+          relatedOpen: false,
+          // v0.8.5 manual entries form (see renderManual)
+          man: { open: false, editId: null, picks: [], names: {}, query: '', results: [], searching: false, searchError: null, seq: 0, timer: 0, time: '', activity: '', note: '', error: null, saving: false } },
     missed: { days: [], dismissed: '', busy: new Set() }, // v0.7.1: missed worklog days (getMissedWorklogDays / worklogMissed)
 
     notif: { list: null, loading: false, error: null, markingAll: false },
@@ -5542,7 +5544,8 @@
     const todo = sumOf(items, 'todoSeconds');
     const share = sumOf(items, 'shareSeconds');
     // v0.8: the "fixed" column (created issues + comments) only when the run has such time; editors in the preview only
-    const hasFixed = !compact && items.some((i) => Number(i.fixedSeconds) > 0 || fixedRoles(i).length);
+    const fixedOf = (i) => (Number(i.fixedSeconds) || 0) + (Number(i.manualSeconds) || 0); // v0.8.5: + manual time
+    const hasFixed = !compact && items.some((i) => fixedOf(i) > 0 || fixedRoles(i).length);
     const cols = (showResult ? 7 : 6) - (compact ? 2 : 0) + (hasFixed ? 1 : 0) + 1; // + the actions column (v0.8.1)
     const canExclude = !compact && !showResult;
     return html`<div class="table-wrap"><table class="table">
@@ -5563,7 +5566,7 @@
           <td><span class="cell-issue"><span class="cell-issue-top"><button type="button" class="wl-open card-key" data-open-key="${it.key}" data-focus-key="${it.key}" aria-haspopup="dialog" title="${t('worklog.openIssue')}">${it.key}</button>${roleChips(it)}</span><button type="button" class="wl-open sum" data-open-key="${it.key}" tabindex="-1" title="${it.summary || ''}">${it.summary || ''}</button>${it.comment ? html`<span class="wl-desc" title="${t('worklog.descTip')}">${it.comment}</span>` : ''}</span></td>
           ${compact ? '' : html`<td class="nowrap">${nameOf(it.status)}</td>`}
           ${compact ? '' : html`<td class="num">${Number(it.shareSeconds) > 0 || !hasFixed ? dur(it.shareSeconds) : '—'}</td>`}
-          ${hasFixed ? html`<td class="num">${Number(it.fixedSeconds) > 0 ? dur(it.fixedSeconds) : '—'}</td>` : ''}
+          ${hasFixed ? html`<td class="num">${fixedOf(it) > 0 ? dur(fixedOf(it)) : '—'}</td>` : ''}
           <td class="num muted">${it.loggedSeconds ? dur(it.loggedSeconds) : '—'}</td>
           <td class="num strong">${it.todoSeconds ? dur(it.todoSeconds) : '—'}</td>
           <td class="muted">${it.started ? i18n.time(it.started) : '—'}</td>
@@ -5577,7 +5580,7 @@
       ${compact ? '' : html`<tfoot><tr>
         <td>${t('worklog.total')}</td><td></td>
         <td class="num">${dur(share)}</td>
-        ${hasFixed ? html`<td class="num">${dur(sumOf(items, 'fixedSeconds'))}</td>` : ''}
+        ${hasFixed ? html`<td class="num">${dur(items.reduce((a, i) => a + fixedOf(i), 0))}</td>` : ''}
         <td class="num">${logged ? dur(logged) : '—'}</td>
         <td class="num">${dur(todo)}</td>
         <td></td>${showResult ? html`<td></td>` : ''}<td></td>
@@ -5618,6 +5621,8 @@
 
   function renderWorklogPreview() {
     const el = $('#wl-preview');
+    if (!S.wl.man.open) renderManual(); // v0.8.5 (an open form is never re-rendered from here: typing)
+    else $('#wl-add-btn').disabled = S.wl.running;
     const { preview, previewLoading, previewError, result, running } = S.wl;
     const run = result || preview;
     const items = (run && Array.isArray(run.items)) ? run.items : [];
@@ -5666,7 +5671,7 @@
   }
 
   /* --- v0.8: worklog by role — role chips, fixed time (author / commenter) editors, related issues --- */
-  const ROLE_ORDER = ['dev', 'qa', 'reviewer', 'author', 'commenter'];
+  const ROLE_ORDER = ['dev', 'qa', 'reviewer', 'author', 'commenter', 'manual'];
   const fixedRoles = (it) => (Array.isArray(it && it.roles) ? it.roles : []).filter((r) => r === 'author' || r === 'commenter');
   function roleChips(it) {
     const have = Array.isArray(it && it.roles) ? it.roles : [];
@@ -5757,6 +5762,8 @@
       if (v && num(v.commentSeconds) != null) o.commentSeconds = num(v.commentSeconds);
       if (Object.keys(o).length) out.issues[key] = o;
     });
+    // v0.8.5: manual entries ride along unchanged (a fixed-time save must not drop them)
+    if (d && Array.isArray(d.manual) && d.manual.length) out.manual = d.manual.map((e) => ({ ...e, keys: (e.keys || []).slice() }));
     return out;
   }
   /** The stored value behind a field id, or null when not set. */
@@ -5855,6 +5862,224 @@
     if (S.wl.fx.saving) $('#wl-run-btn').disabled = true; // renderWorklogPreview() enables it again
   }
 
+  /* --- v0.8.5 manual entries: time on any issue (e.g. a meeting about a backlog issue) ---
+   * The block lives in #wl-manual, outside #wl-preview, so the frequent preview re-renders never touch
+   * the form being typed in. Entries are stored in the day's overrides (DayOverrides.manual). */
+  const MAN_ACTS = ['grooming', 'estimation', 'questions'];
+  const MAN_MAX_KEYS = 20;
+  const manEntries = () => { const d = S.wl.ov.data; return d && Array.isArray(d.manual) ? d.manual : []; };
+  /** A key's summary: picked in the form, else from the preview / related lists. */
+  function manName(key) {
+    const m = S.wl.man;
+    if (m.names[key]) return m.names[key];
+    const run = S.wl.preview;
+    const it = run && [...(run.items || []), ...(run.related || [])].find((x) => x.key === key);
+    return it ? it.summary || '' : '';
+  }
+  function manOpen(entry) {
+    const m = S.wl.man;
+    Object.assign(m, {
+      open: true, editId: entry ? entry.id : null, query: '', results: [], searching: false, searchError: null,
+      picks: entry ? entry.keys.slice() : [], time: entry ? jiraDur(entry.seconds) : '',
+      activity: entry ? entry.activity || '' : '', note: entry ? entry.note || '' : '', error: null,
+    });
+    renderManual();
+    const q = $('#man-q');
+    if (q) q.focus();
+  }
+  function manClose(focusAdd) {
+    clearTimeout(S.wl.man.timer);
+    S.wl.man.open = false;
+    S.wl.man.error = null;
+    renderManual();
+    if (focusAdd) $('#wl-add-btn').focus();
+  }
+  function renderManual() {
+    const el = $('#wl-manual');
+    if (!el) return;
+    const m = S.wl.man;
+    const ready = !!S.wl.ov.data && S.wl.ov.date === (S.wl.date || '');
+    const add = $('#wl-add-btn');
+    add.disabled = !ready || S.wl.running;
+    add.setAttribute('aria-expanded', m.open ? 'true' : 'false');
+    const list = ready ? manEntries() : [];
+    if (!list.length && !m.open) { el.textContent = ''; el.hidden = true; return; }
+    el.hidden = false;
+    setHTML(el, html`<div class="man">
+      ${list.length ? html`<h3 class="man-head">${t('worklog.man.listTitle', { n: list.length })}</h3><ul class="man-list" role="list">${list.map(manRow)}</ul>` : ''}
+      ${m.open ? manForm() : ''}
+    </div>`);
+  }
+  function manRow(e) {
+    const what = [e.activity ? t('worklog.man.act.' + e.activity) : '', e.note || ''].filter(Boolean).join(' · ');
+    return html`<li class="man-row">
+      <span class="man-time">${dur(e.seconds)}</span>
+      <span class="man-keys">${e.keys.map((k) => html`<button type="button" class="chip man-key" data-open-key="${k}" aria-haspopup="dialog" title="${manName(k)}">${k}</button>`)}</span>
+      <span class="man-what">${what || html`<span class="muted">${t('worklog.man.noActivity')}</span>`}${e.keys.length > 1 ? html`<span class="man-split">${t('worklog.man.splitN', { n: e.keys.length, each: dur(Math.floor(e.seconds / 60 / e.keys.length) * 60) })}</span>` : ''}</span>
+      <span class="man-acts">
+        <button type="button" class="icon-btn icon-btn-sm" data-man="edit" data-id="${e.id}" aria-label="${t('worklog.man.edit')}" title="${t('worklog.man.edit')}">${icon('pencil')}</button>
+        <button type="button" class="icon-btn icon-btn-sm" data-man="delete" data-id="${e.id}" aria-label="${t('worklog.man.delete')}" title="${t('worklog.man.delete')}">${icon('trash')}</button>
+      </span>
+    </li>`;
+  }
+  function manPicks() {
+    return html`${S.wl.man.picks.map((k) => html`<span class="chip man-pick" title="${manName(k)}"><span>${k}</span><button type="button" class="man-unpick" data-man="unpick" data-key="${k}" aria-label="${t('worklog.man.unpick', { key: k })}">${icon('x')}</button></span>`)}`;
+  }
+  function manResults() {
+    const m = S.wl.man;
+    if (m.searching) return html`<li class="man-res-state"><span class="spinner spinner-xs" aria-hidden="true"></span>${t('common.loading')}</li>`;
+    if (m.searchError) return html`<li class="man-res-state is-error">${errorText(m.searchError)}</li>`;
+    if (m.query.trim().length >= 2 && !m.results.length) return html`<li class="man-res-state">${t('worklog.man.noResults')}</li>`;
+    return html`${m.results.map((r) => {
+      const picked = m.picks.includes(r.key);
+      return html`<li><button type="button" class="man-res" data-man="pick" data-key="${r.key}" data-summary="${r.summary || ''}"${picked ? html` aria-pressed="true"` : ''}>
+        <span class="card-key">${r.key}</span><span class="man-res-sum">${r.summary || ''}</span>${r.status ? html`<span class="man-res-st">${nameOf(r.status)}</span>` : ''}${picked ? icon('check', 'man-res-check') : ''}
+      </button></li>`;
+    })}`;
+  }
+  function manForm() {
+    const m = S.wl.man;
+    return html`<form class="man-form" id="man-form" novalidate aria-labelledby="man-form-title">
+      <h3 class="man-head" id="man-form-title">${t(m.editId ? 'worklog.man.editTitle' : 'worklog.man.addTitle')}</h3>
+      <div class="man-field">
+        <label for="man-q">${t('worklog.man.issues')}</label>
+        <div class="man-picks" id="man-picks">${manPicks()}</div>
+        <input class="input" id="man-q" type="text" autocomplete="off" spellcheck="false" value="${m.query}" placeholder="${t('worklog.man.searchPh')}" aria-describedby="man-issues-hint" aria-controls="man-results">
+        <ul class="man-results" id="man-results" aria-live="polite">${manResults()}</ul>
+        <p class="hint" id="man-issues-hint">${t('worklog.man.issuesHint')}</p>
+      </div>
+      <div class="man-grid">
+        <div class="man-field"><label for="man-time">${t('worklog.man.time')}</label><input class="input man-time-in" id="man-time" value="${m.time}" placeholder="1h 30m" autocomplete="off" aria-describedby="man-time-hint"><p class="hint" id="man-time-hint">${t('worklog.man.timeHint')}</p></div>
+        <div class="man-field"><label for="man-act">${t('worklog.man.activity')}</label><select class="input select" id="man-act">${['', ...MAN_ACTS].map((a) => html`<option value="${a}"${a === m.activity ? html` selected` : ''}>${a ? t('worklog.man.act.' + a) : t('worklog.man.noActivity')}</option>`)}</select></div>
+        <div class="man-field man-note"><label for="man-note">${t('worklog.man.note')}</label><input class="input" id="man-note" maxlength="200" value="${m.note}" placeholder="${t('worklog.man.notePh')}" autocomplete="off"></div>
+      </div>
+      ${m.error ? html`<p class="inline-error" role="alert">${icon('alert')}<span>${m.error}</span></p>` : ''}
+      <div class="man-btns">
+        <button type="submit" class="btn btn-primary"${m.saving ? html` disabled aria-busy="true"` : ''}>${m.saving ? html`<span class="spinner spinner-xs" aria-hidden="true"></span>` : icon('check')}<span>${t(m.editId ? 'worklog.man.saveBtn' : 'worklog.man.addBtn')}</span></button>
+        <button type="button" class="btn" data-man="cancel">${t('common.cancel')}</button>
+      </div>
+    </form>`;
+  }
+  function manRenderPart(sel, content) { const el = $(sel); if (el) setHTML(el, content); }
+  function manSearch() {
+    const m = S.wl.man;
+    clearTimeout(m.timer);
+    const q = m.query.trim();
+    if (q.length < 2) { m.results = []; m.searching = false; m.searchError = null; manRenderPart('#man-results', manResults()); return; }
+    m.timer = setTimeout(async () => {
+      const seq = ++m.seq;
+      m.searching = true;
+      manRenderPart('#man-results', manResults());
+      try {
+        const refs = await api('searchIssuesFor', { purpose: 'link', project: '', query: q });
+        if (seq !== m.seq) return;
+        m.results = Array.isArray(refs) ? refs.slice(0, 20) : [];
+        m.searchError = null;
+      } catch (e) {
+        if (seq !== m.seq) return;
+        m.results = [];
+        m.searchError = e;
+      }
+      m.searching = false;
+      manRenderPart('#man-results', manResults());
+    }, 300);
+  }
+  function manPick(key, summary) {
+    const m = S.wl.man;
+    if (summary) m.names[key] = summary;
+    if (m.picks.includes(key)) m.picks = m.picks.filter((k) => k !== key);
+    else if (m.picks.length >= MAN_MAX_KEYS) { m.error = t('worklog.man.tooMany', { n: MAN_MAX_KEYS }); renderManual(); return; }
+    else m.picks.push(key);
+    m.error = null;
+    manRenderPart('#man-picks', manPicks());
+    manRenderPart('#man-results', manResults());
+  }
+  /** Saves the day's overrides with the manual list changed by fn (through the fixed-time save queue). */
+  function manSaveList(fn) {
+    const fx = S.wl.fx;
+    const date = S.wl.date || '';
+    const run = async () => {
+      const ov = S.wl.ov;
+      if (date !== (S.wl.date || '') || !ov.data) throw new Error(t('worklog.man.dayChanged'));
+      const next = normOverrides(ov.data);
+      next.manual = fn((next.manual || []).slice());
+      if (!next.manual.length) delete next.manual;
+      fx.saving = true;
+      fxRenderStatus();
+      try {
+        const res = await api('setWorklogOverrides', date ? { date, overrides: next } : { overrides: next });
+        if (date !== (S.wl.date || '')) return;
+        ov.seq++;
+        ov.data = normOverrides(res && typeof res === 'object' ? res : next);
+        ov.date = date;
+        ov.error = null;
+      } finally {
+        fx.saving = false;
+      }
+    };
+    const p = fx.queue.then(run);
+    fx.queue = p.catch(() => {});
+    return p.then(async () => { renderManual(); S.wl.result = null; await loadPreview({ keepOverrides: true }); });
+  }
+  async function manSubmit() {
+    const m = S.wl.man;
+    if (m.saving) return;
+    const sec = parseFixedDur(m.time);
+    let err = null;
+    if (!m.picks.length) err = t('worklog.man.needIssue');
+    else if (sec == null || Number.isNaN(sec) || sec < 60) err = t('worklog.man.needTime');
+    else if (sec > FX_MAX) err = t('worklog.fx.tooLong');
+    if (err) { m.error = err; renderManual(); const f = $(m.picks.length ? '#man-time' : '#man-q'); if (f) f.focus(); return; }
+    const entry = { id: m.editId || 'm' + Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36), keys: m.picks.slice(), seconds: sec };
+    if (m.activity) entry.activity = m.activity;
+    if (m.note.trim()) entry.note = m.note.trim();
+    m.saving = true;
+    m.error = null;
+    renderManual();
+    try {
+      await manSaveList((list) => (m.editId ? list.map((e) => (e.id === m.editId ? entry : e)) : [...list, entry]));
+      m.saving = false;
+      manClose(true);
+    } catch (e) {
+      m.saving = false;
+      m.error = t('worklog.fx.saveFailed', { error: errorText(e) });
+      renderManual();
+    }
+  }
+  async function manDelete(id) {
+    const old = manEntries().find((e) => e.id === id);
+    if (!old) return;
+    try { await manSaveList((list) => list.filter((e) => e.id !== id)); } catch (e) { toastError(t('worklog.man.deleteFailed'), e); return; }
+    toast(t('worklog.man.deleted'), { tone: 'success', action: { label: t('worklog.undo'), run: () => manSaveList((list) => [...list, old]).catch((e) => toastError(t('worklog.man.deleteFailed'), e)) } });
+  }
+  function onManualClick(e) {
+    const b = e.target.closest('[data-man]');
+    if (!b) return;
+    switch (b.dataset.man) {
+      case 'pick': manPick(b.dataset.key, b.dataset.summary); break;
+      case 'unpick': manPick(b.dataset.key); { const q = $('#man-q'); if (q) q.focus(); } break;
+      case 'cancel': manClose(true); break;
+      case 'edit': manOpen(manEntries().find((x) => x.id === b.dataset.id)); break;
+      case 'delete': manDelete(b.dataset.id); break;
+      default:
+    }
+  }
+  function onManualInput(e) {
+    const m = S.wl.man;
+    const id = e.target.id;
+    if (id === 'man-q') { m.query = e.target.value; manSearch(); }
+    else if (id === 'man-time') m.time = e.target.value;
+    else if (id === 'man-note') m.note = e.target.value;
+    else if (id === 'man-act') m.activity = e.target.value;
+  }
+  function onManualKey(e) {
+    if (e.target.id === 'man-q' && e.key === 'Enter') { // Enter in the search picks the first result instead of submitting
+      e.preventDefault();
+      const r = S.wl.man.results.find((x) => !S.wl.man.picks.includes(x.key));
+      if (r) { manPick(r.key, r.summary); S.wl.man.query = ''; e.target.value = ''; }
+    } else if (e.key === 'Escape' && S.wl.man.open) { e.preventDefault(); e.stopPropagation(); manClose(true); }
+  }
+
   async function loadOverrides() {
     const ov = S.wl.ov;
     const date = S.wl.date || '';
@@ -5871,7 +6096,7 @@
       ov.data = null;
       ov.error = e;
     } finally {
-      if (seq === ov.seq) { ov.loading = false; ov.date = date; if (S.view === 'worklog') renderWorklogPreview(); }
+      if (seq === ov.seq) { ov.loading = false; ov.date = date; if (S.view === 'worklog') { renderWorklogPreview(); if (!S.wl.man.open) renderManual(); } }
     }
   }
 
@@ -5886,6 +6111,8 @@
     S.wl.ov.error = null;
     S.wl.ov.loading = false;
     S.wl.ov.date = null;
+    if (S.wl.man.open) { clearTimeout(S.wl.man.timer); S.wl.man.open = false; } // the form belongs to the previous day
+    renderManual();
   }
 
   /** Validates a field's text and queues the save. via = "timer" (still typing: the text stays as typed) | "commit". */
@@ -7438,6 +7665,14 @@
     $('#view-worklog').addEventListener('input', onWorklogFxInput);
     $('#view-worklog').addEventListener('keydown', onWorklogFxKey);
     $('#view-worklog').addEventListener('focusout', onWorklogFxBlur);
+    // v0.8.5 manual entries
+    $('#wl-add-btn').addEventListener('click', () => { if (S.wl.man.open) { const q = $('#man-q'); if (q) q.focus(); } else manOpen(null); });
+    const wlMan = $('#wl-manual');
+    wlMan.addEventListener('click', onManualClick);
+    wlMan.addEventListener('input', onManualInput);
+    wlMan.addEventListener('change', onManualInput);
+    wlMan.addEventListener('keydown', onManualKey);
+    wlMan.addEventListener('submit', (e) => { e.preventDefault(); manSubmit(); });
     $('#view-worklog').addEventListener('toggle', (e) => { if (e.target.id === 'wl-related') S.wl.relatedOpen = e.target.open; if (e.target.id === 'wl-excluded') S.wl.excludedOpen = e.target.open; }, true);
 
     // Notifications
