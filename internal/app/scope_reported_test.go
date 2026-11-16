@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"jiraffe/internal/jira"
 )
 
 func TestParseScopeAcceptsReported(t *testing.T) {
@@ -26,7 +28,7 @@ func TestParseScopeAcceptsReported(t *testing.T) {
 }
 
 func TestReportedScopeQueries(t *testing.T) {
-	got := ProjectBoardJQL(ScopeReported, "MB", "assignee = currentUser() ORDER BY updated DESC")
+	got := ProjectBoardJQL(ScopeReported, "MB", "assignee = currentUser() ORDER BY updated DESC", MineCond(jira.FieldIDs{}))
 	want := `project = "MB" AND reporter = currentUser() AND (statusCategory != Done OR ` + recentlyDone + ")"
 	if got != want {
 		t.Errorf("project board:\n got %s\nwant %s", got, want)

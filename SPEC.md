@@ -1818,3 +1818,12 @@ Methods:
   own edits, transitions and comments found by the comment poll drop them (also the epic info).
 - A project board whose layout was degraded by a transient failure expires with the layout (metaRetryTTL, a
   minute), so the layout is still retried after a minute.
+
+## v0.8.3 — "Only mine" = my roles
+
+- Scope "mine" of the board (tracked and project boards) and of the sprints: I am the assignee **or** in the
+  Developer / QA / Reviewer field (`MineCond`: `(assignee = currentUser() OR cf[DEV] = currentUser() OR cf[QA] =
+  currentUser() OR cf[REV] = currentUser())`, absent fields left out; not reporter, not commenter).
+- The configurable board query (`boardJql`) keeps working: each `assignee = currentUser()` in it (any case, spaces
+  around `=`) is widened to that condition (`WithMyRoles`); other forms are left as written.
+- The "mine" marker of cards (assignee) and the Epics view are unchanged.

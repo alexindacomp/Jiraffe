@@ -75,7 +75,7 @@ type sprintIssue struct {
 const (
 	openSprintsClause = " AND (sprint in openSprints() OR sprint in futureSprints())"
 	backlogClause     = " AND statusCategory != Done AND (sprint is EMPTY OR sprint not in (openSprints(), futureSprints()))"
-	mineClause        = " AND assignee = currentUser()"
+	mineClause        = " AND assignee = currentUser()" // "mine" without role fields (v0.8.3: MineCond)
 	reportedClause    = " AND reporter = currentUser()"
 )
 
@@ -132,7 +132,7 @@ func (a *App) getSprintGroups(ctx context.Context, project, scope string, includ
 	mine := ""
 	switch scope {
 	case ScopeMine:
-		mine = mineClause
+		mine = " AND " + a.mineCond(ctx, c, id) // = mineClause without role fields
 	case ScopeReported:
 		mine = reportedClause
 	}

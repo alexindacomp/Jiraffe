@@ -274,10 +274,94 @@ func boardCacheKey(scope, project string, boardID int) string {
 	return cacheBoard + ":" + scope + ":" + project + ":" + strconv.Itoa(boardID)
 }
 
+// MineCond is the "mine" condition (v0.8.3): I am the assignee or in a
+// people field of my roles (Developer, QA, Reviewer; absent fields are left
+// out) — not the reporter or a commenter.
+func MineCond(f jira.FieldIDs) string {
+	c := "assignee = currentUser()"
+	n := 0
+	for _, id := range []string{f.Developer, f.QA, f.Reviewer} {
+		if cf := cfClause(id); cf != "" {
+			c += " OR " + cf + " = currentUser()"
+			n++
+		}
+	}
+	if n == 0 {
+		return c
+	}
+	return "(" + c + ")"
+}
+
+// WithMyRoles replaces "assignee = currentUser()" (any case and spacing
+// around "=") in a board query by mine, so the default "mine" board query
+// and custom ones built on it also find the issues of my roles.
+func WithMyRoles(jql, mine string) string {
+	const want = "assignee=currentuser()"
+	var b strings.Builder
+	for i := 0; i < len(jql); {
+		if end, ok := matchFold(jql, i, want); ok {
+			b.WriteString(mine)
+			i = end
+			continue
+		}
+		b.WriteByte(jql[i])
+		i++
+	}
+	return b.String()
+}
+
+// matchFold matches want (ASCII lower case, no spaces) at jql[i:], ignoring
+// ASCII case and spaces around '='; it returns the end of the match.
+func matchFold(jql string, i int, want string) (int, bool) {
+	if i > 0 && isIdent(jql[i-1]) {
+		return 0, false
+	}
+	for k := 0; k < len(want); k++ {
+		if want[k] == '=' {
+			for i < len(jql) && jql[i] == ' ' {
+				i++
+			}
+		}
+		if i >= len(jql) || lowerASCII(jql[i]) != want[k] {
+			return 0, false
+		}
+		i++
+		if want[k] == '=' {
+			for i < len(jql) && jql[i] == ' ' {
+				i++
+			}
+		}
+	}
+	return i, true
+}
+
+func lowerASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + 'a' - 'A'
+	}
+	return b
+}
+
+func isIdent(b byte) bool {
+	return b == '_' || b == '.' || b >= '0' && b <= '9' || lowerASCII(b) >= 'a' && lowerASCII(b) <= 'z'
+}
+
+// mineCond is MineCond of the connection's fields; without them (discovery
+// failed) only the assignee.
+func (a *App) mineCond(ctx context.Context, c *jira.Client, identity string) string {
+	m, err := a.metaFor(ctx, c, identity)
+	if err != nil {
+		log.Printf("mine condition: %v", err)
+		return MineCond(jira.FieldIDs{})
+	}
+	return MineCond(m.fields)
+}
+
 // ProjectBoardJQL is the query of a project board without ORDER BY: not-done
 // issues plus those done in the last 14 days. "mine" uses the condition of
-// boardJQL (its ORDER BY dropped) and adds my recently done issues.
-func ProjectBoardJQL(scope, project, boardJQL string) string {
+// boardJQL (its ORDER BY dropped; "assignee = currentUser()" widened to
+// mine, see WithMyRoles) and adds my recently done issues.
+func ProjectBoardJQL(scope, project, boardJQL, mine string) string {
 	p := "project = " + quoteKeys([]string{project})
 	if scope == ScopeAll {
 		return p + " AND (statusCategory != Done OR " + recentlyDone + ")"
@@ -286,9 +370,9 @@ func ProjectBoardJQL(scope, project, boardJQL string) string {
 		return p + " AND reporter = currentUser() AND (statusCategory != Done OR " + recentlyDone + ")"
 	}
 	if w := jqlWhere(boardJQL); w != "" {
-		return p + " AND ((" + w + ") OR (assignee = currentUser() AND statusCategory = Done AND " + recentlyDone + "))"
+		return p + " AND ((" + WithMyRoles(w, mine) + ") OR (" + mine + " AND statusCategory = Done AND " + recentlyDone + "))"
 	}
-	return p + " AND assignee = currentUser() AND (statusCategory != Done OR " + recentlyDone + ")"
+	return p + " AND " + mine + " AND (statusCategory != Done OR " + recentlyDone + ")"
 }
 
 // jqlWhere returns the condition of a JQL query: the text before its
@@ -388,6 +472,9 @@ func (a *App) getBoard(ctx context.Context, force bool, scope, project string, b
 	}
 	b := &Board{Columns: []Column{}, FetchedAt: now.Format(time.RFC3339), Scope: scope}
 	jql, limit := a.cfg.Get().BoardJQL, mineBoardMax
+	if scope == ScopeMine {
+		jql = WithMyRoles(jql, a.mineCond(ctx, c, id))
+	}
 	if scope == ScopeReported {
 		jql = ReportedBoardJQL
 	}
@@ -443,7 +530,7 @@ func (a *App) projectBoard(ctx context.Context, c *jira.Client, id, scope, proje
 	if err != nil {
 		return nil, err
 	}
-	res, err := searchRanked(ctx, c, ProjectBoardJQL(scope, project, a.cfg.Get().BoardJQL),
+	res, err := searchRanked(ctx, c, ProjectBoardJQL(scope, project, a.cfg.Get().BoardJQL, a.mineCond(ctx, c, id)),
 		jira.SearchOptions{Fields: v.fields(boardFields, false), Limit: projectBoardMax})
 	if err != nil {
 		return nil, err

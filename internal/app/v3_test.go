@@ -431,7 +431,7 @@ func TestProjectBoardJQL(t *testing.T) {
 		{ScopeMine, ` ORDER BY Rank`, `project = "MB" AND assignee = currentUser() AND (statusCategory != Done OR updated >= -14d)`},
 		{ScopeMine, `myorder by x`, `project = "MB" AND ((myorder by x) OR (assignee = currentUser() AND statusCategory = Done AND updated >= -14d))`},
 	} {
-		if got := ProjectBoardJQL(c.scope, "MB", c.boardJQL); got != c.want {
+		if got := ProjectBoardJQL(c.scope, "MB", c.boardJQL, MineCond(jira.FieldIDs{})); got != c.want {
 			t.Errorf("%s %q:\n got %s\nwant %s", c.scope, c.boardJQL, got, c.want)
 		}
 	}
