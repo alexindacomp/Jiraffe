@@ -484,11 +484,14 @@ func (c *Client) Worklogs(ctx context.Context, key string) ([]Worklog, error) {
 }
 
 // AddWorklog logs seconds on an issue starting at started.
-func (c *Client) AddWorklog(ctx context.Context, key string, seconds int64, started time.Time) error {
+func (c *Client) AddWorklog(ctx context.Context, key string, seconds int64, started time.Time, comment string) error {
 	if !ValidIssueKey(key) {
 		return &Error{Code: CodeBadRequest, Kind: KindInvalidKey, Message: "invalid issue key " + strconv.Quote(key)}
 	}
 	body := map[string]any{"timeSpentSeconds": seconds, "started": FormatTime(started)}
+	if comment != "" {
+		body["comment"] = comment
+	}
 	return c.do(ctx, "POST", "/rest/api/2/issue/"+url.PathEscape(key)+"/worklog", nil, body, nil)
 }
 

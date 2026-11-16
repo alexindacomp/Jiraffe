@@ -123,3 +123,17 @@ func keys(m map[string]DayOverrides) []string {
 	}
 	return out
 }
+
+// v0.8.1: excluded issues merge per key, the later change wins.
+func TestMergeExcluded(t *testing.T) {
+	mine := map[string]ExcludedIssue{"A-1": {Excluded: true, At: "2026-11-16T10:00:00Z"}, "B-2": {Excluded: true, At: "2026-11-16T10:00:00Z"}}
+	disk := map[string]ExcludedIssue{"A-1": {Excluded: false, At: "2026-11-16T11:00:00Z"}, "B-2": {Excluded: false, At: "2026-11-16T09:00:00Z"}, "C-3": {Excluded: true, At: "2026-11-16T08:00:00Z"}}
+	out, n := mergeExcluded(mine, disk)
+	if n != 2 || out["A-1"].Excluded || !out["B-2"].Excluded || !out["C-3"].Excluded {
+		t.Errorf("n=%d %+v", n, out)
+	}
+	d := Data{WorklogExcluded: out}
+	if ex := d.Excluded(); len(ex) != 2 || !ex["B-2"] || !ex["C-3"] {
+		t.Errorf("excluded %v", ex)
+	}
+}

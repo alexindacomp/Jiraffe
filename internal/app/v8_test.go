@@ -494,3 +494,73 @@ func TestKnownStatuses(t *testing.T) {
 		t.Error("no known status: no past query")
 	}
 }
+
+// v0.8.1: an excluded issue gets no time (also no fixed time) and the
+// others get the day; putting it back restores it. Bad params are rejected.
+func TestV81ExcludedIssues(t *testing.T) {
+	fj := &fakeJira{
+		issues:   issuesJSON(allDayA1),
+		created:  issuesJSON(createdJSON("N-2", "2026-11-11T11:00:00.000+0200", alexJSON)),
+		worklogs: map[string][]jira.Worklog{},
+	}
+	a := openApp(t, t.TempDir(), fj, &fakeClock{t: time.Date(2026, 11, 11, 18, 0, 0, 0, zone)}, nil)
+	ctx := context.Background()
+	call := func(params string) []ExcludedDTO {
+		t.Helper()
+		res, err := a.Call(ctx, "setWorklogExcluded", json.RawMessage(params))
+		if err != nil {
+			t.Fatalf("%s: %v", params, err)
+		}
+		return res.([]ExcludedDTO)
+	}
+	l := call(`{"key":"A-1","summary":"Stale task","excluded":true}`)
+	if len(l) != 1 || l[0].Key != "A-1" || l[0].Summary != "Stale task" {
+		t.Fatalf("list %+v", l)
+	}
+	if got, want := runItems(preview(t, a)), "N-2 [author] todo=900 share=0 fixed=900"; got != want {
+		t.Errorf("excluded\n got  %s\n want %s", got, want)
+	}
+	if l := call(`{"key":"A-1","excluded":false}`); len(l) != 0 {
+		t.Errorf("after re-include %+v", l)
+	}
+	if got := runItems(preview(t, a)); !strings.HasPrefix(got, "A-1 [dev]") {
+		t.Errorf("re-included: %s", got)
+	}
+	res, err := a.Call(ctx, "getWorklogExcluded", nil)
+	if err != nil || len(res.([]ExcludedDTO)) != 0 {
+		t.Errorf("get %v %v", res, err)
+	}
+	for _, p := range []string{`{"key":"a-1","excluded":true}`, `{"key":"A-1"}`, `{"excluded":true}`, `{"key":"A-1","excluded":"yes"}`} {
+		if _, err := a.Call(ctx, "setWorklogExcluded", json.RawMessage(p)); ToError(err).Code != CodeBadParams {
+			t.Errorf("%s: %v, want bad_params", p, err)
+		}
+	}
+}
+
+// v0.8.2: each worklog carries a short description in the comment
+// language (settings; "" = the interface language), also in the preview.
+func TestV82WorklogComments(t *testing.T) {
+	fj := &fakeJira{
+		issues:  issuesJSON(allDayA1),
+		created: issuesJSON(createdJSON("N-2", "2026-11-11T11:00:00.000+0200", alexJSON)),
+		commented: issuesJSON(commentsJSON("C-3", 2,
+			"alex@2026-11-11T16:20:00.000+0200", "alex@2026-11-11T10:15:00.000+0200")),
+		worklogs: map[string][]jira.Worklog{},
+	}
+	a := openApp(t, t.TempDir(), fj, &fakeClock{t: time.Date(2026, 11, 11, 18, 0, 0, 0, zone)}, nil)
+	if c := itemsByKey(preview(t, a))["A-1"].Comment; c != "Разработка" {
+		t.Errorf("preview comment %q", c)
+	}
+	s := a.cfg.Get()
+	s.WorklogCommentLanguage = "en"
+	if _, errs, err := a.cfg.Save(s, nil); err != nil || len(errs) > 0 {
+		t.Fatal(errs, err)
+	}
+	if _, err := a.Call(context.Background(), "worklogRun", nil); err != nil {
+		t.Fatal(err)
+	}
+	want := "A-1: Development|N-2: Issue creation|C-3: Comments (2)"
+	if got := strings.Join(fj.postedComments, "|"); got != want {
+		t.Errorf("posted comments\n got  %s\n want %s", got, want)
+	}
+}

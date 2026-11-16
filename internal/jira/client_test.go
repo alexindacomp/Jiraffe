@@ -110,7 +110,7 @@ func TestSearchPaginatesAndAuthenticates(t *testing.T) {
 func TestAddWorklogBody(t *testing.T) {
 	ft := &fakeTransport{fn: func(*Request) (*Response, error) { return &Response{StatusCode: 201, Body: []byte(`{}`)}, nil }}
 	started := time.Date(2026, 11, 11, 9, 0, 0, 0, time.FixedZone("", 2*3600))
-	if err := New("https://sd.local", "t", ft).AddWorklog(context.Background(), "PROJ-7", 7200, started); err != nil {
+	if err := New("https://sd.local", "t", ft).AddWorklog(context.Background(), "PROJ-7", 7200, started, ""); err != nil {
 		t.Fatal(err)
 	}
 	r := ft.reqs[0]

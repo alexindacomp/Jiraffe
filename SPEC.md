@@ -1782,3 +1782,31 @@ Methods:
 4. Re-running a day logs nothing new; the cap is never exceeded.
 5. Settings: new fields validated, saved, defaults for old files; Dev statuses = existing `inProgressStatuses`.
 6. `./build.sh --check` passes; the exe stays < 5 MiB; no `regexp`.
+
+## v0.8.1 — excluded issues, links
+
+- **Exclude from the worklog.** A preview row's ⊘ button takes the issue out of the worklog until it is returned:
+  no status share, no fixed time (its time already logged that day still counts against the cap, as "other").
+  Stored in `state.json` → `worklogExcluded` (key → `{summary, excluded, at}`; per key the later change wins on
+  merge; `excluded:false` records a return). Excluded issues are also left out of `related`.
+  - `getWorklogExcluded` → `[{key, summary, at}]` (most recent first);
+  - `setWorklogExcluded {key, summary?, excluded}` → the new list (`bad_params`: bad key, `excluded` not a boolean).
+  - UI: a collapsible "Исключены из учёта времени (N)" list under the preview with "Вернуть"; a toast with "Отменить".
+- **Links.** Worklog rows (preview and history): key / summary open the drawer; an "Open in Jira" button
+  (`<jiraUrl>/browse/<key>`). The drawer header gets a "copy issue link" button.
+
+## v0.8.2 — worklog descriptions
+
+- Every worklog sent to Jira carries a short `comment`, built from what its time is for: the status roles when the
+  issue has status time (share ≥ 1 min) — "Разработка" / "Тестирование" / "Код-ревью" —, "создание задачи" with
+  create time, "комментарии (N)" with comment time; parts joined with "; ", the first capitalised
+  (`worklog.Describe`). Nothing to describe ⇒ no comment.
+- en: development, testing, code review, issue creation, comments (N); uk: розробка, тестування, код-рев'ю,
+  створення задачі, коментарі (N).
+- `WorklogItem.comment` (omitted when empty) shows the text in the preview and the history.
+- Setting `worklogCommentLanguage`: "" (default = the interface language), "ru", "uk", "en"; Settings → Roles.
+- **Update check every 10 minutes** (was: once a day). The first automatic check of a session uses the API
+  (`releases/latest`). Later ones first read the redirect of `https://github.com/alexindacomp/Jiraffe/releases/latest`
+  (→ `…/releases/tag/vX.Y.Z`, not followed; github.com pages are not counted against the API's 60 requests/hour
+  per IP — many users behind one office IP); same version ⇒ only the check time is recorded, nothing is announced
+  again; another version, a failed probe or no earlier successful check ⇒ the full API check.

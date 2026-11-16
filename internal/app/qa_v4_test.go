@@ -499,7 +499,7 @@ func TestV4QAPlainTextEdgeCases(t *testing.T) {
 // The SPEC's schedule: first check 30 s after start, then a look every
 // 15 min whether a day of uptime has passed; exe.old kept 10 minutes.
 func TestV4QAUpdateTimingDefaults(t *testing.T) {
-	if updateStartDelay != 30*time.Second || updateTick != 15*time.Minute || updateEvery != 24*time.Hour || keepOldFor != 10*time.Minute {
+	if updateStartDelay != 30*time.Second || updateTick != time.Minute || updateEvery != 10*time.Minute || keepOldFor != 10*time.Minute {
 		t.Errorf("start delay %s, tick %s, every %s, keep old %s", updateStartDelay, updateTick, updateEvery, keepOldFor)
 	}
 }

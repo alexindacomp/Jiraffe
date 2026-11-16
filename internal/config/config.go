@@ -55,7 +55,7 @@ type Settings struct {
 	// comment alerts are limited to. nil (JSON null) = not initialised yet.
 	// Store.Save never changes it; use Store.UpdateTrackedProjects.
 	TrackedProjects []string `json:"trackedProjects"`
-	// AutoCheckUpdates enables the update check at startup and once a day.
+	// AutoCheckUpdates enables the update check at startup and every 10 minutes.
 	AutoCheckUpdates bool `json:"autoCheckUpdates"`
 	// Worklog roles (v0.8): the statuses counted for the QA / Reviewer roles
 	// (empty = role off; InProgressStatuses are the Dev statuses) and the
@@ -65,6 +65,9 @@ type Settings struct {
 	ReviewStatuses []string `json:"reviewStatuses"`
 	AuthorMinutes  int      `json:"authorMinutes"`
 	CommentMinutes int      `json:"commentMinutes"`
+	// WorklogCommentLanguage is the language of the worklog descriptions
+	// (v0.8.2): "ru", "uk", "en" or "" = the interface language.
+	WorklogCommentLanguage string `json:"worklogCommentLanguage"`
 }
 
 // Limits of the status lists and the fixed worklog minutes.
@@ -189,6 +192,7 @@ func effectivePort(u *url.URL) string {
 func (s *Settings) Normalize() {
 	s.JiraURL = NormalizeURL(s.JiraURL)
 	s.Language = strings.ToLower(strings.TrimSpace(s.Language))
+	s.WorklogCommentLanguage = strings.ToLower(strings.TrimSpace(s.WorklogCommentLanguage))
 	for _, p := range []*string{&s.WorklogTime, &s.WorkdayStart, &s.WorkdayEnd, &s.LunchStart, &s.LunchEnd} {
 		*p = strings.TrimSpace(*p)
 	}
@@ -272,6 +276,9 @@ func (s Settings) Validate() []FieldError {
 	}
 	if s.Language != "ru" && s.Language != "uk" && s.Language != "en" {
 		add("language", "language")
+	}
+	if l := s.WorklogCommentLanguage; l != "" && l != "ru" && l != "uk" && l != "en" {
+		add("worklogCommentLanguage", "language")
 	}
 	clocks := map[string]int{}
 	for _, f := range []struct {
@@ -498,6 +505,8 @@ func repair(s Settings, errs []FieldError) Settings {
 			s.JiraURL = d.JiraURL
 		case "language":
 			s.Language = d.Language
+		case "worklogCommentLanguage":
+			s.WorklogCommentLanguage = ""
 		case "worklogTime":
 			s.WorklogTime = d.WorklogTime
 			if wt, err := ParseClock(s.WorklogTime); err == nil {

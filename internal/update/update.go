@@ -22,6 +22,9 @@ const (
 	LatestURL = "https://api.github.com/repos/alexindacomp/Jiraffe/releases/latest"
 	// ReleasesURL prefixes the release pages; openUrl may open URLs below it.
 	ReleasesURL = "https://github.com/alexindacomp/Jiraffe/releases/"
+	// LatestPageURL redirects to the latest release's tag page; reading the
+	// redirect is a cheap version probe outside the rate-limited API (v0.8.1).
+	LatestPageURL = ReleasesURL + "latest"
 	// downloadPrefix is where the release assets must be downloaded from.
 	downloadPrefix = ReleasesURL + "download/"
 

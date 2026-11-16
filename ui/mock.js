@@ -554,6 +554,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     reviewStatuses: ['Review', 'In Review', 'Code Review'],
     authorMinutes: 15,
     commentMinutes: 5,
+    worklogCommentLanguage: '', // v0.8.2: "" = the interface language
     notifyComments: true,
     commentPollMinutes: 5,
     boardJql: 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC',
@@ -719,6 +720,23 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     return run;
   }
 
+  // v0.8.2: the worklog description (same rules as worklog.Describe)
+  const DESCRIBE = {
+    en: { dev: 'development', qa: 'testing', reviewer: 'code review', author: 'issue creation', commenter: 'comments' },
+    ru: { dev: 'разработка', qa: 'тестирование', reviewer: 'код-ревью', author: 'создание задачи', commenter: 'комментарии' },
+    uk: { dev: 'розробка', qa: 'тестування', reviewer: "код-рев'ю", author: 'створення задачі', commenter: 'коментарі' },
+  };
+  function mockDescribe(i) {
+    const ph = DESCRIBE[settings.worklogCommentLanguage || settings.language] || DESCRIBE.en;
+    const roles = i.roles || [];
+    const parts = [];
+    if ((i.shareSeconds || 0) >= 60) ['dev', 'qa', 'reviewer'].forEach((r) => { if (roles.includes(r)) parts.push(ph[r]); });
+    if (i.createSeconds > 0 && roles.includes('author')) parts.push(ph.author);
+    if (i.commentSeconds > 0 && roles.includes('commenter')) parts.push(ph.commenter + (i.comments ? ` (${i.comments})` : ''));
+    const s = parts.join('; ');
+    return s ? s[0].toUpperCase() + s.slice(1) : '';
+  }
+  const excludedIssues = new Map(); // v0.8.1: key → { key, summary, at }
   function buildRun(trigger, date) {
     if (date && date !== isoDay(now())) return buildPastRun(trigger, date);
     const d = now();
@@ -727,9 +745,10 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     if (reason) { run.skippedReason = reason; return run; }
     if (OTHER_LOGGED !== undefined) run.otherLoggedSeconds = OTHER_LOGGED;
     const capLeft = Math.max(0, capSec() - (OTHER_LOGGED || 0) - [...loggedToday.values()].reduce((a, b) => a + b, 0));
-    const items = roleItems(d, SHARES, FIXED.today);
+    const items = roleItems(d, SHARES, FIXED.today).filter((i) => !excludedIssues.has(i.key)); // v0.8.1
     items.forEach((i) => { i.loggedSeconds = loggedToday.get(i.key) || 0; });
     allocate(items, capLeft);
+    items.forEach((i) => { i.comment = mockDescribe(i); }); // v0.8.2
     run.items = items;
     run.totalSeconds = items.reduce((a, i) => a + i.todoSeconds, 0);
     run.total = fmt(run.totalSeconds);
@@ -1629,6 +1648,15 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       const run = buildRun('preview', date);
       if (!run.skippedReason) run.related = relatedOf(run); // v0.8: preview only, never stored in history
       return run;
+    },
+    /* --- v0.8.1 issues excluded from the worklog --- */
+    getWorklogExcluded() { return [...excludedIssues.values()].reverse().map(clone); },
+    setWorklogExcluded(p) {
+      const key = p && p.key;
+      if (typeof key !== 'string' || !/^[A-Z][A-Z0-9_]*-\d+$/.test(key) || typeof (p && p.excluded) !== 'boolean') throw new MockError('bad_params', 'Invalid parameters');
+      if (p.excluded) excludedIssues.set(key, { key, summary: String(p.summary || '').slice(0, 300), at: new Date().toISOString() });
+      else excludedIssues.delete(key);
+      return [...excludedIssues.values()].reverse().map(clone);
     },
     /* --- v0.8 fixed-time overrides (state.json worklogOverrides) --- */
     getWorklogOverrides(p) {

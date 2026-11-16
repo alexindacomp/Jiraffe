@@ -1435,6 +1435,19 @@ input.input::-webkit-calendar-picker-indicator { opacity: .6; cursor: pointer; }
 .wl-rel-row:hover { background: var(--surface-hover); }
 .wl-rel-sum { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wl-rel-status { font-size: var(--fs-sm); color: var(--text-3); white-space: nowrap; }
+/* v0.8.1: worklog rows open the issue; actions (Jira, exclude) at the row end; the excluded list */
+.wl-open { all: unset; cursor: pointer; border-radius: 4px; }
+.wl-open.sum { display: -webkit-box; color: inherit; }
+.wl-open:hover { text-decoration: underline; text-underline-offset: 2px; }
+.wl-open:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.wl-acts { width: 1%; white-space: nowrap; }
+.wl-desc { font-size: var(--fs-sm); color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } /* v0.8.2: the worklog description */
+.wl-acts-in { display: inline-flex; gap: 2px; opacity: .55; transition: opacity var(--dur-1) var(--ease-out); }
+tr:hover .wl-acts-in, .wl-acts-in:focus-within { opacity: 1; }
+.wl-excluded { margin-top: var(--sp-3); }
+.wl-excluded-hint { margin: var(--sp-1) 0 var(--sp-1) calc(16px + var(--sp-2)); }
+.wl-ex-li { display: flex; align-items: center; gap: var(--sp-2); }
+.wl-ex-li .wl-rel-row { flex: 1; min-width: 0; grid-template-columns: auto minmax(0, 1fr); }
 
 /* ---------- Notifications ---------- */
 .list-head { display: flex; align-items: center; gap: var(--sp-3); }

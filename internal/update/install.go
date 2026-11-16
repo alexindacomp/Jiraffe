@@ -176,6 +176,36 @@ func (u *Updater) Latest(ctx context.Context) (*Release, error) {
 	return ParseRelease(buf.Bytes())
 }
 
+// LatestVersion returns the version of the latest release from the
+// redirect of LatestPageURL (…/releases/tag/vX.Y.Z) without following it:
+// github.com pages are not counted against the API's 60 requests per hour,
+// so frequent checks only call Latest when the version changed.
+func (u *Updater) LatestVersion(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, u.c.CheckTimeout)
+	defer cancel()
+	status, loc, err := u.c.Getter.Get(ctx, LatestPageURL, nil, io.Discard, maxReleaseJSON)
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "", &Error{Code: CodeNetwork, Detail: "timeout", Err: ErrTimeout}
+	case ctx.Err() != nil:
+		return "", &Error{Code: CodeCancelled, Err: ctx.Err()}
+	case err != nil && !errors.Is(err, ErrTooLarge):
+		return "", &Error{Code: CodeNetwork, Err: err}
+	case status < 300 || status >= 400 || status == 304:
+		return "", &Error{Code: CodeHTTP, Detail: "HTTP " + strconv.Itoa(status) + " from " + hostOf(LatestPageURL)}
+	}
+	next, err := resolve(LatestPageURL, loc)
+	prefix := ReleasesURL + "tag/v"
+	if err != nil || !strings.HasPrefix(next, prefix) {
+		return "", badRelease("unexpected latest release page %q", loc)
+	}
+	v := strings.TrimPrefix(next, prefix)
+	if _, ok := ParseVersion(v); !ok {
+		return "", badRelease("unexpected latest version %q", v)
+	}
+	return v, nil
+}
+
 // Progress reports the download: received of total bytes.
 type Progress func(received, total int64)
 

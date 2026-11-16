@@ -447,14 +447,15 @@ func TestUpdateAutoCheckSchedule(t *testing.T) {
 		checks int
 	}{
 		{0, true, 1},                 // first check of the session
-		{time.Hour, true, 1},         // within a day: no
-		{23 * time.Hour, true, 1},    // still within a day
-		{24 * time.Hour, true, 2},    // a day later: again
-		{30 * time.Hour, true, 2},    //
-		{50 * time.Hour, false, 2},   // setting off: never
-		{-time.Hour, true, 3},        // clock went back: check
-		{-30 * time.Minute, true, 3}, // …but not again right away
+		{5 * time.Minute, true, 1},   // within 10 minutes: no
+		{9 * time.Minute, true, 1},   // still within
+		{10 * time.Minute, true, 1},  // due, but the probe sees the same version: no API call
+		{12 * time.Minute, true, 1},  //
+		{50 * time.Minute, false, 1}, // setting off: never
+		{-time.Hour, true, 1},        // clock went back: due, probe again
+		{-58 * time.Minute, true, 1}, // …but not again right away
 	}
+	serveLatestPage(e.gh, "0.4.0")
 	for i, s := range steps {
 		if !s.auto {
 			cur := e.a.cfg.Get()
@@ -475,11 +476,48 @@ func TestUpdateAutoCheckSchedule(t *testing.T) {
 	}
 	// A failed automatic check: no balloon, no event, result stored.
 	e.gh.set(update.LatestURL, ghResp{status: 500})
+	e.gh.set(update.LatestPageURL, ghResp{status: 500}) // the probe fails too: full check
 	e.clock.t = t0.Add(100 * time.Hour)
 	e.a.autoCheck(context.Background())
 	if c := e.a.st.Snapshot().UpdateCheck; c == nil || c.OK || len(e.plat.notices) != 0 || len(e.rec.of("updateFailed")) != 0 {
 		t.Errorf("failed auto check: %+v notices %+v", c, e.plat.notices)
 	}
+}
+
+// serveLatestPage makes the release page redirect to version's tag.
+func serveLatestPage(g *fakeGitHub, version string) {
+	g.set(update.LatestPageURL, ghResp{status: 302, loc: update.ReleasesURL + "tag/v" + version})
+}
+
+// v0.8.1: checks every 10 minutes probe the release page; the API is only
+// called for the first check of the session, a new version, or a failed probe.
+func TestUpdateProbeAvoidsAPI(t *testing.T) {
+	e := newUpdateApp(t, nil)
+	serveRelease(e.gh, "0.5.0", fakeExe(10, 1))
+	serveLatestPage(e.gh, "0.5.0")
+	t0 := e.clock.t
+	check := func(min, wantAPI, wantProbe int) {
+		t.Helper()
+		e.clock.t = t0.Add(time.Duration(min) * time.Minute)
+		e.a.autoCheck(context.Background())
+		if a, p := e.gh.count(update.LatestURL), e.gh.count(update.LatestPageURL); a != wantAPI || p != wantProbe {
+			t.Errorf("at %dm: api %d probe %d, want %d %d", min, a, p, wantAPI, wantProbe)
+		}
+	}
+	check(0, 1, 0)  // first check: full
+	check(10, 1, 1) // same version: probe only
+	if c := e.a.st.Snapshot().UpdateCheck; c == nil || !c.OK || c.At != t0.Add(10*time.Minute).Format(time.RFC3339) || c.Latest == nil || c.Latest.Version != "0.5.0" {
+		t.Errorf("probe check not recorded: %+v", c)
+	}
+	events := len(e.rec.of("updateAvailable"))
+	serveRelease(e.gh, "0.6.0", fakeExe(10, 2))
+	serveLatestPage(e.gh, "0.6.0")
+	check(20, 2, 2) // new version: full check, announced
+	if n := len(e.rec.of("updateAvailable")); n != events+1 {
+		t.Errorf("updateAvailable %d, want %d", n, events+1)
+	}
+	e.gh.set(update.LatestPageURL, ghResp{status: 200}) // not a redirect: full check
+	check(30, 3, 3)
 }
 
 // --- install -------------------------------------------------------------------------

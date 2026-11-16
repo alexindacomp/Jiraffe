@@ -215,6 +215,7 @@
     pj: { list: null, loading: false, error: null, seq: 0, busy: new Set(), bulk: false, restoreFocus: null },
 
     wl: { preview: null, previewLoading: false, previewError: null, previewSeq: 0,
+          excluded: null, excludedOpen: false, // v0.8.1: issues taken out of the worklog (getWorklogExcluded)
           result: null, running: false,
           history: null, historyLoading: false, historyError: null,
           date: null, pendingDate: null, // v0.7.1: the chosen day (null = today); Review from the missed notice sets pendingDate
@@ -2671,6 +2672,7 @@
         <div class="drawer-crumbs">${is.type ? typeIcon(is.type) : ''}<span class="card-key">${is.key}</span>${d.loading && det ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : ''}</div>
         <div class="drawer-head-end">
           ${det ? (() => { const no = S.noEditKeys.has(top.key); return html`<button type="button" class="icon-btn" data-action="edit" aria-label="${no ? t('cf.noPermission') : t('drawer.edit')}" title="${no ? t('cf.noPermission') : t('drawer.editTitle')}"${no ? html` aria-disabled="true"` : ''}${d.editLoading ? html` aria-busy="true"` : ''}>${d.editLoading ? html`<span class="spinner spinner-sm" aria-hidden="true"></span>` : icon('pencil')}</button>`; })() : ''}
+          ${is.url ? html`<button type="button" class="icon-btn" data-copy="${is.url}" aria-label="${t('drawer.copyLink')}" title="${t('drawer.copyLink')}">${icon('link')}</button>` : ''}
           <button type="button" class="icon-btn" data-action="open-jira" aria-label="${t('common.openInJira')}" title="${t('common.openInJira')}" ${is.url ? '' : html`disabled`}>${icon('external')}</button>
           <button type="button" class="icon-btn" data-action="close" aria-label="${t('common.close')}" title="${t('common.closeEsc')}">${icon('x')}</button>
         </div>
@@ -5339,6 +5341,7 @@
     const seq = ++S.wl.previewSeq;
     S.wl.previewLoading = true;
     if (!keepOverrides || !S.wl.ov.data) loadOverrides();
+    loadExcluded();
     renderWorklog();
     renderRefreshState();
     try {
@@ -5353,6 +5356,31 @@
     } finally {
       if (seq === S.wl.previewSeq) { S.wl.previewLoading = false; renderWorklog(); renderRefreshState(); }
     }
+  }
+
+  async function loadExcluded() {
+    try {
+      const list = await api('getWorklogExcluded');
+      S.wl.excluded = Array.isArray(list) ? list : [];
+      renderWorklog();
+    } catch { /* the list is optional; the preview still works */ }
+  }
+  /** v0.8.1: take an issue out of the worklog (excluded) or put it back, then recompute the preview. */
+  async function setExcluded(key, summary, excluded) {
+    try {
+      const list = await api('setWorklogExcluded', { key, summary: summary || '', excluded });
+      S.wl.excluded = Array.isArray(list) ? list : [];
+    } catch (e) { toastError(t('worklog.excludeFailed'), e); return; }
+    toast(t(excluded ? 'worklog.excludedToast' : 'worklog.includedToast', { key }), {
+      tone: 'success',
+      action: excluded ? { label: t('worklog.undo'), run: () => setExcluded(key, summary, false) } : undefined,
+    });
+    loadPreview({ keepOverrides: true });
+  }
+  async function openInJiraByKey(key) {
+    const s = await ensureSettings();
+    const base = s && s.jiraUrl ? String(s.jiraUrl).replace(/\/+$/, '') : '';
+    if (base) openUrl(`${base}/browse/${encodeURIComponent(key)}`);
   }
 
   async function loadHistory() {
@@ -5515,7 +5543,8 @@
     const share = sumOf(items, 'shareSeconds');
     // v0.8: the "fixed" column (created issues + comments) only when the run has such time; editors in the preview only
     const hasFixed = !compact && items.some((i) => Number(i.fixedSeconds) > 0 || fixedRoles(i).length);
-    const cols = (showResult ? 7 : 6) - (compact ? 2 : 0) + (hasFixed ? 1 : 0);
+    const cols = (showResult ? 7 : 6) - (compact ? 2 : 0) + (hasFixed ? 1 : 0) + 1; // + the actions column (v0.8.1)
+    const canExclude = !compact && !showResult;
     return html`<div class="table-wrap"><table class="table">
       <thead><tr>
         <th scope="col">${t('worklog.col.issue')}</th>
@@ -5526,11 +5555,12 @@
         <th scope="col" class="num">${t(compact ? 'worklog.col.logTotal' : showResult ? 'worklog.col.attempted' : 'worklog.col.todo')}</th>
         <th scope="col">${t('worklog.col.start')}</th>
         ${showResult ? html`<th scope="col">${t('worklog.col.result')}</th>` : ''}
+        <th scope="col" class="wl-acts-h"><span class="sr-only">${t('worklog.col.actions')}</span></th>
       </tr></thead>
       <tbody>${items.map((it) => {
         const fx = edit && fixedRoles(it).length > 0;
         return html`<tr${fx ? html` class="has-fx"` : ''}>
-          <td><span class="cell-issue"><span class="cell-issue-top"><span class="card-key">${it.key}</span>${roleChips(it)}</span><span class="sum" title="${it.summary || ''}">${it.summary || ''}</span></span></td>
+          <td><span class="cell-issue"><span class="cell-issue-top"><button type="button" class="wl-open card-key" data-open-key="${it.key}" data-focus-key="${it.key}" aria-haspopup="dialog" title="${t('worklog.openIssue')}">${it.key}</button>${roleChips(it)}</span><button type="button" class="wl-open sum" data-open-key="${it.key}" tabindex="-1" title="${it.summary || ''}">${it.summary || ''}</button>${it.comment ? html`<span class="wl-desc" title="${t('worklog.descTip')}">${it.comment}</span>` : ''}</span></td>
           ${compact ? '' : html`<td class="nowrap">${nameOf(it.status)}</td>`}
           ${compact ? '' : html`<td class="num">${Number(it.shareSeconds) > 0 || !hasFixed ? dur(it.shareSeconds) : '—'}</td>`}
           ${hasFixed ? html`<td class="num">${Number(it.fixedSeconds) > 0 ? dur(it.fixedSeconds) : '—'}</td>` : ''}
@@ -5538,6 +5568,10 @@
           <td class="num strong">${it.todoSeconds ? dur(it.todoSeconds) : '—'}</td>
           <td class="muted">${it.started ? i18n.time(it.started) : '—'}</td>
           ${showResult ? html`<td>${resultChip(it)}</td>` : ''}
+          <td class="wl-acts"><span class="wl-acts-in">
+            <button type="button" class="icon-btn icon-btn-sm" data-action="wl-jira" data-key="${it.key}" aria-label="${t('common.openInJira')} ${it.key}" title="${t('common.openInJira')}">${icon('external')}</button>
+            ${canExclude ? html`<button type="button" class="icon-btn icon-btn-sm" data-action="wl-exclude" data-key="${it.key}" data-summary="${it.summary || ''}" aria-label="${t('worklog.exclude')} ${it.key}" title="${t('worklog.exclude')}">${icon('eye-off')}</button>` : ''}
+          </span></td>
         </tr>${fx ? fxRow(it, cols) : ''}${it.error ? html`<tr class="row-error"><td colspan="${cols}">${it.error}</td></tr>` : ''}`;
       })}</tbody>
       ${compact ? '' : html`<tfoot><tr>
@@ -5546,7 +5580,7 @@
         ${hasFixed ? html`<td class="num">${dur(sumOf(items, 'fixedSeconds'))}</td>` : ''}
         <td class="num">${logged ? dur(logged) : '—'}</td>
         <td class="num">${dur(todo)}</td>
-        <td></td>${showResult ? html`<td></td>` : ''}
+        <td></td>${showResult ? html`<td></td>` : ''}<td></td>
       </tr></tfoot>`}
     </table></div>`;
   }
@@ -5619,7 +5653,7 @@
     const offNote = run.nonWorkingDay ? html`<p class="wl-note">${icon('calendar')}<span>${t('worklog.offDayNote', { reason: reasonText(run.nonWorkingDay) })}</span></p>` : '';
     const dayNote = html`${pastDay && !result ? html`<p class="wl-note wl-past">${icon('history')}<span>${t('worklog.pastNote', { date: dayTextShort(pastDay) })}</span></p>` : ''}${offNote}`;
     const errBanner = run.error ? html`<div class="inline-error" style="margin-bottom:12px">${icon('alert')}<span>${run.error}</span></div>` : '';
-    const related = result ? '' : relatedBlock(run);
+    const related = result ? '' : html`${relatedBlock(run)}${excludedBlock()}`;
     if (!items.length) {
       wlKeepFocus(el, html`${errBanner}${offNote}${otherNote(run)}${stateBlock({ iconName: 'inbox', title: t('worklog.nothingTitle'), text: pastDay ? t('worklog.nothingTextDay') : t('worklog.nothingText') })}${related}`);
       return;
@@ -5655,6 +5689,19 @@
     </details>`;
   }
 
+  /** v0.8.1: issues taken out of the worklog; "Return" puts one back. Collapsed by default. */
+  function excludedBlock() {
+    const list = Array.isArray(S.wl.excluded) ? S.wl.excluded : [];
+    if (!list.length) return '';
+    return html`<details class="wl-related wl-excluded" id="wl-excluded"${S.wl.excludedOpen ? html` open` : ''}>
+      <summary>${icon('chevron-down', 'chev')}<span>${t('worklog.excludedList', { n: list.length })}</span></summary>
+      <p class="hint wl-excluded-hint">${t('worklog.excludedHint')}</p>
+      <ul class="wl-rel-list" role="list">${list.map((x) => html`<li class="wl-ex-li"><button type="button" class="wl-rel-row" data-open-key="${x.key}" data-focus-key="${x.key}" aria-haspopup="dialog">
+        <span class="card-key">${x.key}</span><span class="wl-rel-sum" title="${x.summary || ''}">${x.summary || ''}</span>
+      </button><button type="button" class="btn btn-sm btn-ghost" data-action="wl-include" data-key="${x.key}" title="${t('worklog.includeTip')}">${icon('eye')}<span>${t('worklog.include')}</span></button></li>`)}</ul>
+    </details>`;
+  }
+
   /** Re-renders the preview without losing the field being typed in (value, caret) or the focused row. */
   function wlKeepFocus(el, content) {
     const a = document.activeElement;
@@ -5663,6 +5710,8 @@
       if (a.dataset.fx) keep = { sel: `[data-fx="${CSS.escape(a.dataset.fx)}"]`, value: a.value, start: a.selectionStart, end: a.selectionEnd };
       else if (a.dataset.openKey) keep = { sel: `[data-open-key="${CSS.escape(a.dataset.openKey)}"]` };
       else if (a.closest('#wl-related > summary')) keep = { sel: '#wl-related > summary' };
+      else if (a.closest('#wl-excluded > summary')) keep = { sel: '#wl-excluded > summary' };
+      else if (a.dataset.action && a.dataset.key) keep = { sel: `[data-action="${CSS.escape(a.dataset.action)}"][data-key="${CSS.escape(a.dataset.key)}"]` };
       else if (a.dataset.action) keep = { sel: `[data-action="${CSS.escape(a.dataset.action)}"]` };
     }
     S.wl.fx.rendering = true; // the focused input goes away with the old markup: that blur is not a commit
@@ -6277,7 +6326,7 @@
   /* ================================================================
    * SETTINGS
    * ================================================================ */
-  const FORM_SCALARS = ['jiraUrl', 'language', 'worklogTime', 'workdayStart', 'workdayEnd', 'lunchStart', 'lunchEnd', 'boardJql'];
+  const FORM_SCALARS = ['jiraUrl', 'language', 'worklogTime', 'workdayStart', 'workdayEnd', 'lunchStart', 'lunchEnd', 'boardJql', 'worklogCommentLanguage'];
   const FORM_BOOLS = ['autostart', 'worklogEnabled', 'notifyComments', 'autoCheckUpdates'];
   const FORM_NUMS = ['dailyCapHours', 'loadFactor', 'hoursPerDay', 'commentPollMinutes', 'authorMinutes', 'commentMinutes'];
   /* v0.8 Settings → Roles: the three status lists share the tag-list control; the key is the data-status-kind /
@@ -6626,6 +6675,7 @@
     if (!Array.isArray(out.reviewStatuses)) out.reviewStatuses = [];
     if (out.authorMinutes == null) out.authorMinutes = 15;
     if (out.commentMinutes == null) out.commentMinutes = 5;
+    if (out.worklogCommentLanguage == null) out.worklogCommentLanguage = ''; // v0.8.2: "" = the interface language
     S.autostartMismatch = asked !== effective;
     return out;
   }
@@ -7374,9 +7424,12 @@
     $('#missed-notice').addEventListener('click', onMissedClick);
     $('#view-worklog').addEventListener('click', (e) => {
       const row = e.target.closest('[data-open-key]');
-      if (row) { openIssue(row.dataset.openKey); return; } // v0.8: "other issues" list
+      if (row) { openIssue(row.dataset.openKey); return; } // v0.8: "other issues" list; v0.8.1: worklog rows too
       const a = e.target.closest('[data-action]');
       if (!a) return;
+      if (a.dataset.action === 'wl-jira') { openInJiraByKey(a.dataset.key); return; }
+      if (a.dataset.action === 'wl-exclude') { setExcluded(a.dataset.key, a.dataset.summary, true); return; }
+      if (a.dataset.action === 'wl-include') { setExcluded(a.dataset.key, '', false); return; }
       if (a.dataset.action === 'wl-retry') loadPreview();
       if (a.dataset.action === 'history-retry') loadHistory();
       if (a.dataset.action === 'fx-retry') loadOverrides();
@@ -7385,7 +7438,7 @@
     $('#view-worklog').addEventListener('input', onWorklogFxInput);
     $('#view-worklog').addEventListener('keydown', onWorklogFxKey);
     $('#view-worklog').addEventListener('focusout', onWorklogFxBlur);
-    $('#view-worklog').addEventListener('toggle', (e) => { if (e.target.id === 'wl-related') S.wl.relatedOpen = e.target.open; }, true);
+    $('#view-worklog').addEventListener('toggle', (e) => { if (e.target.id === 'wl-related') S.wl.relatedOpen = e.target.open; if (e.target.id === 'wl-excluded') S.wl.excludedOpen = e.target.open; }, true);
 
     // Notifications
     $('#notif-mark-all').addEventListener('click', markAllRead);

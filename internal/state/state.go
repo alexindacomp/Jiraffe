@@ -87,6 +87,17 @@ type Data struct {
 	// WorklogOverrides are the fixed-time overrides per day ("2006-01-02");
 	// days older than OverrideKeepDays are dropped on save.
 	WorklogOverrides map[string]DayOverrides `json:"worklogOverrides,omitempty"`
+	// WorklogExcluded are the issues taken out of the worklog (v0.8.1), by
+	// key; Excluded=false records a re-include so merging keeps the newer one.
+	WorklogExcluded map[string]ExcludedIssue `json:"worklogExcluded,omitempty"`
+}
+
+// ExcludedIssue is an issue the user took out of the worklog (or put back:
+// Excluded=false). At (RFC 3339) decides concurrent saves.
+type ExcludedIssue struct {
+	Summary  string `json:"summary,omitempty"`
+	Excluded bool   `json:"excluded"`
+	At       string `json:"at"`
 }
 
 // DayOverrides is a day's worklog overrides as stored: At (RFC 3339) is
@@ -170,6 +181,12 @@ func (d Data) clone() Data {
 	if d.UIPrefs != nil {
 		c.UIPrefs = append(json.RawMessage{}, d.UIPrefs...)
 	}
+	if d.WorklogExcluded != nil {
+		c.WorklogExcluded = make(map[string]ExcludedIssue, len(d.WorklogExcluded))
+		for k, v := range d.WorklogExcluded {
+			c.WorklogExcluded[k] = v
+		}
+	}
 	if d.WorklogOverrides != nil {
 		c.WorklogOverrides = make(map[string]DayOverrides, len(d.WorklogOverrides))
 		for k, v := range d.WorklogOverrides {
@@ -251,6 +268,28 @@ func (d Data) Unread() int {
 // unique, capped at MaxSkippedDays).
 func (t Tx) SkipDay(date string) {
 	t.SkippedWorklogDays = unionDays(t.SkippedWorklogDays, []string{date})
+}
+
+// Excluded reports the issues currently taken out of the worklog.
+func (d Data) Excluded() map[string]bool {
+	out := map[string]bool{}
+	for k, v := range d.WorklogExcluded {
+		if v.Excluded {
+			out[k] = true
+		}
+	}
+	return out
+}
+
+// SetExcluded takes an issue out of the worklog (excluded) or puts it back.
+func (t Tx) SetExcluded(key, summary string, excluded bool, at time.Time) {
+	if t.WorklogExcluded == nil {
+		t.WorklogExcluded = map[string]ExcludedIssue{}
+	}
+	if !excluded {
+		summary = ""
+	}
+	t.WorklogExcluded[key] = ExcludedIssue{Summary: summary, Excluded: excluded, At: at.Format(time.RFC3339Nano)}
 }
 
 // Overrides returns the worklog overrides of a day (empty when none).
@@ -416,6 +455,32 @@ func merge(mine, disk Data) (Data, int) {
 	var o int
 	out.WorklogOverrides, o = mergeOverrides(mine.WorklogOverrides, disk.WorklogOverrides)
 	n += o
+	var x int
+	out.WorklogExcluded, x = mergeExcluded(mine.WorklogExcluded, disk.WorklogExcluded)
+	n += x
+	return out, n
+}
+
+// mergeExcluded keeps, per issue, the state set later (mine on a tie).
+func mergeExcluded(mine, disk map[string]ExcludedIssue) (map[string]ExcludedIssue, int) {
+	var out map[string]ExcludedIssue
+	n := 0
+	for k, d := range disk {
+		if m, ok := mine[k]; ok && !parseTime(d.At).After(parseTime(m.At)) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]ExcludedIssue, len(mine)+len(disk))
+			for k2, v := range mine {
+				out[k2] = v
+			}
+		}
+		out[k] = d
+		n++
+	}
+	if out == nil {
+		return mine, 0
+	}
 	return out, n
 }
 

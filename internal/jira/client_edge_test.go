@@ -218,7 +218,7 @@ func TestInvalidIssueKeysAreRejectedBeforeSending(t *testing.T) {
 		calls := map[string]error{}
 		_, calls["GetIssue"] = c.GetIssue(ctx, key, nil)
 		_, calls["Worklogs"] = c.Worklogs(ctx, key)
-		calls["AddWorklog"] = c.AddWorklog(ctx, key, 60, time.Now())
+		calls["AddWorklog"] = c.AddWorklog(ctx, key, 60, time.Now(), "")
 		_, calls["Transitions"] = c.Transitions(ctx, key)
 		calls["DoTransition"] = c.DoTransition(ctx, key, "1")
 		for name, err := range calls {

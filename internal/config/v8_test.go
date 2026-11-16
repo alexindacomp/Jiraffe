@@ -116,3 +116,28 @@ func TestV8RoleSettingsValidation(t *testing.T) {
 		t.Errorf("repair %+v %d", r.QAStatuses, r.AuthorMinutes)
 	}
 }
+
+// v0.8.2: the worklog comment language is "", ru, uk or en.
+func TestWorklogCommentLanguage(t *testing.T) {
+	s := Defaults()
+	if s.WorklogCommentLanguage != "" {
+		t.Errorf("default %q", s.WorklogCommentLanguage)
+	}
+	for _, l := range []string{"", "ru", " UK ", "en"} {
+		s.WorklogCommentLanguage = l
+		s.Normalize()
+		for _, e := range s.Validate() {
+			if e.Field == "worklogCommentLanguage" {
+				t.Errorf("%q rejected", l)
+			}
+		}
+	}
+	s.WorklogCommentLanguage = "de"
+	bad := false
+	for _, e := range s.Validate() {
+		bad = bad || e.Field == "worklogCommentLanguage"
+	}
+	if !bad {
+		t.Error("de accepted")
+	}
+}

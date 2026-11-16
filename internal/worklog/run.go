@@ -57,8 +57,11 @@ type Item struct {
 	TodoSeconds   int64  `json:"todoSeconds"`
 	Duration      string `json:"duration"`
 	Started       string `json:"started"`
-	Result        string `json:"result,omitempty"`
-	Error         string `json:"error,omitempty"`
+	// Comment is the worklog description sent to Jira (v0.8.2), e.g.
+	// "Разработка; создание задачи; комментарии (2)".
+	Comment string `json:"comment,omitempty"`
+	Result  string `json:"result,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // Run is the result of a worklog run or preview (WorklogRun in the JS contract).

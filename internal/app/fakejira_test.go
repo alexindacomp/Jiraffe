@@ -76,6 +76,7 @@ type fakeJira struct {
 	worklogs    map[string][]jira.Worklog
 
 	posted         []string
+	postedComments []string // v0.8.2: "KEY: comment" per posted worklog
 	jqls           []string
 	lastToken      string
 	searches       int
@@ -162,9 +163,11 @@ func (f *fakeJira) Do(_ context.Context, r *jira.Request) (*jira.Response, error
 			var body struct {
 				TimeSpentSeconds int64  `json:"timeSpentSeconds"`
 				Started          string `json:"started"`
+				Comment          string `json:"comment"`
 			}
 			_ = json.Unmarshal(r.Body, &body)
 			f.posted = append(f.posted, fmt.Sprintf("%s %d %s", key, body.TimeSpentSeconds, body.Started))
+			f.postedComments = append(f.postedComments, key+": "+body.Comment)
 			if f.worklogs == nil {
 				f.worklogs = map[string][]jira.Worklog{}
 			}

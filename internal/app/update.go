@@ -25,7 +25,7 @@ type UpdateHost interface {
 
 // Timing of the automatic update check (SPEC v0.4 §5).
 const (
-	updateEvery    = 24 * time.Hour
+	updateEvery    = 10 * time.Minute // v0.8.1 (was a day); see sameLatest
 	cleanupRetries = 5
 )
 
@@ -33,7 +33,7 @@ const (
 // after start, then how often the loop looks whether a check is due.
 var (
 	updateStartDelay = 30 * time.Second
-	updateTick       = 15 * time.Minute
+	updateTick       = time.Minute
 )
 
 // Cleanup timing (variables for tests): retries of a locked file, and how
@@ -155,6 +155,10 @@ func (a *App) checkUpdates(ctx context.Context) (UpdateStatus, error) {
 	rel, err := a.upd.Latest(ctx)
 	if err != nil {
 		log.Printf("update check: %v", err)
+	} else {
+		a.mu.Lock()
+		a.updFullChecked = true
+		a.mu.Unlock()
 	}
 	a.recordCheck(rel, err)
 	if err == nil && update.Newer(rel.Version, Version) && rel.Version != a.st.Snapshot().SkippedVersion {
@@ -220,12 +224,39 @@ func (a *App) autoCheckDue(now time.Time) bool {
 // autoCheck runs the automatic check when due; failures are only logged and
 // stored (shown in Settings), never shown as balloons.
 func (a *App) autoCheck(ctx context.Context) {
-	if a.autoCheckDue(a.clock.Now()) {
+	if a.autoCheckDue(a.clock.Now()) && !a.sameLatest(ctx) {
 		_, _ = a.checkUpdates(ctx)
 	}
 }
 
-// updateLoop checks updateStartDelay after start and then once a day.
+// sameLatest probes the latest version cheaply (release page redirect, not
+// the rate-limited API) once this session has a successful full check; when
+// it is still the release known, only the check time is recorded and nothing
+// is announced again. Any doubt (probe failed, other version) means a full
+// check.
+func (a *App) sameLatest(ctx context.Context) bool {
+	a.mu.Lock()
+	checked := a.updFullChecked
+	a.mu.Unlock()
+	known := a.st.Snapshot().UpdateCheck
+	if !checked || known == nil || !known.OK || known.Latest == nil {
+		return false
+	}
+	v, err := a.upd.LatestVersion(ctx)
+	if err != nil {
+		log.Printf("update probe: %v", err)
+		return false
+	}
+	if v != known.Latest.Version {
+		return false
+	}
+	a.updCheckMu.Lock()
+	defer a.updCheckMu.Unlock()
+	a.recordCheck(known.Latest, nil)
+	return true
+}
+
+// updateLoop checks updateStartDelay after start and then every updateEvery.
 func (a *App) updateLoop(ctx context.Context) {
 	wait := updateStartDelay
 	for {

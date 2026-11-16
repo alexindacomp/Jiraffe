@@ -214,9 +214,10 @@ type App struct {
 	updJob     atomic.Bool // an install job is running
 	updExiting atomic.Bool // the new exe was started: no more worklog runs
 	// guarded by mu
-	updLastAuto  time.Time   // last automatic check of this session
-	updAnnounced string      // version announced by balloon this session
-	justUpdated  *UpdatedDTO // set after an update (this session)
+	updLastAuto    time.Time   // last automatic check of this session
+	updAnnounced   string      // version announced by balloon this session
+	updFullChecked bool        // a full (API) check succeeded this session (v0.8.1: later ones may probe)
+	justUpdated    *UpdatedDTO // set after an update (this session)
 }
 
 // New creates the app. emit may be nil.
@@ -592,6 +593,18 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 			return nil, err
 		}
 		return a.setWorklogOverrides(p.Date, p.Overrides)
+	case "getWorklogExcluded":
+		return a.worklogExcluded(), nil
+	case "setWorklogExcluded":
+		var p struct {
+			Key      string `json:"key"`
+			Summary  string `json:"summary"`
+			Excluded *bool  `json:"excluded"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.setWorklogExcluded(p.Key, p.Summary, p.Excluded)
 	case "getMissedWorklogDays":
 		return a.missedDays(), nil
 	case "skipWorklogDay":

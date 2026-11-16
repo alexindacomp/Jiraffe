@@ -232,6 +232,7 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time,
 			Duration:       worklog.FormatDuration(float64(p.Todo), s.HoursPerDay),
 			Started:        started.Format(time.RFC3339),
 		}
+		item.Comment = worklog.Describe(p.Roles, int64(math.Round(p.Share)), p.Fixed.CreateSeconds, p.Fixed.CommentSeconds, p.Comments, commentLang(s))
 		switch {
 		case p.Todo < worklog.MinSeconds:
 			item.TodoSeconds = 0
@@ -241,7 +242,7 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time,
 			total += p.Todo
 		default:
 			attempted++
-			if err := c.AddWorklog(ctx, p.Key, p.Todo, started); err != nil {
+			if err := c.AddWorklog(ctx, p.Key, p.Todo, started, item.Comment); err != nil {
 				failed++
 				item.Result = worklog.ResultError
 				item.Error = Localize(err, lang).Message
@@ -374,6 +375,14 @@ func statusList(names []string) string {
 		}
 	}
 	return strings.Join(out, ", ")
+}
+
+// commentLang is the language of the worklog descriptions.
+func commentLang(s config.Settings) string {
+	if s.WorklogCommentLanguage != "" {
+		return s.WorklogCommentLanguage
+	}
+	return s.Language
 }
 
 // WorklogJQLFor returns the status-roles query for a run computing the day
@@ -608,8 +617,14 @@ func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s confi
 		}
 	}
 
+	// Issues taken out of the worklog get nothing (their time logged that
+	// day still counts against the cap, as "other" time).
+	excluded := a.st.Snapshot().Excluded()
 	var fixedIn []worklog.FixedIssue
 	for _, d := range found.order {
+		if excluded[d.key] {
+			continue
+		}
 		if d.created || d.comments > 0 {
 			fixedIn = append(fixedIn, worklog.FixedIssue{Key: d.key, Created: d.created, Comments: d.comments})
 		}
@@ -620,7 +635,7 @@ func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s confi
 	ws, we := config.At(now, s.WorkdayStart), config.At(now, s.WorkdayEnd).Add(-time.Minute)
 	var cands []worklog.Candidate
 	for _, d := range found.order {
-		if len(d.spans) == 0 && !d.created && d.comments == 0 {
+		if excluded[d.key] || len(d.spans) == 0 && !d.created && d.comments == 0 {
 			continue
 		}
 		start := d.fixedAt.In(now.Location())
@@ -794,7 +809,7 @@ func (a *App) relatedIssues(ctx context.Context, run worklog.Run) []worklog.Rela
 		log.Printf("worklog related: %v", err)
 		return nil
 	}
-	skip := map[string]bool{}
+	skip := a.st.Snapshot().Excluded() // shown in their own list
 	for _, it := range run.Items {
 		skip[it.Key] = true
 	}
