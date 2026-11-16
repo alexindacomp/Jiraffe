@@ -28,10 +28,10 @@ const (
 
 const (
 	metaTTL     = time.Hour
-	epicInfoTTL = 10 * time.Minute
-	listTTL     = 60 * time.Second // epics / stories
+	epicInfoTTL = 48 * time.Hour // v0.8.2: epics change rarely; Refresh (force) and own edits bypass/drop it
+	listTTL     = 48 * time.Hour // epics / stories
 	projectsTTL = 10 * time.Minute
-	agileTTL    = 10 * time.Minute
+	agileTTL    = time.Hour // sprint lists, project boards (v0.8.2)
 )
 
 // cacheEntry is a cached result for one connection identity.

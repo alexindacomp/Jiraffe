@@ -105,6 +105,10 @@ type Board struct {
 	Hidden *HiddenDTO `json:"hidden,omitempty"`
 	// Layout describes the columns of a project board (project mode only).
 	Layout *BoardLayoutDTO `json:"layout,omitempty"`
+	// expires (not sent) ends the cache life of a project board early: a
+	// layout degraded by a transient failure is retried after a minute, not
+	// after boardTTL (v0.8.2: an hour).
+	expires time.Time
 }
 
 // HiddenDTO is Board.hidden.
@@ -147,7 +151,7 @@ const (
 const ReportedBoardJQL = "reporter = currentUser() AND statusCategory != Done ORDER BY updated DESC"
 
 const (
-	boardTTL        = 60 * time.Second
+	boardTTL        = time.Hour // v0.8.2
 	mineBoardMax    = 300
 	allBoardMax     = 500
 	projectBoardMax = 500 // both scopes of a project board
@@ -364,7 +368,9 @@ func (a *App) getBoard(ctx context.Context, force bool, scope, project string, b
 	key := boardCacheKey(scope, project, boardID)
 	cached, gen, ok := a.cacheGet(key, id, boardTTL)
 	if ok && !force {
-		return cached.(*Board), nil
+		if b := cached.(*Board); b.expires.IsZero() || a.clock.Now().Before(b.expires) {
+			return b, nil
+		}
 	}
 	now := a.clock.Now()
 	if project != "" {
@@ -458,6 +464,7 @@ func (a *App) projectBoard(ctx context.Context, c *jira.Client, id, scope, proje
 		Scope:     scope,
 		Truncated: res.Truncated(),
 		Layout:    &layout,
+		expires:   lay.at.Add(lay.ttl), // the layout's own life (an hour, a minute after a transient failure)
 	}, nil
 }
 

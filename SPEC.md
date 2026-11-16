@@ -1810,3 +1810,11 @@ Methods:
   (→ `…/releases/tag/vX.Y.Z`, not followed; github.com pages are not counted against the API's 60 requests/hour
   per IP — many users behind one office IP); same version ⇒ only the check time is recorded, nothing is announced
   again; another version, a failed probe or no earlier successful check ⇒ the full API check.
+
+## v0.8.2 — longer caches
+
+- Cache life (in memory): epics / stories lists and epic info (names, colours) **48 h**; boards, sprint groups,
+  sprint lists and project boards **1 h** (were 60 s / 2 min / 10 min). The Refresh button (force) bypasses them;
+  own edits, transitions and comments found by the comment poll drop them (also the epic info).
+- A project board whose layout was degraded by a transient failure expires with the layout (metaRetryTTL, a
+  minute), so the layout is still retried after a minute.

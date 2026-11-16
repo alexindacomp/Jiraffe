@@ -822,6 +822,10 @@ func (a *App) invalidateCaches() {
 // already in flight will not store its (possibly stale) result.
 func (a *App) invalidateBoard() {
 	a.dropCache(cacheBoard, cacheSprintGroups, cacheEpics, cacheStories, cacheProjects)
+	// v0.8.2: epic names / colours live 48 h; an edit may have renamed one
+	a.mu.Lock()
+	a.epics = epicCache{}
+	a.mu.Unlock()
 }
 
 // --- settings --------------------------------------------------------------

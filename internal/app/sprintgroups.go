@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	sprintGroupsTTL  = 2 * time.Minute
+	sprintGroupsTTL  = time.Hour // v0.8.2
 	maxBacklogIssues = 300
 	// recentClosed is how many closed sprints includeClosed adds.
 	recentClosed = 3

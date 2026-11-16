@@ -231,12 +231,12 @@ func TestQAProjectLayoutRetryAfterTransientFailure(t *testing.T) {
 		fj.mu.Lock()
 		fj.boardConfigs[673] = mbConfig673
 		fj.mu.Unlock()
-		advance(t, a, metaRetryTTL+time.Second) // the board (60 s) expired, the layout not
+		advance(t, a, metaRetryTTL+time.Second) // v0.8.2: a permanent fallback keeps the whole board for its hour
 		if b := getBoardT(t, a, `{"project":"MB","scope":"all"}`); b.Layout.Source != LayoutWorkflow {
 			t.Errorf("a permanent fallback was rebuilt after a minute: %+v", b.Layout)
 		}
-		if n := countJQL(fj, specMBAllJQL); n != 2 {
-			t.Errorf("issues read %d times, want 2 (board TTL expired)", n)
+		if n := countJQL(fj, specMBAllJQL); n != 1 {
+			t.Errorf("issues read %d times, want 1 (board cached for an hour)", n)
 		}
 		if n := len(fj.requests(configPath)); n != 1 {
 			t.Errorf("configuration read %d times within the hour", n)
@@ -413,12 +413,12 @@ func TestQASprintGroupsScopeCacheKeyAndUntrackedProject(t *testing.T) {
 	}
 }
 
-// Sprint groups are cached for 2 minutes (SPEC, written out).
+// Sprint groups are cached for an hour (v0.8.2; was 2 minutes).
 func TestQASprintGroupsTTL(t *testing.T) {
 	fj := sprintJira()
 	a := v2App(t, fj, []string{"MB"})
 	sprintGroupsT(t, a, `{"project":"MB"}`)
-	advance(t, a, 2*time.Minute-time.Second)
+	advance(t, a, time.Hour-time.Second)
 	sprintGroupsT(t, a, `{"project":"MB"}`)
 	if n := countJQL(fj, specMBOpenJQL); n != 1 {
 		t.Errorf("re-read before the TTL: %d open queries", n)
