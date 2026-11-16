@@ -550,8 +550,8 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     holidays: ['2026-12-25', '2027-01-01'],
     inProgressStatuses: ['In Progress', 'В работе', 'В роботі'],
     // v0.8 roles (SPEC defaults)
-    qaStatuses: ['Ready for QA', 'QA', 'In QA', 'Testing', 'In Testing', 'Ready for Test', 'In Test'],
-    reviewStatuses: ['Review', 'In Review', 'Code Review'],
+    qaStatuses: ['ForTesting', 'InTesting', 'ForBuild', 'ReleaseTesting'],
+    reviewStatuses: ['ForReview', 'InReview'],
     authorMinutes: 15,
     commentMinutes: 5,
     worklogCommentLanguage: '', // v0.8.2: "" = the interface language

@@ -232,7 +232,7 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time,
 			Duration:       worklog.FormatDuration(float64(p.Todo), s.HoursPerDay),
 			Started:        started.Format(time.RFC3339),
 		}
-		item.Comment = worklog.Describe(p.Roles, int64(math.Round(p.Share)), p.Fixed.CreateSeconds, p.Fixed.CommentSeconds, p.Comments, commentLang(s))
+		item.Comment = worklog.Describe(describedRoles(p.Candidate), int64(math.Round(p.Share)), p.Fixed.CreateSeconds, p.Fixed.CommentSeconds, p.Comments, commentLang(s))
 		switch {
 		case p.Todo < worklog.MinSeconds:
 			item.TodoSeconds = 0
@@ -311,11 +311,11 @@ func KnownStatuses(q RoleQuery, all []jira.Status) RoleQuery {
 	}
 	byName := make(map[string]string, len(all))
 	for _, st := range all {
-		byName[strings.ToLower(strings.TrimSpace(st.Name))] = st.Name
+		byName[worklog.NormStatus(st.Name)] = st.Name
 	}
 	var keep []string
 	for _, n := range q.Statuses {
-		if name, ok := byName[strings.ToLower(strings.TrimSpace(n))]; ok {
+		if name, ok := byName[worklog.NormStatus(n)]; ok {
 			keep = append(keep, name)
 		}
 	}
@@ -375,6 +375,25 @@ func statusList(names []string) string {
 		}
 	}
 	return strings.Join(out, ", ")
+}
+
+// describedRoles are the roles a worklog description names: the fixed
+// roles and, of the status roles, those whose statuses had time.
+func describedRoles(c worklog.Candidate) []string {
+	if c.Worked == nil {
+		return c.Roles
+	}
+	worked := map[string]bool{}
+	for _, r := range c.Worked {
+		worked[r] = true
+	}
+	var out []string
+	for _, r := range c.Roles {
+		if r == worklog.RoleAuthor || r == worklog.RoleCommenter || worked[r] {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // commentLang is the language of the worklog descriptions.
@@ -526,6 +545,7 @@ func roleStatuses(s config.Settings, roles []string) worklog.StatusSet {
 type dayIssue struct {
 	key, summary, status string
 	statusRoles          []string
+	worked               []string // status roles whose own statuses had time (v0.8.4)
 	spans                []worklog.Interval
 	created              bool
 	comments             int
@@ -646,7 +666,7 @@ func (a *App) plan(ctx context.Context, c *jira.Client, identity string, s confi
 			start = we
 		}
 		cands = append(cands, worklog.Candidate{Key: d.key, Summary: d.summary, Status: d.status, Spans: d.spans,
-			Roles: d.roles(), Comments: d.comments, Fixed: fixed[d.key], FixedStart: start})
+			Roles: d.roles(), Comments: d.comments, Fixed: fixed[d.key], FixedStart: start, Worked: d.worked})
 	}
 	isCand := map[string]bool{}
 	for i := range cands {
@@ -711,6 +731,13 @@ func (a *App) statusIssues(ctx context.Context, c *jira.Client, me *jira.User, s
 		d := found.get(is)
 		if d.statusRoles == nil {
 			d.statusRoles, d.spans = roles, spans
+			// The description names only the roles that worked: a Reviewer
+			// who is also QA of an issue in testing is not "code review".
+			for _, r := range roles {
+				if worklog.TotalSeconds(day.Clip(issueIntervals(is, roleStatuses(s, []string{r}), now))) >= worklog.MinSeconds {
+					d.worked = append(d.worked, r)
+				}
+			}
 		}
 	}
 	return nil

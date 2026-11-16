@@ -24,3 +24,16 @@ func TestDescribe(t *testing.T) {
 		}
 	}
 }
+
+// v0.8.4: status names match without spaces and case ("In Testing" = InTesting).
+func TestStatusSetIgnoresSpaces(t *testing.T) {
+	s := NewStatusSet([]string{"In Testing", " for  review "})
+	for _, n := range []string{"InTesting", "intesting", "In Testing", "ForReview"} {
+		if !s.Has(n) {
+			t.Errorf("%q not matched", n)
+		}
+	}
+	if s.Has("Testing") {
+		t.Error("Testing matched In Testing")
+	}
+}

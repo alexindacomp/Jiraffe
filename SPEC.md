@@ -1827,3 +1827,15 @@ Methods:
 - The configurable board query (`boardJql`) keeps working: each `assignee = currentUser()` in it (any case, spaces
   around `=`) is widened to that condition (`WithMyRoles`); other forms are left as written.
 - The "mine" marker of cards (assignee) and the Epics view are unchanged.
+
+## v0.8.4 — role statuses that match the real Jira
+
+- The real Jira's workflow (verified 2026-11-16, projects MB, CMA, RBI, EDS, SBI, SDD, DOPS): ToDo → In Progress →
+  ForReview → InReview → ForTesting → InTesting → ForBuild → ReleaseTesting → On Prod / Закрыт (no spaces in names).
+- Defaults: Dev `In Progress, В работе, В роботі` (unchanged); QA `ForTesting, InTesting, ForBuild, ReleaseTesting`
+  (everything after review until release); Reviewer `ForReview, InReview`. Settings whose QA / Reviewer list still
+  equals the v0.8.0 defaults are moved to these on load; edited lists are kept.
+- Status names are compared without case **and spaces** ("In Testing" = InTesting), in the worklog and when
+  matching Jira's status list.
+- The worklog description names only the status roles whose own statuses had time that day (QA + Reviewer of an
+  issue in testing ⇒ "Тестирование", not "Тестирование; код-ревью").

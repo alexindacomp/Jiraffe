@@ -10,8 +10,8 @@ import (
 
 func TestV8RoleDefaults(t *testing.T) {
 	d := Defaults()
-	if !reflect.DeepEqual(d.QAStatuses, []string{"Ready for QA", "QA", "In QA", "Testing", "In Testing", "Ready for Test", "In Test"}) ||
-		!reflect.DeepEqual(d.ReviewStatuses, []string{"Review", "In Review", "Code Review"}) ||
+	if !reflect.DeepEqual(d.QAStatuses, []string{"ForTesting", "InTesting", "ForBuild", "ReleaseTesting"}) ||
+		!reflect.DeepEqual(d.ReviewStatuses, []string{"ForReview", "InReview"}) ||
 		d.AuthorMinutes != 15 || d.CommentMinutes != 5 {
 		t.Errorf("defaults %+v %+v %d %d", d.QAStatuses, d.ReviewStatuses, d.AuthorMinutes, d.CommentMinutes)
 	}
@@ -139,5 +139,23 @@ func TestWorklogCommentLanguage(t *testing.T) {
 	}
 	if !bad {
 		t.Error("de accepted")
+	}
+}
+
+// v0.8.4: lists still equal to the v0.8.0 defaults move to the new
+// defaults; edited lists are kept.
+func TestMigrateRoleStatuses(t *testing.T) {
+	s := Defaults()
+	s.QAStatuses = append([]string{}, oldQAStatuses...)
+	s.ReviewStatuses = []string{"review", "In Review ", "Code Review"} // same, other case / spaces
+	migrateRoleStatuses(&s)
+	if !reflect.DeepEqual(s.QAStatuses, Defaults().QAStatuses) || !reflect.DeepEqual(s.ReviewStatuses, Defaults().ReviewStatuses) {
+		t.Errorf("not migrated: %v %v", s.QAStatuses, s.ReviewStatuses)
+	}
+	s.QAStatuses = []string{"InTesting"}
+	s.ReviewStatuses = []string{"Review", "In Review"}
+	migrateRoleStatuses(&s)
+	if !reflect.DeepEqual(s.QAStatuses, []string{"InTesting"}) || !reflect.DeepEqual(s.ReviewStatuses, []string{"Review", "In Review"}) {
+		t.Errorf("edited lists changed: %v %v", s.QAStatuses, s.ReviewStatuses)
 	}
 }

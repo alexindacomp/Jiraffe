@@ -114,11 +114,11 @@ func TestV8DefaultRolesDay(t *testing.T) {
 func TestV8QAAndReviewerRoles(t *testing.T) {
 	qa := withFields(issueJSON("Q-1", "Done", "2026-11-09T10:00:00.000+0200",
 		"2026-11-10T10:00:00.000+0200 ToDo>In Progress",
-		"2026-11-11T11:00:00.000+0200 In Progress>Testing",
-		"2026-11-11T15:00:00.000+0200 Testing>Done"), `"assignee":`+bobJSON+`,"customfield_10302":[`+alexJSON+`]`)
+		"2026-11-11T11:00:00.000+0200 In Progress>InTesting",
+		"2026-11-11T15:00:00.000+0200 InTesting>Done"), `"assignee":`+bobJSON+`,"customfield_10302":[`+alexJSON+`]`)
 	rev := withFields(issueJSON("R-2", "Done", "2026-11-09T10:00:00.000+0200",
-		"2026-11-11T14:00:00.000+0200 In Progress>Code Review",
-		"2026-11-11T16:00:00.000+0200 Code Review>Done"), `"customfield_10301":[`+alexJSON+`]`)
+		"2026-11-11T14:00:00.000+0200 In Progress>InReview",
+		"2026-11-11T16:00:00.000+0200 InReview>Done"), `"customfield_10301":[`+alexJSON+`]`)
 	// Assignee and QA: the In Progress time is the developer's, not mine.
 	both := withFields(allDayA1, `"assignee":`+alexJSON+`,"customfield_10302":[`+bobJSON+`,`+alexJSON+`]`)
 	// The Developer field and QA: both roles, so In Progress counts.
@@ -139,7 +139,7 @@ func TestV8QAAndReviewerRoles(t *testing.T) {
 		}
 	}
 	wantQ := `(assignee = currentUser() OR cf[10300] = currentUser() OR cf[10302] = currentUser() OR cf[10301] = currentUser() OR status changed BY currentUser() DURING (startOfDay(), now())) AND ` +
-		`(status changed DURING (startOfDay(), now()) OR statusCategory = "In Progress" OR status IN ("In Progress", "В работе", "В роботі", "Ready for QA", "QA", "In QA", "Testing", "In Testing", "Ready for Test", "In Test", "Review", "In Review", "Code Review"))`
+		`(status changed DURING (startOfDay(), now()) OR statusCategory = "In Progress" OR status IN ("In Progress", "В работе", "В роботі", "ForTesting", "InTesting", "ForBuild", "ReleaseTesting", "ForReview", "InReview"))`
 	if roleQ != wantQ {
 		t.Errorf("status-roles query\n got  %s\n want %s", roleQ, wantQ)
 	}
@@ -228,7 +228,7 @@ func TestV8RoleQueries(t *testing.T) {
 	tests := []struct{ name, got, want string }{
 		{"past, no fields", PastWorklogJQL(date, none), specPastJQL(date)},
 		{"past, all fields", PastWorklogJQL(date, all),
-			`status WAS IN ("In Progress", "В работе", "В роботі", "Ready for QA", "QA", "In QA", "Testing", "In Testing", "Ready for Test", "In Test", "Review", "In Review", "Code Review") ` + during +
+			`status WAS IN ("In Progress", "В работе", "В роботі", "ForTesting", "InTesting", "ForBuild", "ReleaseTesting", "ForReview", "InReview") ` + during +
 				` AND (assignee WAS currentUser() ` + during + ` OR cf[10300] = currentUser() OR cf[10302] = currentUser() OR cf[10301] = currentUser() OR status CHANGED BY currentUser() ` + during + `)`},
 		{"today, no fields", WorklogJQLFor(time.Date(2026, 11, 11, 18, 0, 0, 0, zone), time.Date(2026, 11, 11, 18, 0, 0, 0, zone), none), specWorklogJQL},
 		{"author", AuthorJQL(date), `creator = currentUser() AND created >= "2026-11-12 00:00" AND created <= "2026-11-12 23:59"`},
@@ -489,6 +489,9 @@ func TestKnownStatuses(t *testing.T) {
 	}
 	if k := KnownStatuses(q, nil); len(k.Statuses) != 4 {
 		t.Errorf("nil list: %v", k.Statuses)
+	}
+	if got := KnownStatuses(RoleQuery{Statuses: []string{"In Testing", "for review"}}, []jira.Status{{Name: "InTesting"}, {Name: "ForReview"}}); strings.Join(got.Statuses, "|") != "InTesting|ForReview" {
+		t.Errorf("spaces: %v", got.Statuses) // v0.8.4
 	}
 	if PastWorklogJQL("2026-11-12", KnownStatuses(q, []jira.Status{{Name: "Done"}})) != "" {
 		t.Error("no known status: no past query")

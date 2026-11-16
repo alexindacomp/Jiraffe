@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"jiraffe/internal/jira"
+	"jiraffe/internal/worklog"
 )
 
 // v0.8.3: "mine" on the board and in sprints = assignee or a role field
@@ -35,5 +36,18 @@ func TestMineCondWithRoles(t *testing.T) {
 	got := ProjectBoardJQL(ScopeMine, "MB", "", MineCond(jira.FieldIDs{QA: "customfield_10302"}))
 	if want := `project = "MB" AND (assignee = currentUser() OR cf[10302] = currentUser()) AND (statusCategory != Done OR ` + recentlyDone + `)`; got != want {
 		t.Errorf("project board\n got  %s\n want %s", got, want)
+	}
+}
+
+// v0.8.4: the description names the status roles whose statuses had time,
+// plus the fixed roles; without Worked (old callers) all roles.
+func TestDescribedRoles(t *testing.T) {
+	c := worklog.Candidate{Roles: []string{"qa", "reviewer", "commenter"}, Worked: []string{"qa"}}
+	if got := describedRoles(c); len(got) != 2 || got[0] != "qa" || got[1] != "commenter" {
+		t.Errorf("got %v", got)
+	}
+	c.Worked = nil
+	if got := describedRoles(c); len(got) != 3 {
+		t.Errorf("nil worked: %v", got)
 	}
 }

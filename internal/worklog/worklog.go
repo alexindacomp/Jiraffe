@@ -50,7 +50,7 @@ type StatusSet map[string]struct{}
 func NewStatusSet(names []string) StatusSet {
 	s := make(StatusSet, len(names))
 	for _, n := range names {
-		if n = strings.ToLower(strings.TrimSpace(n)); n != "" {
+		if n = NormStatus(n); n != "" {
 			s[n] = struct{}{}
 		}
 	}
@@ -59,8 +59,14 @@ func NewStatusSet(names []string) StatusSet {
 
 // Has reports whether name is in the set (case-insensitive).
 func (s StatusSet) Has(name string) bool {
-	_, ok := s[strings.ToLower(strings.TrimSpace(name))]
+	_, ok := s[NormStatus(name)]
 	return ok
+}
+
+// NormStatus is the comparison key of a status name: lower case without
+// spaces, so "In Testing" matches a Jira status "InTesting" (v0.8.4).
+func NormStatus(name string) string {
+	return strings.ToLower(strings.Join(strings.Fields(name), ""))
 }
 
 // InProgressIntervals rebuilds the intervals the issue spent in an in-progress
@@ -227,6 +233,9 @@ type Candidate struct {
 	// FixedStart is when a fixed-only worklog starts (creation / first
 	// comment, already clamped into the workday).
 	FixedStart time.Time
+	// Worked are the status roles whose own statuses had time that day
+	// (v0.8.4: the description names only these; nil = all status roles).
+	Worked []string
 }
 
 // hasFixedRole reports whether the candidate is author or commenter.

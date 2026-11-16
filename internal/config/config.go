@@ -103,10 +103,14 @@ func Defaults() Settings {
 		BoardJQL:           DefaultBoardJQL,
 		LoadFactor:         1,
 		AutoCheckUpdates:   true,
-		QAStatuses:         []string{"Ready for QA", "QA", "In QA", "Testing", "In Testing", "Ready for Test", "In Test"},
-		ReviewStatuses:     []string{"Review", "In Review", "Code Review"},
-		AuthorMinutes:      15,
-		CommentMinutes:     5,
+		// v0.8.4: the real Jira's workflow (verified 2026-11-16) — ToDo →
+		// In Progress → ForReview → InReview → ForTesting → InTesting →
+		// ForBuild → ReleaseTesting → On Prod / Закрыт: QA = everything
+		// after review until release, Reviewer = the review statuses.
+		QAStatuses:     []string{"ForTesting", "InTesting", "ForBuild", "ReleaseTesting"},
+		ReviewStatuses: []string{"ForReview", "InReview"},
+		AuthorMinutes:  15,
+		CommentMinutes: 5,
 	}
 }
 
@@ -475,6 +479,7 @@ func Open(path string, prot Protector) (*Store, error) {
 		return st, fmt.Errorf("config %s is corrupt (moved to .bad, defaults used): %w", path, err)
 	}
 	ff.Settings.Normalize()
+	migrateRoleStatuses(&ff.Settings)
 	if errs := ff.Settings.Validate(); len(errs) > 0 {
 		// Keep what is valid; fall back to defaults for broken fields.
 		ff.Settings = repair(ff.Settings, errs)
@@ -494,6 +499,37 @@ func Open(path string, prot Protector) (*Store, error) {
 		}
 	}
 	return st, nil
+}
+
+// v0.8.0 role status defaults: they missed the real Jira's names
+// (ForTesting, InReview, …), so untouched lists move to the new defaults.
+var (
+	oldQAStatuses     = []string{"Ready for QA", "QA", "In QA", "Testing", "In Testing", "Ready for Test", "In Test"}
+	oldReviewStatuses = []string{"Review", "In Review", "Code Review"}
+)
+
+// migrateRoleStatuses replaces role status lists still equal to the v0.8.0
+// defaults (the user never edited them) with the current defaults.
+func migrateRoleStatuses(s *Settings) {
+	d := Defaults()
+	if sameList(s.QAStatuses, oldQAStatuses) {
+		s.QAStatuses = d.QAStatuses
+	}
+	if sameList(s.ReviewStatuses, oldReviewStatuses) {
+		s.ReviewStatuses = d.ReviewStatuses
+	}
+}
+
+func sameList(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(strings.TrimSpace(a[i]), b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // repair replaces fields that failed validation with their defaults.
