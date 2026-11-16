@@ -132,6 +132,27 @@ func (d Day) Clip(spans []Interval) []Interval {
 // scaled down proportionally. Returns the share per issue (seconds) and the
 // seconds to log, rounded down to whole minutes.
 func Allocate(spans map[string][]Interval, logged map[string]int64, capSeconds int64) (map[string]float64, map[string]int64) {
+	share := Shares(spans)
+	todo := make(map[string]float64, len(spans))
+	var already, need float64
+	for k := range spans {
+		l := float64(logged[k])
+		already += l
+		todo[k] = math.Max(0, share[k]-l)
+		need += todo[k]
+	}
+	budget := math.Max(0, float64(capSeconds)-already)
+	scaleInto(todo, need, budget)
+	out := make(map[string]int64, len(todo))
+	for k, v := range todo {
+		out[k] = floorMinutes(v)
+	}
+	return share, out
+}
+
+// Shares divides the wall-clock time of the spans between the issues: at
+// every elementary time slice equally between the issues active in it.
+func Shares(spans map[string][]Interval) map[string]float64 {
 	pointSet := map[int64]struct{}{}
 	for _, sp := range spans {
 		for _, iv := range sp {
@@ -169,68 +190,113 @@ func Allocate(spans map[string][]Interval, logged map[string]int64, capSeconds i
 			share[k] += part
 		}
 	}
-
-	todo := make(map[string]float64, len(spans))
-	var already, need float64
-	for k := range spans {
-		l := float64(logged[k])
-		already += l
-		todo[k] = math.Max(0, share[k]-l)
-		need += todo[k]
-	}
-	budget := math.Max(0, float64(capSeconds)-already)
-	if need > budget {
-		for k, v := range todo {
-			todo[k] = v * budget / need
-		}
-	}
-	out := make(map[string]int64, len(todo))
-	for k, v := range todo {
-		// The epsilon guards against float noise such as 7199.9999999 turning
-		// a clean 2h into 1h 59m.
-		out[k] = int64(math.Floor((v+1e-6)/60)) * 60
-	}
-	return share, out
+	return share
 }
 
-// Candidate is an issue with today's clipped in-progress spans.
+// scaleInto scales the values down proportionally when their sum (need)
+// exceeds budget.
+func scaleInto(todo map[string]float64, need, budget float64) {
+	if need > budget {
+		for k, v := range todo {
+			if need > 0 {
+				todo[k] = v * budget / need
+			}
+		}
+	}
+}
+
+// floorMinutes rounds seconds down to whole minutes. The epsilon guards
+// against float noise such as 7199.9999999 turning a clean 2h into 1h 59m.
+func floorMinutes(v float64) int64 {
+	return int64(math.Floor((v+1e-6)/60)) * 60
+}
+
+// Candidate is an issue with today's clipped status spans and/or fixed time.
 type Candidate struct {
 	Key     string
 	Summary string
 	Status  string
-	Spans   []Interval // clipped to today, chronological
+	Spans   []Interval // clipped to today, chronological (status roles)
 	Logged  int64      // seconds I already logged today
+	// Roles I hold on the issue that day (RoleOrder order).
+	Roles []string
+	// Comments is the number of my comments that day.
+	Comments int
+	// Fixed is the effective fixed time (author / commenter roles).
+	Fixed FixedPart
+	// FixedStart is when a fixed-only worklog starts (creation / first
+	// comment, already clamped into the workday).
+	FixedStart time.Time
+}
+
+// hasFixedRole reports whether the candidate is author or commenter.
+func (c Candidate) hasFixedRole() bool {
+	return c.Fixed.CreateSource != "" || c.Fixed.CommentSource != ""
 }
 
 // Planned is the allocation result for one candidate.
 type Planned struct {
 	Candidate
-	Share   float64 // seconds of today attributed to the issue
+	Share   float64 // seconds of the status time attributed to the issue
 	Todo    int64   // seconds to log now (whole minutes; < MinSeconds means nothing)
 	Started time.Time
 }
 
-// Plan allocates today's time between candidates, preserving their order.
-// Candidates without spans are ignored.
+// Plan allocates the day's time between candidates, preserving their order;
+// capSeconds is the cap minus my time logged that day on other issues.
+// Candidates without spans and without a fixed role are ignored, as are
+// repeated keys (the first one wins).
+//
+// The budget is capSeconds minus what is already logged on the candidates.
+// Fixed time comes first: per issue max(0, fixed − logged), all scaled down
+// proportionally when they exceed the budget (status time then gets
+// nothing). The status shares get the rest: per issue max(0, share −
+// max(0, logged − fixed)), scaled into what the fixed time left. Todo is
+// the sum, rounded down to whole minutes, so re-running a day never logs
+// twice and the cap is never exceeded.
 func Plan(cands []Candidate, capSeconds int64) []Planned {
 	spans := make(map[string][]Interval, len(cands))
-	logged := make(map[string]int64, len(cands))
+	seen := make(map[string]bool, len(cands))
 	kept := make([]Candidate, 0, len(cands))
 	for _, c := range cands {
-		if len(c.Spans) == 0 {
+		if len(c.Spans) == 0 && !c.hasFixedRole() || seen[c.Key] {
 			continue
 		}
-		if _, dup := spans[c.Key]; dup {
-			continue
+		seen[c.Key] = true
+		if len(c.Spans) > 0 {
+			spans[c.Key] = c.Spans
 		}
-		spans[c.Key] = c.Spans
-		logged[c.Key] = c.Logged
 		kept = append(kept, c)
 	}
-	share, todo := Allocate(spans, logged, capSeconds)
+	share := Shares(spans)
+
+	var already, fixedNeed float64
+	fixedTodo := make(map[string]float64, len(kept))
+	for _, c := range kept {
+		already += float64(c.Logged)
+		fixedTodo[c.Key] = math.Max(0, float64(c.Fixed.Seconds()-c.Logged))
+		fixedNeed += fixedTodo[c.Key]
+	}
+	budget := math.Max(0, float64(capSeconds)-already)
+	scaleInto(fixedTodo, fixedNeed, budget)
+	rest := math.Max(0, budget-fixedNeed)
+
+	statusTodo := make(map[string]float64, len(kept))
+	var statusNeed float64
+	for _, c := range kept {
+		over := math.Max(0, float64(c.Logged-c.Fixed.Seconds())) // logged beyond the fixed part
+		statusTodo[c.Key] = math.Max(0, share[c.Key]-over)
+		statusNeed += statusTodo[c.Key]
+	}
+	scaleInto(statusTodo, statusNeed, rest)
+
 	out := make([]Planned, 0, len(kept))
 	for _, c := range kept {
-		out = append(out, Planned{Candidate: c, Share: share[c.Key], Todo: todo[c.Key], Started: c.Spans[0].Start})
+		started := c.FixedStart
+		if len(c.Spans) > 0 {
+			started = c.Spans[0].Start
+		}
+		out = append(out, Planned{Candidate: c, Share: share[c.Key], Todo: floorMinutes(fixedTodo[c.Key] + statusTodo[c.Key]), Started: started})
 	}
 	return out
 }

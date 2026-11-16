@@ -17,11 +17,41 @@ const (
 	ResultError   = "error"
 )
 
+// Roles I can hold on an issue (WorklogItem.roles), in contract order.
+const (
+	RoleDev       = "dev"
+	RoleQA        = "qa"
+	RoleReviewer  = "reviewer"
+	RoleAuthor    = "author"
+	RoleCommenter = "commenter"
+)
+
+// RoleOrder is the order of roles in WorklogItem.roles / RelatedItem.roles.
+var RoleOrder = []string{RoleDev, RoleQA, RoleReviewer, RoleAuthor, RoleCommenter}
+
+// Sources of a fixed-time part (createSource / commentSource).
+const (
+	SourceDefault = "default"
+	SourceGroup   = "group"
+	SourceManual  = "manual"
+)
+
 // Item is one issue of a worklog run (WorklogItem in the JS contract).
 type Item struct {
-	Key           string `json:"key"`
-	Summary       string `json:"summary"`
-	Status        string `json:"status"`
+	Key     string   `json:"key"`
+	Summary string   `json:"summary"`
+	Status  string   `json:"status"`
+	Roles   []string `json:"roles"`
+	// Comments is the number of my comments on the issue that day.
+	Comments int `json:"comments"`
+	// CreateSeconds / CommentSeconds are the effective fixed parts (author /
+	// commenter); their sources are set only when the role holds.
+	CreateSeconds  int64  `json:"createSeconds"`
+	CommentSeconds int64  `json:"commentSeconds"`
+	CreateSource   string `json:"createSource,omitempty"`
+	CommentSource  string `json:"commentSource,omitempty"`
+	FixedSeconds   int64  `json:"fixedSeconds"`
+	// ShareSeconds is the status share (time in my status roles' statuses).
 	ShareSeconds  int64  `json:"shareSeconds"`
 	LoggedSeconds int64  `json:"loggedSeconds"`
 	TodoSeconds   int64  `json:"todoSeconds"`
@@ -49,4 +79,16 @@ type Run struct {
 	// ("weekend", "holiday", "vacation") was computed on request anyway.
 	NonWorkingDay string `json:"nonWorkingDay,omitempty"`
 	Error         string `json:"error,omitempty"`
+	// Related are my other issues without activity that day: preview only,
+	// never stored in the history.
+	Related []RelatedItem `json:"related,omitempty"`
+}
+
+// RelatedItem is an issue where I hold a role but that has nothing to log
+// that day (RelatedItem in the JS contract).
+type RelatedItem struct {
+	Key     string   `json:"key"`
+	Summary string   `json:"summary"`
+	Status  string   `json:"status"`
+	Roles   []string `json:"roles"`
 }

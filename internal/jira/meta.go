@@ -223,6 +223,15 @@ func (c *Client) ProjectStatuses(ctx context.Context, projectKey string) ([]Issu
 	return out, nil
 }
 
+// Statuses returns all statuses of the Jira (GET /rest/api/2/status).
+func (c *Client) Statuses(ctx context.Context) ([]Status, error) {
+	var out []Status
+	if err := c.do(ctx, "GET", "/rest/api/2/status", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // StatusByID returns one status (GET /rest/api/2/status/{id}). Status ids
 // are numeric; anything else is rejected without a request.
 func (c *Client) StatusByID(ctx context.Context, id string) (*Status, error) {

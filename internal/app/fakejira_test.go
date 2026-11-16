@@ -20,17 +20,29 @@ import (
 // taken from the production constants, so a change to a query fails the
 // tests instead of silently changing both sides.
 const (
-	specWorklogJQL = `(assignee = currentUser() OR status changed BY currentUser() DURING (startOfDay(), now())) AND (status changed DURING (startOfDay(), now()) OR statusCategory = "In Progress")`
+	// v0.8: the status-roles query with the default Dev statuses on a Jira
+	// without Developer / QA / Reviewer fields.
+	specWorklogJQL = `(assignee = currentUser() OR status changed BY currentUser() DURING (startOfDay(), now())) AND (status changed DURING (startOfDay(), now()) OR statusCategory = "In Progress" OR status IN ("In Progress", "В работе", "В роботі"))`
 	specBoardJQL   = `assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC`
 	specMyOpenJQL  = `assignee = currentUser() AND statusCategory != Done`
 )
 
 var (
 	// A run computing a past day widens startOfDay() to startOfDay(-Nd).
-	specWorklogJQLWidened = regexp.MustCompile(`^\(assignee = currentUser\(\) OR status changed BY currentUser\(\) DURING \(startOfDay\(-(\d+)d\), now\(\)\)\) AND \(status changed DURING \(startOfDay\(-(\d+)d\), now\(\)\) OR statusCategory = "In Progress"\)$`)
+	specWorklogJQLWidened = regexp.MustCompile(`^\(assignee = currentUser\(\) OR status changed BY currentUser\(\) DURING \(startOfDay\(-(\d+)d\), now\(\)\)\) AND \(status changed DURING \(startOfDay\(-(\d+)d\), now\(\)\) OR statusCategory = "In Progress" OR status IN \("In Progress", "В работе", "В роботі"\)\)$`)
 	specCommentJQL        = regexp.MustCompile(`^assignee = currentUser\(\) AND updated >= -(\d+)m ORDER BY updated ASC$`)
 	specKeysJQL           = regexp.MustCompile(`^issuekey in \(("[A-Z0-9_]+-\d+"(?:,"[A-Z0-9_]+-\d+")*)\)$`)
 	specCapJQL            = regexp.MustCompile(`^worklogAuthor = currentUser\(\) AND worklogDate >= "(\d{4}-\d\d-\d\d)" AND worklogDate <= "(\d{4}-\d\d-\d\d)"$`)
+)
+
+// v0.8 queries.
+var (
+	// The status-roles query with any people fields / status list (today's
+	// form), and the author / commenter / related queries.
+	specRolesJQL     = regexp.MustCompile(`^\(assignee = currentUser\(\)(?: OR cf\[\d+\] = currentUser\(\))* OR status changed BY currentUser\(\) DURING \(startOfDay\(\), now\(\)\)\) AND \(status changed DURING \(startOfDay\(\), now\(\)\) OR statusCategory = "In Progress" OR status IN \(.+\)\)$`)
+	specAuthorJQL    = regexp.MustCompile(`^creator = currentUser\(\) AND created >= "(\d{4}-\d\d-\d\d) 00:00" AND created <= "(\d{4}-\d\d-\d\d) 23:59"$`)
+	specCommenterJQL = regexp.MustCompile(`^updated >= "(\d{4}-\d\d-\d\d) 00:00" AND \(watcher = currentUser\(\) OR assignee = currentUser\(\) OR creator = currentUser\(\) OR reporter = currentUser\(\)(?: OR cf\[\d+\] = currentUser\(\))*\)$`)
+	specRelatedJQL   = regexp.MustCompile(`^\(assignee = currentUser\(\) OR creator = currentUser\(\)(?: OR cf\[\d+\] = currentUser\(\))*\) AND \(resolution = Unresolved OR resolved >= "(\d{4}-\d\d-\d\d) 00:00"\)$`)
 )
 
 type pollComment struct {
@@ -53,6 +65,9 @@ type fakeJira struct {
 	clock scheduler.Clock // set by newTestApp/openApp when nil
 
 	issues      string      // JSON array: worklog search and board
+	created     string      // JSON array: v0.8 author search ("" = none)
+	commented   string      // JSON array: v0.8 commenter search ("" = none)
+	related     string      // JSON array: v0.8 related search ("" = none)
 	capIssues   string      // JSON array: "my worklogs around the day" search ("" = none)
 	capDay      string      // day the cap search must cover ±1; "" = the clock's date
 	comments    string      // JSON array: comment search (when pollIssues is nil)
@@ -340,8 +355,14 @@ func (f *fakeJira) search(q url.Values) (*jira.Response, error) {
 		} else {
 			list = rawList(f.issues)
 		}
-	case jql == specWorklogJQL || jql == specBoardJQL:
+	case jql == specWorklogJQL || jql == specBoardJQL || specRolesJQL.MatchString(jql):
 		list = rawList(f.issues)
+	case specAuthorJQL.MatchString(jql):
+		list = rawList(f.created)
+	case specCommenterJQL.MatchString(jql):
+		list = rawList(f.commented)
+	case specRelatedJQL.MatchString(jql):
+		list = rawList(f.related)
 	case specWorklogJQLWidened.MatchString(jql):
 		m := specWorklogJQLWidened.FindStringSubmatch(jql)
 		if m[1] != m[2] {

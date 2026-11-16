@@ -1647,3 +1647,138 @@ first, never deletes `jiraffe.log.1` (the rename replaces it) and keeps appendin
   (`reporter = currentUser()` wherever "mine" uses its condition: tracked board `reporter = currentUser() AND
   statusCategory != Done ORDER BY updated DESC`, project board incl. done-in-14-days, sprints/backlog); `hidden` is
   reported for it like for "mine"; cached per scope. `getEpics`/`getStories` reject it (`bad_params`).
+
+---
+
+# v0.8 — Worklog by role
+
+Time is logged not only for issues I develop, but for every role I hold on an issue. Defaults below; everything
+is configurable in Settings → **Roles** (new section, right after *Worklog*).
+
+## Roles
+
+| Role (`roles[]` value) | Who | How time is counted |
+|---|---|---|
+| `dev` | assignee = me, or the Developer field contains me, or I changed the status that day (and I am not QA/Reviewer on it) | intervals in `inProgressStatuses` (the existing setting = Dev statuses), as before |
+| `qa` | the QA field (QA Engineer / QA, discovered as in v0.6) contains me | intervals in `qaStatuses` |
+| `reviewer` | the Reviewer field contains me | intervals in `reviewStatuses` |
+| `author` | `creator` = me and the issue was created that day | fixed time per created issue |
+| `commenter` | I wrote ≥ 1 comment on the issue that day | fixed time per comment |
+
+- An issue can hold several roles. Its status time = the time it spent (clipped to working hours, lunch cut, like
+  today) in the **union** of the status sets of my status roles on it. Parallel issues split the wall-clock time
+  equally (unchanged `Allocate`).
+- A role whose status list is empty (QA, Reviewer) / whose minutes are 0 (author, commenter) is off.
+- Role membership is evaluated on the issue's current field values (no history of the role fields).
+
+## Settings (config.Settings, JSON camelCase)
+
+- `qaStatuses` []string, default `["Ready for QA", "QA", "In QA", "Testing", "In Testing", "Ready for Test", "In Test"]`
+- `reviewStatuses` []string, default `["Review", "In Review", "Code Review"]`
+- `authorMinutes` int, default 15, 0…480 — default time per issue I created that day
+- `commentMinutes` int, default 5, 0…240 — default time per comment I wrote that day
+- Lists validated like `inProgressStatuses` (trimmed, de-duplicated case-insensitively, ≤ 50 items, each ≤ 100
+  chars; empty allowed for qa/review). Missing fields in an old settings file get the defaults.
+- UI: section **Roles** (ru «Роли», uk «Ролі», en "Roles") with: Dev statuses (the existing in-progress tag list
+  moves here from *Worklog*, label "Dev — исполнитель"), QA statuses, Reviewer statuses (same tag-list control),
+  "Создание задачи, по умолчанию" (minutes), "Комментарий, по умолчанию" (minutes, per comment). Status inputs
+  suggest the Jira status names already known to the UI (board/sprint statuses), free text allowed.
+
+## Fixed time (author / commenter) and manual overrides
+
+Per day, the effective fixed time of an issue = create part + comment part:
+1. per-issue manual value for that part, if set;
+2. else the day's **group total** for that part, if set, split evenly: create total ÷ number of created issues
+   without a per-issue create value; comment total ÷ number of my comments on issues without a per-issue comment
+   value (an issue with 2 comments gets 2 shares); rounded down to whole minutes;
+3. else the default (`authorMinutes` × 1, `commentMinutes` × comments).
+
+Overrides are stored per day in `state.json` → `worklogOverrides` (map "YYYY-MM-DD" → DayOverrides; days older
+than 31 days are dropped on save) and are used by preview, manual **and scheduled** runs of that day.
+
+```
+DayOverrides {
+  createTotalSeconds?: int     // group total for "created issues" that day (null/absent = not set)
+  commentTotalSeconds?: int    // group total for "comments" that day
+  issues: { [key]: { createSeconds?: int, commentSeconds?: int } }   // per-issue values; 0 is a valid value
+}
+```
+Validation (`bad_params`): each value 0…86400 and a multiple of 60; ≤ 200 issue keys, keys match `^[A-Z][A-Z0-9_]*-\d+$`
+(checked without regexp); date as in `worklogPreview` (≤ 30 days back, not future).
+
+## Budget (daily cap)
+
+As today: budget = cap − my time logged that day on all issues. Then:
+1. **Fixed first**: per issue, fixed todo = max(0, fixed − logged on it). If Σ fixed todo > budget, all fixed
+   todos are scaled down proportionally and status time gets nothing.
+2. **Status time gets the rest**: per issue, status todo = max(0, share − max(0, logged − fixed)); scaled
+   proportionally into budget − Σ fixed todo.
+3. Todo = fixed todo + status todo, floored to whole minutes; < 1 min is skipped (unchanged). Re-running a day
+   never logs twice (logged time is subtracted, as now).
+- `started` of the worklog: the first status span start; for a fixed-only issue, the creation time / first comment
+  time that day, clamped into [workday start, workday end).
+
+## Queries (Jira Server JQL; `cf[N]` = discovered field id number; a clause is omitted if its field is absent)
+
+- Status roles (today; past days use the same absolute-date form as v0.7.1 with `WAS`):
+  `(assignee = currentUser() OR cf[DEV] = currentUser() OR cf[QA] = currentUser() OR cf[REV] = currentUser()
+  OR status changed BY currentUser() DURING (<from>, now())) AND (status changed DURING (<from>, now()) OR
+  statusCategory = "In Progress" OR status IN (<all role statuses>))`
+- Author: `creator = currentUser() AND created >= "<date> 00:00" AND created <= "<date> 23:59"`, then filtered by
+  the local day of `created`.
+- Commenter: `updated >= "<date> 00:00" AND (watcher = currentUser() OR assignee = currentUser() OR creator =
+  currentUser() OR reporter = currentUser() OR cf[DEV|QA|REV] = currentUser())`, fields `comment`; my comments
+  (author = me, created in the local day) counted; when the embedded comment list is incomplete, fetch all
+  comments of that issue. Limit 200 issues.
+- Related (preview only, not stored in history): issues where I hold a role —
+  `(assignee = currentUser() OR creator = currentUser() OR cf[DEV|QA|REV] = currentUser()) AND (resolution =
+  Unresolved OR resolved >= "<date> 00:00")`, limit 200, minus the run's items.
+
+- Status names are first matched against `GET /rest/api/2/status` (case-insensitive, Jira's spelling used); unknown
+  names are left out of the JQL, since Jira rejects a query with an unknown status (verified 2026-11-16: "In QA",
+  "QA", "Ready for QA", "Ready for Test" do not exist on the real Jira). 400/403/404 on the list keeps the names.
+- Settings → Roles: a ⌄ button next to each status input opens the app menu with the status names the UI knows.
+
+## Contract (additions)
+
+`WorklogItem` gains:
+```
+roles: string[]          // subset of "dev","qa","reviewer","author","commenter", in this order
+comments: int            // my comments on it that day
+createSeconds: int       // effective create part (0 if not author)
+commentSeconds: int      // effective comment part (0 if no comments)
+createSource?: "default" | "group" | "manual"    // present when author
+commentSource?: "default" | "group" | "manual"   // present when commenter
+fixedSeconds: int        // createSeconds + commentSeconds
+// shareSeconds stays = the status share
+```
+`WorklogRun` gains `related: RelatedItem[]` — **preview only** (empty/absent in runs stored in history):
+`RelatedItem { key, summary, status, roles: string[] }`.
+
+Methods:
+- `getWorklogOverrides { date? }` → `DayOverrides` (empty `{ issues: {} }` when none).
+- `setWorklogOverrides { date?, overrides: DayOverrides }` → `DayOverrides` (saved, normalized: absent instead
+  of null, issues without values removed). Replaces the day's overrides as a whole.
+
+## UI — Worklog screen
+
+- Each row shows role chips (Dev, QA, Reviewer, Автор, Коммент ×N) next to the summary.
+- Rows with `author`/`commenter` show the create / comment parts as small editable duration fields (Jira format,
+  e.g. `20m`, `1h 30m`; empty = back to default/group); a source hint (по умолчанию / поровну / вручную).
+- Above the table, when the day has created issues or comments: two group fields "Создание задач — всего за день"
+  and "Комментарии — всего за день" (empty = per-issue defaults), hint "распределяется поровну".
+- Any change → `setWorklogOverrides` (debounced 600 ms, Enter/blur commits) → re-preview. Errors inline.
+- Below the table, a collapsible "Другие мои задачи — без активности за день (N)" lists `related` (key, summary,
+  status, role chips), opening the drawer on click.
+- History rows show the same role chips (from stored items).
+- i18n: en / ru / uk for every new string.
+
+## Acceptance v0.8
+
+1. Defaults: a day with one In Progress issue (dev), one issue I created and 2 comments on another issue logs
+   status share + 15m + 2×5m within the cap; fixed time is taken first.
+2. QA / Reviewer issues are found by their fields and counted only while in their role's statuses.
+3. Per-issue and group overrides follow the precedence above, persist per day and are used by the scheduled run.
+4. Re-running a day logs nothing new; the cap is never exceeded.
+5. Settings: new fields validated, saved, defaults for old files; Dev statuses = existing `inProgressStatuses`.
+6. `./build.sh --check` passes; the exe stays < 5 MiB; no `regexp`.

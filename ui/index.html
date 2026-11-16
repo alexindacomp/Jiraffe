@@ -60,6 +60,8 @@
     <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l3-3A5 5 0 0 0 13 2.9l-1 1"/><path d="M14 11a5 5 0 0 0-7.1 0l-3 3A5 5 0 0 0 11 21.1l1-1"/></symbol>
     <symbol id="i-message" viewBox="0 0 24 24"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/></symbol>
     <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+    <!-- v0.8: Settings → Roles -->
+    <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
     <!-- v0.5: issue form + rich-text editor -->
     <!-- v0.6: issue panel -->
     <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
@@ -349,15 +351,59 @@
                       <p class="field-error" id="e-hoursPerDay" data-error-for="hoursPerDay" hidden></p>
                     </div>
                   </div>
+                </section>
+
+                <!-- Roles (v0.8): whose time is counted on an issue; Dev statuses = inProgressStatuses -->
+                <section class="settings-section" aria-labelledby="sec-roles">
+                  <h2 class="settings-title" id="sec-roles"><svg class="icon" aria-hidden="true"><use href="#i-users"/></svg><span data-i18n="settings.roles"></span></h2>
                   <div class="setting setting-stack">
-                    <div class="setting-text"><label for="s-status-input" data-i18n="settings.statuses"></label><p class="hint" data-i18n="settings.statusesHint"></p></div>
+                    <div class="setting-text"><label for="s-status-input" id="l-statuses" data-i18n="settings.statuses"></label><p class="hint" id="h-inProgressStatuses" data-i18n="settings.statusesHint"></p></div>
                     <div class="setting-control setting-control-wide">
-                      <ul class="tags" id="s-statuses" role="list"></ul>
+                      <ul class="tags" id="s-statuses" role="list" aria-labelledby="l-statuses"></ul>
                       <div class="add-row">
-                        <input class="input" type="text" id="s-status-input" data-i18n-attr="placeholder:settings.statusPlaceholder" aria-describedby="e-inProgressStatuses">
-                        <button type="button" class="btn" data-action="add-status"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="common.add"></span></button>
+                        <input class="input" type="text" id="s-status-input" autocomplete="off" spellcheck="false" data-status-kind="status" data-i18n-attr="placeholder:settings.statusPlaceholder" aria-describedby="h-inProgressStatuses e-inProgressStatuses">
+                        <button type="button" class="icon-btn" id="s-status-pick" data-action="pick-status" data-status-kind="status" aria-haspopup="menu" aria-expanded="false" data-i18n-attr="aria-label:settings.pickStatus;title:settings.pickStatus"><svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+                        <button type="button" class="btn" data-action="add-status" data-status-kind="status"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="common.add"></span></button>
                       </div>
                       <p class="field-error" id="e-inProgressStatuses" data-error-for="inProgressStatuses" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting setting-stack">
+                    <div class="setting-text"><label for="s-qa-status-input" id="l-qaStatuses" data-i18n="settings.qaStatuses"></label><p class="hint" id="h-qaStatuses" data-i18n="settings.qaStatusesHint"></p></div>
+                    <div class="setting-control setting-control-wide">
+                      <ul class="tags" id="s-qa-statuses" role="list" aria-labelledby="l-qaStatuses"></ul>
+                      <div class="add-row">
+                        <input class="input" type="text" id="s-qa-status-input" autocomplete="off" spellcheck="false" data-status-kind="qa-status" data-i18n-attr="placeholder:settings.statusPlaceholder" aria-describedby="h-qaStatuses e-qaStatuses">
+                        <button type="button" class="icon-btn" id="s-qa-status-pick" data-action="pick-status" data-status-kind="qa-status" aria-haspopup="menu" aria-expanded="false" data-i18n-attr="aria-label:settings.pickStatus;title:settings.pickStatus"><svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+                        <button type="button" class="btn" data-action="add-status" data-status-kind="qa-status"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="common.add"></span></button>
+                      </div>
+                      <p class="field-error" id="e-qaStatuses" data-error-for="qaStatuses" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting setting-stack">
+                    <div class="setting-text"><label for="s-review-status-input" id="l-reviewStatuses" data-i18n="settings.reviewStatuses"></label><p class="hint" id="h-reviewStatuses" data-i18n="settings.reviewStatusesHint"></p></div>
+                    <div class="setting-control setting-control-wide">
+                      <ul class="tags" id="s-review-statuses" role="list" aria-labelledby="l-reviewStatuses"></ul>
+                      <div class="add-row">
+                        <input class="input" type="text" id="s-review-status-input" autocomplete="off" spellcheck="false" data-status-kind="review-status" data-i18n-attr="placeholder:settings.statusPlaceholder" aria-describedby="h-reviewStatuses e-reviewStatuses">
+                        <button type="button" class="icon-btn" id="s-review-status-pick" data-action="pick-status" data-status-kind="review-status" aria-haspopup="menu" aria-expanded="false" data-i18n-attr="aria-label:settings.pickStatus;title:settings.pickStatus"><svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+                        <button type="button" class="btn" data-action="add-status" data-status-kind="review-status"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="common.add"></span></button>
+                      </div>
+                      <p class="field-error" id="e-reviewStatuses" data-error-for="reviewStatuses" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-authorMinutes" data-i18n="settings.authorMinutes"></label><p class="hint" id="h-authorMinutes" data-i18n="settings.authorMinutesHint"></p></div>
+                    <div class="setting-control">
+                      <div class="input-unit"><input class="input input-num" type="number" id="s-authorMinutes" name="authorMinutes" min="0" max="480" step="1" inputmode="numeric" aria-describedby="h-authorMinutes e-authorMinutes"><span data-i18n="settings.unitMinutes"></span></div>
+                      <p class="field-error" id="e-authorMinutes" data-error-for="authorMinutes" hidden></p>
+                    </div>
+                  </div>
+                  <div class="setting">
+                    <div class="setting-text"><label for="s-commentMinutes" data-i18n="settings.commentMinutes"></label><p class="hint" id="h-commentMinutes" data-i18n="settings.commentMinutesHint"></p></div>
+                    <div class="setting-control">
+                      <div class="input-unit"><input class="input input-num" type="number" id="s-commentMinutes" name="commentMinutes" min="0" max="240" step="1" inputmode="numeric" aria-describedby="h-commentMinutes e-commentMinutes"><span data-i18n="settings.unitMinutes"></span></div>
+                      <p class="field-error" id="e-commentMinutes" data-error-for="commentMinutes" hidden></p>
                     </div>
                   </div>
                 </section>

@@ -21,6 +21,8 @@ var messages = map[string]map[string]string{
 		"worklogBeforeEnd": "The run time must not be earlier than the end of the workday",
 		"projectsMany":     "Too many projects (at most %d)",
 		"projectKey":       "Invalid project key %q",
+		"statusesMany":     "Too many statuses (at most %d)",
+		"statusLong":       "A status name is too long (at most %d characters)",
 	},
 	"ru": {
 		"url":              "Укажите полный адрес http(s), например https://jira.example.com",
@@ -39,6 +41,8 @@ var messages = map[string]map[string]string{
 		"worklogBeforeEnd": "Время запуска не может быть раньше конца рабочего дня",
 		"projectsMany":     "Слишком много проектов (не больше %d)",
 		"projectKey":       "Неверный ключ проекта %q",
+		"statusesMany":     "Слишком много статусов (не больше %d)",
+		"statusLong":       "Слишком длинное название статуса (не больше %d символов)",
 	},
 	"uk": {
 		"url":              "Вкажіть повну адресу http(s), наприклад https://jira.example.com",
@@ -57,6 +61,8 @@ var messages = map[string]map[string]string{
 		"worklogBeforeEnd": "Час запуску не може бути раніше за кінець робочого дня",
 		"projectsMany":     "Забагато проєктів (не більше %d)",
 		"projectKey":       "Невірний ключ проєкту %q",
+		"statusesMany":     "Забагато статусів (не більше %d)",
+		"statusLong":       "Задовга назва статусу (не більше %d символів)",
 	},
 }
 

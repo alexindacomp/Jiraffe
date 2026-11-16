@@ -225,6 +225,7 @@ func New(cfg *config.Store, st *state.Store, plat Platform, clock scheduler.Cloc
 		emit = func(string, any) {}
 	}
 	a := &App{cfg: cfg, st: st, plat: plat, clock: clock, emit: emit}
+	st.SetClock(clock.Now) // old worklog overrides are pruned by the app's day
 	a.bgCtx, a.bgCancel = context.WithCancel(context.Background())
 	a.sched = scheduler.New(clock, scheduler.Hooks{
 		Config:       a.schedulerConfig,
@@ -569,11 +570,28 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 		if method == "worklogRun" {
 			return a.manualWorklog(ctx, date)
 		}
-		run, err := a.computeWorklog(ctx, worklog.TriggerPreview, time.Time{}, date)
+		run, err := a.previewWorklog(ctx, date)
 		if err != nil {
 			return nil, err
 		}
 		return run, nil
+	case "getWorklogOverrides":
+		var p struct {
+			Date string `json:"date"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.worklogOverrides(p.Date)
+	case "setWorklogOverrides":
+		var p struct {
+			Date      string                `json:"date"`
+			Overrides *worklog.DayOverrides `json:"overrides"`
+		}
+		if err := a.decode(params, &p); err != nil {
+			return nil, err
+		}
+		return a.setWorklogOverrides(p.Date, p.Overrides)
 	case "getMissedWorklogDays":
 		return a.missedDays(), nil
 	case "skipWorklogDay":
@@ -588,6 +606,13 @@ func (a *App) Call(ctx context.Context, method string, params json.RawMessage) (
 		h := a.st.Snapshot().History
 		if h == nil {
 			h = []worklog.Run{}
+		}
+		for i := range h {
+			for j := range h[i].Items {
+				if h[i].Items[j].Roles == nil { // stored before v0.8
+					h[i].Items[j].Roles = []string{}
+				}
+			}
 		}
 		return h, nil
 	case "getNotifications":

@@ -15,6 +15,7 @@
    | untracked (trackedProjects = null) | closedfail (getSprintGroups: closed sprints fail ⇒ closedUnavailable)
    | limit (tracking more than 6 projects fails with a validation error, like the Go limit of 200) | noprefs (no getUiPrefs: older backend)
    | timepartial (getEpics reports timePartial: some issues' time could not be read)
+   | ovfail (v0.8: getWorklogOverrides fails)
    | (v0.5 create / edit: see the "v0.5 create / edit issues" block)
    | update | update-oncheck | update-fail | update-nowrite | update-badsig | update-checkfail | noupdate | devbuild | updated
    (auto-update, see the "v0.4 auto-update" block below). */
@@ -548,6 +549,11 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     vacations: [{ from: '2026-12-24', to: '2027-01-02', note: 'Новогодние' }],
     holidays: ['2026-12-25', '2027-01-01'],
     inProgressStatuses: ['In Progress', 'В работе', 'В роботі'],
+    // v0.8 roles (SPEC defaults)
+    qaStatuses: ['Ready for QA', 'QA', 'In QA', 'Testing', 'In Testing', 'Ready for Test', 'In Test'],
+    reviewStatuses: ['Review', 'In Review', 'Code Review'],
+    authorMinutes: 15,
+    commentMinutes: 5,
     notifyComments: true,
     commentPollMinutes: 5,
     boardJql: 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC',
@@ -597,6 +603,82 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     return null;
   }
 
+  /* v0.8 worklog by role. Status roles of the share rows; issues I created / commented that day (today, or any past
+     working day); "related" issues without activity (preview only); per-day overrides as in state.json. Roles switch
+     off like the Go side: empty QA / Reviewer statuses, 0 author / comment minutes. */
+  const ROLE_ORDER = ['dev', 'qa', 'reviewer', 'author', 'commenter'];
+  const SHARE_ROLES = { 'RBI-1028': 'dev', 'CMA-412': 'dev', 'EDS-230': 'qa' };
+  const FIXED = flags.has('empty') ? { today: { authored: [], comments: {} }, past: { authored: [], comments: {} } }
+    : { today: { authored: ['MB-90'], comments: { 'CMA-412': 1, 'RBI-1019': 2 } }, past: { authored: [], comments: { 'EDS-233': 1 } } };
+  const RELATED = flags.has('empty') ? [] : [['CMA-415', ['reviewer']], ['MB-77', ['qa']], ['EDS-233', ['dev']], ['OPS-12', ['dev', 'author']], ['RBI-1019', ['dev']]];
+  const worklogOverrides = new Map(); // "YYYY-MM-DD" → DayOverrides
+  const roleOn = (r) => (r === 'qa' ? settings.qaStatuses.length > 0 : r === 'reviewer' ? settings.reviewStatuses.length > 0 : true);
+  /** key → { comments, createSeconds, commentSeconds, createSource?, commentSource? } by the SPEC precedence. */
+  function fixedParts(date, spec) {
+    const ov = worklogOverrides.get(date) || { issues: {} };
+    const iss = (k) => ov.issues[k] || {};
+    const authored = settings.authorMinutes > 0 ? spec.authored : [];
+    const comments = settings.commentMinutes > 0 ? spec.comments : {};
+    const out = new Map();
+    const at = (k) => { if (!out.has(k)) out.set(k, { comments: 0, createSeconds: 0, commentSeconds: 0 }); return out.get(k); };
+    const freeCreate = authored.filter((k) => iss(k).createSeconds == null).length;
+    authored.forEach((k) => {
+      const m = iss(k).createSeconds;
+      const p = at(k);
+      if (m != null) { p.createSeconds = m; p.createSource = 'manual'; }
+      else if (ov.createTotalSeconds != null) { p.createSeconds = Math.floor(ov.createTotalSeconds / freeCreate / 60) * 60; p.createSource = 'group'; }
+      else { p.createSeconds = settings.authorMinutes * 60; p.createSource = 'default'; }
+    });
+    const freeComments = Object.keys(comments).filter((k) => iss(k).commentSeconds == null).reduce((a, k) => a + comments[k], 0);
+    Object.keys(comments).forEach((k) => {
+      const n = comments[k];
+      const m = iss(k).commentSeconds;
+      const p = at(k);
+      p.comments = n;
+      if (m != null) { p.commentSeconds = m; p.commentSource = 'manual'; }
+      else if (ov.commentTotalSeconds != null) { p.commentSeconds = Math.floor((ov.commentTotalSeconds * n) / freeComments / 60) * 60; p.commentSource = 'group'; }
+      else { p.commentSeconds = settings.commentMinutes * 60 * n; p.commentSource = 'default'; }
+    });
+    return out;
+  }
+  /** Rows of a day: status shares ([key, share, start]) + created / commented issues, with roles and fixed parts. */
+  function roleItems(day, shares, spec) {
+    const fixed = fixedParts(isoDay(day), spec);
+    const rows = shares.filter(([key]) => roleOn(SHARE_ROLES[key] || 'dev')).map(([key, share, start]) => ({ key, share, start }));
+    fixed.forEach((_, key) => { if (!rows.some((r) => r.key === key)) rows.push({ key, share: 0, start: '10:00' }); });
+    return rows.map(({ key, share, start }) => {
+      const is = rec(key) || {};
+      const f = fixed.get(key) || { comments: 0, createSeconds: 0, commentSeconds: 0 };
+      const roles = [];
+      if (share > 0) roles.push(SHARE_ROLES[key] || 'dev');
+      if (f.createSource) roles.push('author');
+      if (f.comments > 0) roles.push('commenter');
+      const item = { key, summary: is.summary || key, status: (is.status || ST.inprog).name, roles: ROLE_ORDER.filter((r) => roles.includes(r)),
+        comments: f.comments, createSeconds: f.createSeconds, commentSeconds: f.commentSeconds, fixedSeconds: f.createSeconds + f.commentSeconds,
+        shareSeconds: share, loggedSeconds: 0, todoSeconds: 0, started: rfc(atTime(day, start)) };
+      if (f.createSource) item.createSource = f.createSource;
+      if (f.comments > 0) item.commentSource = f.commentSource;
+      return item;
+    });
+  }
+  /** SPEC v0.8 budget: fixed time first, status time gets the rest; floored to whole minutes. */
+  function allocate(items, budget) {
+    const sum = (a) => a.reduce((x, y) => x + y, 0);
+    const fixedTodo = items.map((i) => Math.max(0, i.fixedSeconds - i.loggedSeconds));
+    const fScale = sum(fixedTodo) > budget ? (sum(fixedTodo) ? Math.max(0, budget) / sum(fixedTodo) : 0) : 1;
+    const ft = fixedTodo.map((v) => v * fScale);
+    const rest = Math.max(0, budget - sum(ft));
+    const st = items.map((i) => Math.max(0, i.shareSeconds - Math.max(0, i.loggedSeconds - i.fixedSeconds)));
+    const sScale = sum(st) > rest ? (sum(st) ? rest / sum(st) : 0) : 1;
+    items.forEach((i, k) => { i.todoSeconds = Math.floor((ft[k] + st[k] * sScale) / 60) * 60; i.duration = fmt(i.todoSeconds); });
+  }
+  function relatedOf(run) {
+    return RELATED.filter(([key]) => !run.items.some((i) => i.key === key)).map(([key, roles]) => {
+      const is = rec(key) || {};
+      return { key, summary: is.summary || key, status: (is.status || ST.inprog).name, roles: roles.filter(roleOn) };
+    }).filter((r) => r.roles.length);
+  }
+
   /* v0.7.1 past days: D's in-progress shares; logged time per day; missed days (?mock=nomissed: none, missed2: two). */
   const PAST_SHARES = [['RBI-1028', 3 * 3600 + 36 * 60, '09:00'], ['CMA-412', 2 * 3600, '14:00']]; // 5h 36m: the missed day
   const loggedPast = new Map(); // date → Map(key → seconds), runs made for past days
@@ -620,7 +702,7 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
       run.nonWorkingDay = reason;
       if (d.getDay() !== 6 || history.some((r) => r.date === date && r.trigger === 'manual')) return run; // Saturday: 1 h on RBI-1028
       const is = rec('RBI-1028') || {};
-      run.items = [{ key: 'RBI-1028', summary: is.summary || 'RBI-1028', status: (is.status || ST.inprog).name, shareSeconds: 3600, loggedSeconds: 0, todoSeconds: 3600, duration: fmt(3600), started: rfc(atTime(d, '11:00')) }];
+      run.items = [{ key: 'RBI-1028', summary: is.summary || 'RBI-1028', status: (is.status || ST.inprog).name, roles: ['dev'], comments: 0, createSeconds: 0, commentSeconds: 0, fixedSeconds: 0, shareSeconds: 3600, loggedSeconds: 0, todoSeconds: 3600, duration: fmt(3600), started: rfc(atTime(d, '11:00')) }];
       run.totalSeconds = 3600; run.total = fmt(3600);
       return run;
     }
@@ -629,12 +711,9 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     const quiet = history.some((r) => r.date === date && r.trigger === 'catchup'); // the "nothing to add" day
     if (quiet && !done) return run;
     const logged = loggedPast.get(date) || new Map();
-    run.items = PAST_SHARES.map(([key, share, start]) => {
-      const is = rec(key) || {};
-      const prior = done ? share : logged.get(key) || 0;
-      return { key, summary: is.summary || key, status: (is.status || ST.inprog).name, shareSeconds: share, loggedSeconds: prior, todoSeconds: Math.max(0, share - prior), started: rfc(atTime(d, start)) };
-    });
-    run.items.forEach((i) => { i.duration = fmt(i.todoSeconds); });
+    run.items = roleItems(d, PAST_SHARES, FIXED.past);
+    run.items.forEach((i) => { i.loggedSeconds = done ? i.shareSeconds + i.fixedSeconds : logged.get(i.key) || 0; });
+    allocate(run.items, capSec() - run.items.reduce((a, i) => a + i.loggedSeconds, 0));
     run.totalSeconds = run.items.reduce((a, i) => a + i.todoSeconds, 0);
     run.total = fmt(run.totalSeconds);
     return run;
@@ -648,14 +727,9 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     if (reason) { run.skippedReason = reason; return run; }
     if (OTHER_LOGGED !== undefined) run.otherLoggedSeconds = OTHER_LOGGED;
     const capLeft = Math.max(0, capSec() - (OTHER_LOGGED || 0) - [...loggedToday.values()].reduce((a, b) => a + b, 0));
-    const items = SHARES.map(([key, share, start]) => {
-      const is = rec(key) || {};
-      const logged = loggedToday.get(key) || 0;
-      return { key, summary: is.summary || key, status: (is.status || ST.inprog).name, shareSeconds: share, loggedSeconds: logged, todoSeconds: Math.max(0, share - logged), started: rfc(atTime(d, start)) };
-    });
-    const sum = items.reduce((a, i) => a + i.todoSeconds, 0);
-    if (sum > capLeft) items.forEach((i) => { i.todoSeconds = sum ? Math.floor((i.todoSeconds * capLeft) / sum / 60) * 60 : 0; });
-    items.forEach((i) => { i.duration = fmt(i.todoSeconds); });
+    const items = roleItems(d, SHARES, FIXED.today);
+    items.forEach((i) => { i.loggedSeconds = loggedToday.get(i.key) || 0; });
+    allocate(items, capLeft);
     run.items = items;
     run.totalSeconds = items.reduce((a, i) => a + i.todoSeconds, 0);
     run.total = fmt(run.totalSeconds);
@@ -734,10 +808,11 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
 
   /* ---------- validation (messages in the configured language, like the Go side would) ---------- */
   const MSG = {
-    ru: { required: 'Обязательное поле', url: 'Введите адрес вида https://…', time: 'Время в формате ЧЧ:ММ', order: 'Начало должно быть раньше конца', within: 'Обед должен быть внутри рабочего дня', range: 'Допустимо от {min} до {max}', int: 'Нужно целое число', days: 'Выберите хотя бы один день', date: 'Некорректная дата', dateOrder: 'Дата окончания раньше даты начала', statuses: 'Нужен хотя бы один статус', token: 'Укажите токен доступа' },
-    uk: { required: 'Обов’язкове поле', url: 'Введіть адресу виду https://…', time: 'Час у форматі ГГ:ХХ', order: 'Початок має бути раніше за кінець', within: 'Обід має бути в межах робочого дня', range: 'Допустимо від {min} до {max}', int: 'Потрібне ціле число', days: 'Оберіть хоча б один день', date: 'Некоректна дата', dateOrder: 'Дата завершення раніше за дату початку', statuses: 'Потрібен хоча б один статус', token: 'Вкажіть токен доступу' },
-    en: { required: 'Required', url: 'Enter a URL like https://…', time: 'Use HH:MM', order: 'Start must be before end', within: 'Lunch must be within the working day', range: 'Allowed range {min}–{max}', int: 'Must be a whole number', days: 'Select at least one day', date: 'Invalid date', dateOrder: 'End date is before start date', statuses: 'At least one status is required', token: 'Enter an access token' },
+    ru: { required: 'Обязательное поле', url: 'Введите адрес вида https://…', time: 'Время в формате ЧЧ:ММ', order: 'Начало должно быть раньше конца', within: 'Обед должен быть внутри рабочего дня', range: 'Допустимо от {min} до {max}', int: 'Нужно целое число', days: 'Выберите хотя бы один день', date: 'Некорректная дата', dateOrder: 'Дата окончания раньше даты начала', statuses: 'Нужен хотя бы один статус', token: 'Укажите токен доступа', listLen: 'Не больше {max} статусов', itemLen: 'Название статуса — до {max} символов' },
+    uk: { required: 'Обов’язкове поле', url: 'Введіть адресу виду https://…', time: 'Час у форматі ГГ:ХХ', order: 'Початок має бути раніше за кінець', within: 'Обід має бути в межах робочого дня', range: 'Допустимо від {min} до {max}', int: 'Потрібне ціле число', days: 'Оберіть хоча б один день', date: 'Некоректна дата', dateOrder: 'Дата завершення раніше за дату початку', statuses: 'Потрібен хоча б один статус', token: 'Вкажіть токен доступу', listLen: 'Не більше {max} статусів', itemLen: 'Назва статусу — до {max} символів' },
+    en: { required: 'Required', url: 'Enter a URL like https://…', time: 'Use HH:MM', order: 'Start must be before end', within: 'Lunch must be within the working day', range: 'Allowed range {min}–{max}', int: 'Must be a whole number', days: 'Select at least one day', date: 'Invalid date', dateOrder: 'End date is before start date', statuses: 'At least one status is required', token: 'Enter an access token', listLen: 'At most {max} statuses', itemLen: 'A status name is at most {max} characters' },
   };
+  const STATUS_LIST_KEYS = ['inProgressStatuses', 'qaStatuses', 'reviewStatuses'];
   function validate(s, newToken) {
     const m = MSG[s.language] || MSG.ru;
     const errs = [];
@@ -770,6 +845,16 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     });
     (s.holidays || []).forEach((h) => { if (!isDate(h)) add('holidays', 'date', {}); });
     if (!Array.isArray(s.inProgressStatuses) || !s.inProgressStatuses.length) add('inProgressStatuses', 'statuses', {});
+    // v0.8: role lists (≤ 50 items, each ≤ 100 chars; empty allowed for QA / Reviewer) and the fixed minutes
+    STATUS_LIST_KEYS.forEach((k) => {
+      const v = s[k];
+      if (!Array.isArray(v) || v.length > 50) add(k, 'listLen', { max: 50 });
+      else if (v.some((x) => typeof x !== 'string' || !x.trim() || x.trim().length > 100)) add(k, 'itemLen', { max: 100 });
+    });
+    [['authorMinutes', 480], ['commentMinutes', 240]].forEach(([k, max]) => {
+      if (!Number.isInteger(s[k])) add(k, 'int', {});
+      else if (s[k] < 0 || s[k] > max) add(k, 'range', { min: 0, max });
+    });
     if (!String(s.boardJql || '').trim()) add('boardJql', 'required', {});
     return errs;
   }
@@ -1541,7 +1626,46 @@ bq. Воспроизводится на стенде _preprod_ стабильн�
     worklogPreview(p) {
       const date = checkDay(p);
       maybeFail(ERROR_RATE / 2, 'network', 'WinHTTP 12002: the operation timed out');
-      return buildRun('preview', date);
+      const run = buildRun('preview', date);
+      if (!run.skippedReason) run.related = relatedOf(run); // v0.8: preview only, never stored in history
+      return run;
+    },
+    /* --- v0.8 fixed-time overrides (state.json worklogOverrides) --- */
+    getWorklogOverrides(p) {
+      const date = checkDay(p);
+      if (flags.has('ovfail')) throw new MockError('internal', 'state.json: access denied');
+      return clone(worklogOverrides.get(date) || { issues: {} });
+    },
+    setWorklogOverrides(p) {
+      const date = checkDay(p);
+      const o = p && p.overrides;
+      if (!o || typeof o !== 'object' || Array.isArray(o)) throw new MockError('bad_params', 'overrides must be an object');
+      const okSec = (v) => Number.isInteger(v) && v >= 0 && v <= 86400 && v % 60 === 0;
+      const out = { issues: {} };
+      ['createTotalSeconds', 'commentTotalSeconds'].forEach((f) => {
+        if (o[f] == null) return;
+        if (!okSec(o[f])) throw new MockError('bad_params', `${f} must be 0…86400 and a multiple of 60`);
+        out[f] = o[f];
+      });
+      const issues = o.issues == null ? {} : o.issues;
+      if (typeof issues !== 'object' || Array.isArray(issues)) throw new MockError('bad_params', 'issues must be an object');
+      const keys = Object.keys(issues);
+      if (keys.length > 200) throw new MockError('bad_params', 'at most 200 issues');
+      keys.forEach((k) => {
+        if (!/^[A-Z][A-Z0-9_]*-\d+$/.test(k)) throw new MockError('bad_params', `bad issue key ${k}`);
+        const v = issues[k] || {};
+        const e = {};
+        ['createSeconds', 'commentSeconds'].forEach((f) => {
+          if (v[f] == null) return;
+          if (!okSec(v[f])) throw new MockError('bad_params', `${k}.${f} must be 0…86400 and a multiple of 60`);
+          e[f] = v[f];
+        });
+        if (Object.keys(e).length) out.issues[k] = e;
+      });
+      if (out.createTotalSeconds == null && out.commentTotalSeconds == null && !Object.keys(out.issues).length) worklogOverrides.delete(date);
+      else worklogOverrides.set(date, out);
+      console.info('[jiraffe mock] setWorklogOverrides →', date, out); // eslint-disable-line no-console
+      return clone(out);
     },
     worklogRun(p) {
       requireConfigured();

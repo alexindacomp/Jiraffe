@@ -11,13 +11,11 @@ import (
 )
 
 func TestWorklogJQLMatchesSpec(t *testing.T) {
-	if WorklogJQL != specWorklogJQL {
-		t.Errorf("WorklogJQL\n got  %s\n want %s", WorklogJQL, specWorklogJQL)
-	}
+	q := RoleQuery{Statuses: config.Defaults().InProgressStatuses}
 	wed := time.Date(2026, 11, 11, 23, 59, 59, 0, zone)
 	widened := func(n string) string {
 		return `(assignee = currentUser() OR status changed BY currentUser() DURING (startOfDay(-` + n + `d), now())) AND ` +
-			`(status changed DURING (startOfDay(-` + n + `d), now()) OR statusCategory = "In Progress")`
+			`(status changed DURING (startOfDay(-` + n + `d), now()) OR statusCategory = "In Progress" OR status IN ("In Progress", "В работе", "В роботі"))`
 	}
 	tests := []struct {
 		name           string
@@ -31,7 +29,7 @@ func TestWorklogJQLMatchesSpec(t *testing.T) {
 		{"real clock in UTC, same local day", wed, wed.UTC(), specWorklogJQL},
 	}
 	for _, tc := range tests {
-		if got := WorklogJQLFor(tc.effective, tc.now); got != tc.want {
+		if got := WorklogJQLFor(tc.effective, tc.now, q); got != tc.want {
 			t.Errorf("%s:\n got  %s\n want %s", tc.name, got, tc.want)
 		}
 	}
@@ -97,7 +95,8 @@ func TestRunDueBeforeMidnightComputesTheDecidedDay(t *testing.T) {
 	if got := strings.Join(fj.posted, "|"); got != "A-1 28800 2026-11-11T09:00:00.000+0200" {
 		t.Errorf("posted %q", got)
 	}
-	if jqls := fj.searched(); len(jqls) == 0 || !strings.Contains(jqls[0], "startOfDay(-2d)") {
+	// v0.8: field discovery may search first; the first status-roles query counts.
+	if jqls := statusRoleQueries(fj.searched()); len(jqls) == 0 || !strings.Contains(jqls[0], "startOfDay(-2d)") {
 		t.Errorf("issue query %q", jqls)
 	}
 	snap := a.st.Snapshot()
@@ -151,4 +150,15 @@ func TestEmbeddedWorklogsAvoidFullFetch(t *testing.T) {
 	if run.Error != "" || run.OtherLoggedSeconds != 3*3600 || run.TotalSeconds != 5*3600 {
 		t.Errorf("error=%q other=%d total=%d", run.Error, run.OtherLoggedSeconds, run.TotalSeconds)
 	}
+}
+
+// statusRoleQueries keeps the status-roles worklog queries of jqls.
+func statusRoleQueries(jqls []string) []string {
+	var out []string
+	for _, q := range jqls {
+		if strings.HasPrefix(q, "(assignee = currentUser() OR") && strings.Contains(q, "status changed BY currentUser()") {
+			out = append(out, q)
+		}
+	}
+	return out
 }

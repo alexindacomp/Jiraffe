@@ -25,6 +25,9 @@ const (
 	MaxNotifications = 200
 	MaxSeenComments  = 5000
 	MaxSkippedDays   = 100
+	// OverrideKeepDays: worklog overrides of days older than this are
+	// dropped on save.
+	OverrideKeepDays = 31
 )
 
 // LockName is the lock file next to state.json that serializes saves of
@@ -81,6 +84,17 @@ type Data struct {
 	// SkippedWorklogDays are past days the user chose not to log
 	// (ascending, unique); they are never reported as missed.
 	SkippedWorklogDays []string `json:"skippedWorklogDays,omitempty"`
+	// WorklogOverrides are the fixed-time overrides per day ("2006-01-02");
+	// days older than OverrideKeepDays are dropped on save.
+	WorklogOverrides map[string]DayOverrides `json:"worklogOverrides,omitempty"`
+}
+
+// DayOverrides is a day's worklog overrides as stored: At (RFC 3339) is
+// when they were set, so that merging with another process's save keeps the
+// newer version of each day. An empty value with At set records a reset.
+type DayOverrides struct {
+	worklog.DayOverrides
+	At string `json:"at,omitempty"`
 }
 
 // UpdateCheck is the result of an update check.
@@ -101,12 +115,13 @@ type Store struct {
 	mu   sync.Mutex
 	d    Data
 	seen map[string]struct{}
+	now  func() time.Time // clock for pruning old overrides
 }
 
 // Open loads state from path. A missing file yields an empty state; a corrupt
 // one is moved aside to path+".bad" (the error is returned, the Store usable).
 func Open(path string) (*Store, error) {
-	s := &Store{path: path, lock: filepath.Join(filepath.Dir(path), LockName), seen: map[string]struct{}{}}
+	s := &Store{path: path, lock: filepath.Join(filepath.Dir(path), LockName), seen: map[string]struct{}{}, now: time.Now}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -123,6 +138,14 @@ func Open(path string) (*Store, error) {
 		s.seen[id] = struct{}{}
 	}
 	return s, nil
+}
+
+// SetClock replaces the clock used to prune old worklog overrides (the app
+// passes its own, so tests can fix the date).
+func (s *Store) SetClock(now func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now = now
 }
 
 // Snapshot returns a deep copy of the state.
@@ -146,6 +169,12 @@ func (d Data) clone() Data {
 	}
 	if d.UIPrefs != nil {
 		c.UIPrefs = append(json.RawMessage{}, d.UIPrefs...)
+	}
+	if d.WorklogOverrides != nil {
+		c.WorklogOverrides = make(map[string]DayOverrides, len(d.WorklogOverrides))
+		for k, v := range d.WorklogOverrides {
+			c.WorklogOverrides[k] = DayOverrides{DayOverrides: v.DayOverrides.Clone(), At: v.At}
+		}
 	}
 	if d.UpdateCheck != nil {
 		u := *d.UpdateCheck
@@ -224,6 +253,39 @@ func (t Tx) SkipDay(date string) {
 	t.SkippedWorklogDays = unionDays(t.SkippedWorklogDays, []string{date})
 }
 
+// Overrides returns the worklog overrides of a day (empty when none).
+func (d Data) Overrides(date string) worklog.DayOverrides {
+	if o, ok := d.WorklogOverrides[date]; ok {
+		return o.DayOverrides.Clone()
+	}
+	return worklog.DayOverrides{Issues: map[string]worklog.IssueOverride{}}
+}
+
+// SetOverrides replaces the worklog overrides of a day; at is when they were
+// set (decides concurrent saves, see merge).
+func (t Tx) SetOverrides(date string, o worklog.DayOverrides, at time.Time) {
+	if t.WorklogOverrides == nil {
+		t.WorklogOverrides = map[string]DayOverrides{}
+	}
+	t.WorklogOverrides[date] = DayOverrides{DayOverrides: o.Clone(), At: at.Format(time.RFC3339Nano)}
+}
+
+// pruneOverrides drops the overrides of days older than OverrideKeepDays
+// before now's day.
+func pruneOverrides(m map[string]DayOverrides, now time.Time) map[string]DayOverrides {
+	y, mo, d := now.Date()
+	oldest := time.Date(y, mo, d-OverrideKeepDays, 12, 0, 0, 0, now.Location()).Format(worklog.DateLayout)
+	for day := range m {
+		if day < oldest { // ISO dates compare as strings
+			delete(m, day)
+		}
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
 // Update applies fn and persists the result. Saves of all processes are
 // serialized by a lock file; under it the file is re-read and merged into
 // this process's state first (see merge), so another process's history,
@@ -240,6 +302,7 @@ func (s *Store) Update(fn func(tx Tx)) error {
 	}
 	s.mergeFromDisk()
 	fn(Tx{Data: &s.d, s: s})
+	s.d.WorklogOverrides = pruneOverrides(s.d.WorklogOverrides, s.now())
 	b, err := json.Marshal(s.d)
 	if err != nil {
 		return fmt.Errorf("encode state: %w", err)
@@ -295,6 +358,7 @@ func sameSlice(a, b []string) bool {
 //     tracks nothing yet adopts the saved tracking), capped;
 //   - skipped worklog days: union; lastWorklogDate: the later one;
 //     firstRunDate: the earlier one;
+//   - worklog overrides: per day the one set later;
 //   - everything else: mine.
 //
 // Without foreign entries mine is returned unchanged (same order).
@@ -348,6 +412,32 @@ func merge(mine, disk Data) (Data, int) {
 	if disk.FirstRunDate != "" && (mine.FirstRunDate == "" || disk.FirstRunDate < mine.FirstRunDate) {
 		out.FirstRunDate = disk.FirstRunDate
 		n++
+	}
+	var o int
+	out.WorklogOverrides, o = mergeOverrides(mine.WorklogOverrides, disk.WorklogOverrides)
+	n += o
+	return out, n
+}
+
+// mergeOverrides keeps, per day, the overrides set later (mine on a tie).
+func mergeOverrides(mine, disk map[string]DayOverrides) (map[string]DayOverrides, int) {
+	var out map[string]DayOverrides
+	n := 0
+	for day, d := range disk {
+		if m, ok := mine[day]; ok && !parseTime(d.At).After(parseTime(m.At)) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]DayOverrides, len(mine)+len(disk))
+			for k, v := range mine {
+				out[k] = v
+			}
+		}
+		out[day] = d
+		n++
+	}
+	if out == nil {
+		return mine, 0
 	}
 	return out, n
 }

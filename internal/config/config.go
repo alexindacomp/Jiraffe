@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultBoardJQL is the board query used when the setting is empty.
@@ -56,7 +57,23 @@ type Settings struct {
 	TrackedProjects []string `json:"trackedProjects"`
 	// AutoCheckUpdates enables the update check at startup and once a day.
 	AutoCheckUpdates bool `json:"autoCheckUpdates"`
+	// Worklog roles (v0.8): the statuses counted for the QA / Reviewer roles
+	// (empty = role off; InProgressStatuses are the Dev statuses) and the
+	// default fixed time per issue I created / per comment I wrote that day
+	// (0 = role off).
+	QAStatuses     []string `json:"qaStatuses"`
+	ReviewStatuses []string `json:"reviewStatuses"`
+	AuthorMinutes  int      `json:"authorMinutes"`
+	CommentMinutes int      `json:"commentMinutes"`
 }
+
+// Limits of the status lists and the fixed worklog minutes.
+const (
+	MaxStatuses       = 50
+	MaxStatusLen      = 100
+	MaxAuthorMinutes  = 480
+	MaxCommentMinutes = 240
+)
 
 // MaxTrackedProjects bounds the tracked project list (JQL length).
 const MaxTrackedProjects = 200
@@ -83,6 +100,10 @@ func Defaults() Settings {
 		BoardJQL:           DefaultBoardJQL,
 		LoadFactor:         1,
 		AutoCheckUpdates:   true,
+		QAStatuses:         []string{"Ready for QA", "QA", "In QA", "Testing", "In Testing", "Ready for Test", "In Test"},
+		ReviewStatuses:     []string{"Review", "In Review", "Code Review"},
+		AuthorMinutes:      15,
+		CommentMinutes:     5,
 	}
 }
 
@@ -98,6 +119,8 @@ func (s Settings) Clone() Settings {
 	c.Vacations = append([]Vacation{}, s.Vacations...)
 	c.Holidays = append([]string{}, s.Holidays...)
 	c.InProgressStatuses = append([]string{}, s.InProgressStatuses...)
+	c.QAStatuses = append([]string{}, s.QAStatuses...)
+	c.ReviewStatuses = append([]string{}, s.ReviewStatuses...)
 	if s.TrackedProjects != nil { // keep nil (not initialised) distinct from empty
 		c.TrackedProjects = append([]string{}, s.TrackedProjects...)
 	}
@@ -199,17 +222,25 @@ func (s *Settings) Normalize() {
 	sort.SliceStable(vac, func(i, j int) bool { return vac[i].From < vac[j].From })
 	s.Vacations = vac
 
-	st := make([]string, 0, len(s.InProgressStatuses))
+	s.InProgressStatuses = normStatuses(s.InProgressStatuses)
+	s.QAStatuses = normStatuses(s.QAStatuses)
+	s.ReviewStatuses = normStatuses(s.ReviewStatuses)
+	s.TrackedProjects = NormalizeProjectKeys(s.TrackedProjects)
+}
+
+// normStatuses trims status names and drops empty and case-insensitive
+// duplicates (first one wins); never nil.
+func normStatuses(names []string) []string {
+	out := make([]string, 0, len(names))
 	seen := map[string]bool{}
-	for _, n := range s.InProgressStatuses {
+	for _, n := range names {
 		n = strings.TrimSpace(n)
-		if n != "" && !seen[strings.ToLower(n)] {
-			seen[strings.ToLower(n)] = true
-			st = append(st, n)
+		if k := strings.ToLower(n); n != "" && !seen[k] {
+			seen[k] = true
+			out = append(out, n)
 		}
 	}
-	s.InProgressStatuses = st
-	s.TrackedProjects = NormalizeProjectKeys(s.TrackedProjects)
+	return out
 }
 
 // NormalizeProjectKeys trims, upper-cases, sorts and dedups project keys.
@@ -315,6 +346,26 @@ func (s Settings) Validate() []FieldError {
 	}
 	if len(s.InProgressStatuses) == 0 {
 		add("inProgressStatuses", "statuses")
+	}
+	for _, f := range []struct {
+		name  string
+		names []string
+	}{{"inProgressStatuses", s.InProgressStatuses}, {"qaStatuses", s.QAStatuses}, {"reviewStatuses", s.ReviewStatuses}} {
+		if len(f.names) > MaxStatuses {
+			add(f.name, "statusesMany", MaxStatuses)
+		}
+		for _, n := range f.names {
+			if utf8.RuneCountInString(n) > MaxStatusLen {
+				add(f.name, "statusLong", MaxStatusLen)
+				break
+			}
+		}
+	}
+	if s.AuthorMinutes < 0 || s.AuthorMinutes > MaxAuthorMinutes {
+		add("authorMinutes", "range", 0, MaxAuthorMinutes)
+	}
+	if s.CommentMinutes < 0 || s.CommentMinutes > MaxCommentMinutes {
+		add("commentMinutes", "range", 0, MaxCommentMinutes)
 	}
 	if s.CommentPollMinutes < 1 || s.CommentPollMinutes > 60 {
 		add("commentPollMinutes", "range", 1, 60)
@@ -470,6 +521,14 @@ func repair(s Settings, errs []FieldError) Settings {
 			s.Holidays = d.Holidays
 		case "inProgressStatuses":
 			s.InProgressStatuses = d.InProgressStatuses
+		case "qaStatuses":
+			s.QAStatuses = d.QAStatuses
+		case "reviewStatuses":
+			s.ReviewStatuses = d.ReviewStatuses
+		case "authorMinutes":
+			s.AuthorMinutes = d.AuthorMinutes
+		case "commentMinutes":
+			s.CommentMinutes = d.CommentMinutes
 		case "commentPollMinutes":
 			s.CommentPollMinutes = d.CommentPollMinutes
 		case "boardJql":

@@ -137,15 +137,15 @@ var rbi1028 = issueJSON("RBI-1028", "ForReview", "2026-11-03T10:00:00.000+0200",
 var me = &jira.User{Name: "alex", Key: "alex"}
 
 func TestPastWorklogJQL(t *testing.T) {
-	if got, want := PastWorklogJQL("2026-11-12", []string{"In Progress", "В работе", "В роботі"}), specPastJQL("2026-11-12"); got != want {
+	if got, want := PastWorklogJQL("2026-11-12", RoleQuery{Statuses: []string{"In Progress", "В работе", "В роботі"}}), specPastJQL("2026-11-12"); got != want {
 		t.Errorf("got  %s\nwant %s", got, want)
 	}
 	// trimmed, de-duplicated case-insensitively, quotes and backslashes escaped
-	got := PastWorklogJQL("2026-11-12", []string{" Doing ", "doing", `Say "hi"`, `a\b`, ""})
+	got := PastWorklogJQL("2026-11-12", RoleQuery{Statuses: []string{" Doing ", "doing", `Say "hi"`, `a\b`, ""}})
 	if !strings.HasPrefix(got, `status WAS IN ("Doing", "Say \"hi\"", "a\\b") DURING`) {
 		t.Errorf("got %s", got)
 	}
-	if PastWorklogJQL("2026-11-12", []string{" ", ""}) != "" {
+	if PastWorklogJQL("2026-11-12", RoleQuery{Statuses: []string{" ", ""}}) != "" {
 		t.Error("no statuses must give no query")
 	}
 }

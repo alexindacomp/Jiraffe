@@ -160,6 +160,7 @@ func (a *App) checkMissedDays(ctx context.Context, now time.Time) error {
 			continue
 		}
 		run.Trigger = worklog.TriggerCatchup
+		run.Related = nil // preview only, never stored
 		if err := a.st.Update(func(tx state.Tx) { tx.AddRun(run) }); err != nil {
 			log.Printf("save catch-up entry %s: %v", date, err)
 		}

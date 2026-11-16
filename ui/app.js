@@ -217,7 +217,12 @@
     wl: { preview: null, previewLoading: false, previewError: null, previewSeq: 0,
           result: null, running: false,
           history: null, historyLoading: false, historyError: null,
-          date: null, pendingDate: null }, // v0.7.1: the chosen day (null = today); Review from the missed notice sets pendingDate
+          date: null, pendingDate: null, // v0.7.1: the chosen day (null = today); Review from the missed notice sets pendingDate
+          // v0.8 fixed time: ov = the day's DayOverrides (get/setWorklogOverrides); fx = the inline editors
+          // (drafts / errors by field id "total:create" | "issue:KEY:comment", debounce timers, one save queue)
+          ov: { date: null, data: null, loading: false, error: null, seq: 0 },
+          fx: { drafts: {}, errors: {}, timers: {}, saving: false, queue: Promise.resolve(), rendering: false },
+          relatedOpen: false },
     missed: { days: [], dismissed: '', busy: new Set() }, // v0.7.1: missed worklog days (getMissedWorklogDays / worklogMissed)
 
     notif: { list: null, loading: false, error: null, markingAll: false },
@@ -5321,16 +5326,19 @@
   function enterWorklog() {
     S.wl.date = S.wl.pendingDate; // a fresh visit shows today; "Review" from the missed notice opens that day
     S.wl.pendingDate = null;
+    fxReset();
     renderWorklog();
     ensureSettings().then(() => { if (S.view === 'worklog') renderWorklog(); });
     if (!S.wl.running) S.wl.result = null; // re-entering the view shows a fresh preview
     if (!S.wl.previewLoading && !S.wl.running) loadPreview();
+    else loadOverrides(); // v0.8: loadPreview fetches them otherwise
     if (!S.wl.historyLoading) loadHistory();
   }
 
-  async function loadPreview() {
+  async function loadPreview({ keepOverrides = false } = {}) {
     const seq = ++S.wl.previewSeq;
     S.wl.previewLoading = true;
+    if (!keepOverrides || !S.wl.ov.data) loadOverrides();
     renderWorklog();
     renderRefreshState();
     try {
@@ -5436,6 +5444,7 @@
     S.wl.date = date;
     S.wl.result = null;
     S.wl.preview = null; // the old day's table must not stay under the new title
+    fxReset();
     loadPreview();
   }
 
@@ -5500,33 +5509,41 @@
     }
   }
 
-  function itemsTable(items, { showResult, compact } = {}) {
+  function itemsTable(items, { showResult, compact, edit } = {}) {
     const logged = sumOf(items, 'loggedSeconds');
     const todo = sumOf(items, 'todoSeconds');
     const share = sumOf(items, 'shareSeconds');
-    const cols = (showResult ? 7 : 6) - (compact ? 2 : 0);
+    // v0.8: the "fixed" column (created issues + comments) only when the run has such time; editors in the preview only
+    const hasFixed = !compact && items.some((i) => Number(i.fixedSeconds) > 0 || fixedRoles(i).length);
+    const cols = (showResult ? 7 : 6) - (compact ? 2 : 0) + (hasFixed ? 1 : 0);
     return html`<div class="table-wrap"><table class="table">
       <thead><tr>
         <th scope="col">${t('worklog.col.issue')}</th>
         ${compact ? '' : html`<th scope="col">${t('worklog.col.status')}</th>`}
         ${compact ? '' : html`<th scope="col" class="num">${t('worklog.col.share')}</th>`}
+        ${hasFixed ? html`<th scope="col" class="num" title="${t('worklog.col.fixedTip')}">${t('worklog.col.fixed')}</th>` : ''}
         <th scope="col" class="num">${t('worklog.col.logged')}</th>
         <th scope="col" class="num">${t(compact ? 'worklog.col.logTotal' : showResult ? 'worklog.col.attempted' : 'worklog.col.todo')}</th>
         <th scope="col">${t('worklog.col.start')}</th>
         ${showResult ? html`<th scope="col">${t('worklog.col.result')}</th>` : ''}
       </tr></thead>
-      <tbody>${items.map((it) => html`<tr>
-          <td><span class="cell-issue"><span class="card-key">${it.key}</span><span class="sum" title="${it.summary || ''}">${it.summary || ''}</span></span></td>
+      <tbody>${items.map((it) => {
+        const fx = edit && fixedRoles(it).length > 0;
+        return html`<tr${fx ? html` class="has-fx"` : ''}>
+          <td><span class="cell-issue"><span class="cell-issue-top"><span class="card-key">${it.key}</span>${roleChips(it)}</span><span class="sum" title="${it.summary || ''}">${it.summary || ''}</span></span></td>
           ${compact ? '' : html`<td class="nowrap">${nameOf(it.status)}</td>`}
-          ${compact ? '' : html`<td class="num">${dur(it.shareSeconds)}</td>`}
+          ${compact ? '' : html`<td class="num">${Number(it.shareSeconds) > 0 || !hasFixed ? dur(it.shareSeconds) : '—'}</td>`}
+          ${hasFixed ? html`<td class="num">${Number(it.fixedSeconds) > 0 ? dur(it.fixedSeconds) : '—'}</td>` : ''}
           <td class="num muted">${it.loggedSeconds ? dur(it.loggedSeconds) : '—'}</td>
           <td class="num strong">${it.todoSeconds ? dur(it.todoSeconds) : '—'}</td>
           <td class="muted">${it.started ? i18n.time(it.started) : '—'}</td>
           ${showResult ? html`<td>${resultChip(it)}</td>` : ''}
-        </tr>${it.error ? html`<tr class="row-error"><td colspan="${cols}">${it.error}</td></tr>` : ''}`)}</tbody>
+        </tr>${fx ? fxRow(it, cols) : ''}${it.error ? html`<tr class="row-error"><td colspan="${cols}">${it.error}</td></tr>` : ''}`;
+      })}</tbody>
       ${compact ? '' : html`<tfoot><tr>
         <td>${t('worklog.total')}</td><td></td>
         <td class="num">${dur(share)}</td>
+        ${hasFixed ? html`<td class="num">${dur(sumOf(items, 'fixedSeconds'))}</td>` : ''}
         <td class="num">${logged ? dur(logged) : '—'}</td>
         <td class="num">${dur(todo)}</td>
         <td></td>${showResult ? html`<td></td>` : ''}
@@ -5582,7 +5599,7 @@
     $('#wl-preview-btn').disabled = previewLoading || running;
     setBusy($('#wl-run-btn'), running || S.wl.refreshingForRun);
     // v0.7.1: a non-working day that has time (past day, by hand) can be logged; without items there is nothing to log
-    $('#wl-run-btn').disabled = running || S.wl.refreshingForRun || previewLoading || !!result || !preview || !!preview.error || todo <= 0;
+    $('#wl-run-btn').disabled = running || S.wl.refreshingForRun || previewLoading || !!result || !preview || !!preview.error || todo <= 0 || S.wl.fx.saving;
 
     if (!run && previewLoading) {
       setHTML(el, html`<div role="status" aria-label="${t('common.loading')}" style="display:flex;flex-direction:column;gap:8px">${[0, 1, 2, 3].map(() => html`<div class="skeleton" style="height:36px"></div>`)}</div>`);
@@ -5602,14 +5619,329 @@
     const offNote = run.nonWorkingDay ? html`<p class="wl-note">${icon('calendar')}<span>${t('worklog.offDayNote', { reason: reasonText(run.nonWorkingDay) })}</span></p>` : '';
     const dayNote = html`${pastDay && !result ? html`<p class="wl-note wl-past">${icon('history')}<span>${t('worklog.pastNote', { date: dayTextShort(pastDay) })}</span></p>` : ''}${offNote}`;
     const errBanner = run.error ? html`<div class="inline-error" style="margin-bottom:12px">${icon('alert')}<span>${run.error}</span></div>` : '';
+    const related = result ? '' : relatedBlock(run);
     if (!items.length) {
-      setHTML(el, html`${errBanner}${offNote}${otherNote(run)}${stateBlock({ iconName: 'inbox', title: t('worklog.nothingTitle'), text: pastDay ? t('worklog.nothingTextDay') : t('worklog.nothingText') })}`);
+      wlKeepFocus(el, html`${errBanner}${offNote}${otherNote(run)}${stateBlock({ iconName: 'inbox', title: t('worklog.nothingTitle'), text: pastDay ? t('worklog.nothingTextDay') : t('worklog.nothingText') })}${related}`);
       return;
     }
     const allDone = !result && todo <= 0
       ? html`<div class="inline-error inline-success">${icon('check-circle')}<span>${t('worklog.allLogged')}</span></div>`
       : '';
-    setHTML(el, html`${errBanner}${allDone}${todo > 0 ? dayNote : offNote}${otherNote(run)}${itemsTable(items, { showResult: !!result })}${capBar(run, items, !!result)}`);
+    const edit = !result && items.some((i) => fixedRoles(i).length);
+    wlKeepFocus(el, html`${errBanner}${allDone}${todo > 0 ? dayNote : offNote}${otherNote(run)}${edit ? fxTotals(items) : ''}${itemsTable(items, { showResult: !!result, edit })}${capBar(run, items, !!result)}${related}`);
+  }
+
+  /* --- v0.8: worklog by role — role chips, fixed time (author / commenter) editors, related issues --- */
+  const ROLE_ORDER = ['dev', 'qa', 'reviewer', 'author', 'commenter'];
+  const fixedRoles = (it) => (Array.isArray(it && it.roles) ? it.roles : []).filter((r) => r === 'author' || r === 'commenter');
+  function roleChips(it) {
+    const have = Array.isArray(it && it.roles) ? it.roles : [];
+    const roles = ROLE_ORDER.filter((r) => have.includes(r));
+    if (!roles.length) return '';
+    const n = Number(it.comments) || 0;
+    return html`<span class="role-chips">${roles.map((r) => html`<span class="chip chip-role" data-rc="${r}" title="${t('worklog.roleTip.' + r, { n })}">${r === 'commenter' && n > 0 ? t('worklog.role.commenterN', { n }) : t('worklog.role.' + r)}</span>`)}</span>`;
+  }
+
+  /** "Other issues of mine without activity that day": preview only, collapsed by default; a row opens the drawer. */
+  function relatedBlock(run) {
+    const rel = (run && Array.isArray(run.related) ? run.related : []).filter((r) => r && r.key);
+    if (!rel.length) return '';
+    return html`<details class="wl-related" id="wl-related"${S.wl.relatedOpen ? html` open` : ''}>
+      <summary>${icon('chevron-down', 'chev')}<span>${t('worklog.related', { n: rel.length })}</span></summary>
+      <ul class="wl-rel-list" role="list">${rel.map((r) => html`<li><button type="button" class="wl-rel-row" data-open-key="${r.key}" data-focus-key="${r.key}" aria-haspopup="dialog">
+        <span class="card-key">${r.key}</span><span class="wl-rel-sum" title="${r.summary || ''}">${r.summary || ''}</span>
+        <span class="wl-rel-status">${nameOf(r.status)}</span>${roleChips(r)}
+      </button></li>`)}</ul>
+    </details>`;
+  }
+
+  /** Re-renders the preview without losing the field being typed in (value, caret) or the focused row. */
+  function wlKeepFocus(el, content) {
+    const a = document.activeElement;
+    let keep = null;
+    if (a && el.contains(a)) {
+      if (a.dataset.fx) keep = { sel: `[data-fx="${CSS.escape(a.dataset.fx)}"]`, value: a.value, start: a.selectionStart, end: a.selectionEnd };
+      else if (a.dataset.openKey) keep = { sel: `[data-open-key="${CSS.escape(a.dataset.openKey)}"]` };
+      else if (a.closest('#wl-related > summary')) keep = { sel: '#wl-related > summary' };
+      else if (a.dataset.action) keep = { sel: `[data-action="${CSS.escape(a.dataset.action)}"]` };
+    }
+    S.wl.fx.rendering = true; // the focused input goes away with the old markup: that blur is not a commit
+    try { setHTML(el, content); } finally { S.wl.fx.rendering = false; }
+    if (!keep) return;
+    const b = $(keep.sel, el);
+    if (!b || b.disabled) return;
+    b.focus({ preventScroll: true });
+    if (keep.start != null && b.value === keep.value) { try { b.setSelectionRange(keep.start, keep.end); } catch { /* not a text field */ } }
+  }
+
+  /** Jira duration text of a fixed-time field → seconds (whole minutes); "" → null (not set); NaN = invalid.
+      "20m", "1h 30m", "1,5h"; a bare number is minutes. 1d = hoursPerDay, 1w = 5d (as dur() shows them). */
+  function parseFixedDur(text) {
+    const v = String(text || '').trim().toLowerCase().replace(/,/g, '.');
+    if (!v) return null;
+    if (/^\d+$/.test(v)) return Number(v) * 60;
+    if (!DURATION.test(v)) return NaN;
+    const hpd = (S.settings && Number(S.settings.hoursPerDay)) || 9;
+    const unit = { w: 5 * hpd * 3600, d: hpd * 3600, h: 3600, m: 60 };
+    let sec = 0;
+    v.replace(/(\d+(?:\.\d+)?)\s*([wdhm])/g, (_, n, u) => { sec += Number(n) * unit[u]; return ''; });
+    return Math.round(sec / 60) * 60;
+  }
+  /** Seconds → the Jira text the fields take ("1h 30m"). */
+  function jiraDur(sec) {
+    const m = Math.max(0, Math.round((Number(sec) || 0) / 60));
+    const h = Math.floor(m / 60);
+    return [h ? h + 'h' : '', m % 60 || !h ? (m % 60) + 'm' : ''].filter(Boolean).join(' ');
+  }
+  const FX_MAX = 86400;
+  const fxDomId = (id) => 'fx-' + id.replace(/[^A-Za-z0-9_-]/g, '-');
+
+  /** DayOverrides as the backend normalizes it: absent instead of null, issues without values dropped. */
+  function normOverrides(d) {
+    const out = { issues: {} };
+    const num = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+    if (d && num(d.createTotalSeconds) != null) out.createTotalSeconds = num(d.createTotalSeconds);
+    if (d && num(d.commentTotalSeconds) != null) out.commentTotalSeconds = num(d.commentTotalSeconds);
+    Object.entries((d && d.issues) || {}).forEach(([key, v]) => {
+      const o = {};
+      if (v && num(v.createSeconds) != null) o.createSeconds = num(v.createSeconds);
+      if (v && num(v.commentSeconds) != null) o.commentSeconds = num(v.commentSeconds);
+      if (Object.keys(o).length) out.issues[key] = o;
+    });
+    return out;
+  }
+  /** The stored value behind a field id, or null when not set. */
+  function fxStored(id) {
+    const d = S.wl.ov.data;
+    if (!d) return null;
+    const [kind, a, b] = id.split(':');
+    if (kind === 'total') { const v = d[a === 'create' ? 'createTotalSeconds' : 'commentTotalSeconds']; return v == null ? null : v; }
+    const v = d.issues[a] && d.issues[a][b === 'create' ? 'createSeconds' : 'commentSeconds'];
+    return v == null ? null : v;
+  }
+  /** A copy of the day's overrides with one field set (sec) or cleared (null). */
+  function fxApply(data, id, sec) {
+    const next = normOverrides(data);
+    const [kind, a, b] = id.split(':');
+    if (kind === 'total') {
+      const f = a === 'create' ? 'createTotalSeconds' : 'commentTotalSeconds';
+      if (sec == null) delete next[f]; else next[f] = sec;
+    } else {
+      const f = b === 'create' ? 'createSeconds' : 'commentSeconds';
+      const cur = Object.assign({}, next.issues[a]);
+      if (sec == null) delete cur[f]; else cur[f] = sec;
+      if (Object.keys(cur).length) next.issues[a] = cur; else delete next.issues[a];
+    }
+    return next;
+  }
+
+  /** One small duration field: label, input (Jira format; empty = back to the group / default value), source hint. */
+  function fxField({ id, label, aria, stored, placeholder, hint }) {
+    const fx = S.wl.fx;
+    const dom = fxDomId(id);
+    const err = fx.errors[id];
+    const value = Object.prototype.hasOwnProperty.call(fx.drafts, id) ? fx.drafts[id] : stored != null ? jiraDur(stored) : '';
+    const disabled = !S.wl.ov.data || S.wl.running;
+    return html`<span class="fx-field">
+      <label class="fx-label" for="${dom}">${label}</label>
+      <input class="input input-dur" type="text" id="${dom}" data-fx="${id}" value="${value}" placeholder="${placeholder}" autocomplete="off" spellcheck="false"
+        aria-label="${aria}" aria-describedby="${dom}-hint${err ? ' ' + dom + '-err' : ''}"${err ? html` aria-invalid="true"` : ''}${disabled ? html` disabled` : ''}>
+      <span class="fx-hint" id="${dom}-hint" data-src="${hint.src || ''}">${hint.text}</span>
+      ${err ? html`<span class="fx-error" id="${dom}-err">${icon('alert')}<span>${err}</span></span>` : ''}
+    </span>`;
+  }
+  const FX_SRC = { default: 'worklog.fx.src.default', group: 'worklog.fx.src.group', manual: 'worklog.fx.src.manual' };
+  const srcHint = (src) => ({ src: FX_SRC[src] ? src : 'default', text: t(FX_SRC[src] || FX_SRC.default) });
+
+  /** The sub-row under an author / commenter row: its create and comment parts. */
+  function fxRow(it, cols) {
+    const roles = fixedRoles(it);
+    const n = Number(it.comments) || 0;
+    const parts = [];
+    if (roles.includes('author')) {
+      const id = `issue:${it.key}:create`;
+      const label = t('worklog.fx.create');
+      parts.push(fxField({ id, label, aria: `${label} — ${it.key}`, stored: fxStored(id), placeholder: jiraDur(it.createSeconds), hint: srcHint(it.createSource) }));
+    }
+    if (roles.includes('commenter')) {
+      const id = `issue:${it.key}:comment`;
+      const label = t('worklog.fx.comments', { n });
+      parts.push(fxField({ id, label, aria: `${label} — ${it.key}`, stored: fxStored(id), placeholder: jiraDur(it.commentSeconds), hint: srcHint(it.commentSource) }));
+    }
+    return html`<tr class="row-fx"><td colspan="${cols}"><div class="fx-parts">${parts}</div></td></tr>`;
+  }
+
+  /** Above the table: the day's group totals (split evenly), shown when the day has created issues / comments. */
+  function fxTotals(items) {
+    const ov = S.wl.ov;
+    const fx = S.wl.fx;
+    const authored = items.filter((i) => fixedRoles(i).includes('author'));
+    const commented = items.filter((i) => fixedRoles(i).includes('commenter'));
+    const fields = [];
+    if (authored.length || fxStored('total:create') != null) {
+      fields.push(fxField({ id: 'total:create', label: t('worklog.fx.createTotal'), aria: t('worklog.fx.createTotal'), stored: fxStored('total:create'),
+        placeholder: jiraDur(sumOf(authored, 'createSeconds')), hint: { src: 'group', text: t('worklog.fx.splitEvenly') } }));
+    }
+    if (commented.length || fxStored('total:comment') != null) {
+      fields.push(fxField({ id: 'total:comment', label: t('worklog.fx.commentTotal'), aria: t('worklog.fx.commentTotal'), stored: fxStored('total:comment'),
+        placeholder: jiraDur(sumOf(commented, 'commentSeconds')), hint: { src: 'group', text: t('worklog.fx.splitEvenly') } }));
+    }
+    return html`<div class="fx-totals" role="group" aria-label="${t('worklog.fx.groupLabel')}">
+      <div class="fx-parts">${fields}</div>
+      <p class="fx-note">${t('worklog.fx.note')}</p>
+      <div class="fx-live" id="fx-live" role="status" aria-live="polite">${fxStatus()}</div>
+    </div>`;
+  }
+  function fxStatus() {
+    const ov = S.wl.ov;
+    if (ov.error && !ov.data) return html`<span class="fx-status is-error">${icon('alert')}<span>${t('worklog.fx.loadFailed')}</span><button type="button" class="btn btn-sm" data-action="fx-retry">${t('common.retry')}</button></span>`;
+    if (S.wl.fx.saving) return html`<span class="fx-status"><span class="spinner spinner-xs" aria-hidden="true"></span><span>${t('worklog.fx.saving')}</span></span>`;
+    if (ov.loading && !ov.data) return html`<span class="fx-status"><span class="spinner spinner-xs" aria-hidden="true"></span><span>${t('common.loading')}</span></span>`;
+    return '';
+  }
+  /** Only the status line and the run button: a full re-render here could swallow a click that is in progress. */
+  function fxRenderStatus() {
+    const live = $('#fx-live');
+    if (live) setHTML(live, html`${fxStatus()}`);
+    if (S.wl.fx.saving) $('#wl-run-btn').disabled = true; // renderWorklogPreview() enables it again
+  }
+
+  async function loadOverrides() {
+    const ov = S.wl.ov;
+    const date = S.wl.date || '';
+    const seq = ++ov.seq;
+    ov.loading = true;
+    if (ov.date !== date) { ov.data = null; ov.error = null; }
+    try {
+      const d = await api('getWorklogOverrides', date ? { date } : {});
+      if (seq !== ov.seq) return;
+      ov.data = normOverrides(d);
+      ov.error = null;
+    } catch (e) {
+      if (seq !== ov.seq) return;
+      ov.data = null;
+      ov.error = e;
+    } finally {
+      if (seq === ov.seq) { ov.loading = false; ov.date = date; if (S.view === 'worklog') renderWorklogPreview(); }
+    }
+  }
+
+  function fxReset() {
+    const fx = S.wl.fx;
+    Object.values(fx.timers).forEach(clearTimeout);
+    fx.timers = {};
+    fx.drafts = {};
+    fx.errors = {};
+    S.wl.ov.seq++; // a load for the previous day is dropped
+    S.wl.ov.data = null;
+    S.wl.ov.error = null;
+    S.wl.ov.loading = false;
+    S.wl.ov.date = null;
+  }
+
+  /** Validates a field's text and queues the save. via = "timer" (still typing: the text stays as typed) | "commit". */
+  function fxCommit(id, via) {
+    const fx = S.wl.fx;
+    clearTimeout(fx.timers[id]);
+    delete fx.timers[id];
+    if (!Object.prototype.hasOwnProperty.call(fx.drafts, id)) return fx.queue;
+    const text = fx.drafts[id];
+    const sec = parseFixedDur(text);
+    let err = null;
+    if (Number.isNaN(sec)) err = t('worklog.fx.invalid');
+    else if (sec != null && sec > FX_MAX) err = t('worklog.fx.tooLong');
+    if (err) {
+      if (fx.errors[id] !== err) { fx.errors[id] = err; renderWorklogPreview(); }
+      return fx.queue;
+    }
+    const date = S.wl.date || '';
+    fx.queue = fx.queue.then(() => fxSave(id, text, sec, date, via)).catch(() => { /* reported inline */ });
+    return fx.queue;
+  }
+
+  async function fxSave(id, text, sec, date, via) {
+    const fx = S.wl.fx;
+    const ov = S.wl.ov;
+    if (date !== (S.wl.date || '') || !ov.data || ov.date !== date) return; // the day changed meanwhile
+    /** true when the field's markup changes (error gone, or the typed text is replaced by the normalized value) */
+    const done = () => {
+      let changed = !!fx.errors[id];
+      delete fx.errors[id];
+      if (via !== 'timer' && fx.drafts[id] === text) { delete fx.drafts[id]; changed = changed || text !== (sec == null ? '' : jiraDur(sec)); }
+      return changed;
+    };
+    const next = fxApply(ov.data, id, sec);
+    if (JSON.stringify(next) === JSON.stringify(normOverrides(ov.data))) { if (done()) renderWorklogPreview(); return; }
+    fx.saving = true;
+    fxRenderStatus();
+    let saved = false;
+    try {
+      const res = await api('setWorklogOverrides', date ? { date, overrides: next } : { overrides: next });
+      if (date !== (S.wl.date || '')) return;
+      ov.seq++; // an older getWorklogOverrides in flight must not overwrite this
+      ov.data = normOverrides(res && typeof res === 'object' ? res : next);
+      ov.loading = false;
+      ov.error = null;
+      ov.date = date;
+      done();
+      saved = true;
+    } catch (e) {
+      if (date === (S.wl.date || '')) fx.errors[id] = t('worklog.fx.saveFailed', { error: errorText(e) });
+    } finally {
+      fx.saving = false;
+      if (!saved || S.wl.running) renderWorklogPreview(); // after a save the re-preview below re-renders the table
+    }
+    if (saved && !S.wl.running) { S.wl.result = null; await loadPreview({ keepOverrides: true }); }
+  }
+
+  /** Before "Log now": commit what is typed, wait for the saves and the re-preview. false = a field is invalid. */
+  async function fxFlush() {
+    const fx = S.wl.fx;
+    Object.keys(fx.drafts).forEach((id) => fxCommit(id, 'commit'));
+    await fx.queue;
+    const bad = Object.keys(fx.errors)[0];
+    if (!bad) return true;
+    const el = $(`[data-fx="${CSS.escape(bad)}"]`);
+    if (el) el.focus();
+    toast(t('worklog.fx.fixFirst'), { tone: 'warn' });
+    return false;
+  }
+
+  function onWorklogFxInput(e) {
+    const el = e.target;
+    const id = el.dataset && el.dataset.fx;
+    if (!id) return;
+    const fx = S.wl.fx;
+    fx.drafts[id] = el.value;
+    if (fx.errors[id]) { // the message goes away while the user fixes the value
+      delete fx.errors[id];
+      el.removeAttribute('aria-invalid');
+      const err = document.getElementById(fxDomId(id) + '-err');
+      if (err) err.remove();
+      el.setAttribute('aria-describedby', fxDomId(id) + '-hint');
+    }
+    clearTimeout(fx.timers[id]);
+    fx.timers[id] = setTimeout(() => fxCommit(id, 'timer'), 600);
+  }
+  function onWorklogFxKey(e) {
+    const id = e.target.dataset && e.target.dataset.fx;
+    if (!id) return;
+    if (e.key === 'Enter') { e.preventDefault(); fxCommit(id, 'commit'); }
+    else if (e.key === 'Escape' && Object.prototype.hasOwnProperty.call(S.wl.fx.drafts, id)) {
+      // back to the saved value
+      e.preventDefault();
+      e.stopPropagation();
+      clearTimeout(S.wl.fx.timers[id]);
+      delete S.wl.fx.timers[id];
+      delete S.wl.fx.drafts[id];
+      delete S.wl.fx.errors[id];
+      renderWorklogPreview();
+    }
+  }
+  function onWorklogFxBlur(e) {
+    const id = e.target.dataset && e.target.dataset.fx;
+    if (!id || S.wl.fx.rendering) return;
+    setTimeout(() => fxCommit(id, 'commit'), 0); // after the focus has moved, so a re-render keeps it on the new target
   }
 
   function runSummary(run) {
@@ -5667,6 +5999,8 @@
   const PREVIEW_MAX_AGE_MS = 2 * 60000;
 
   async function logNow() {
+    if (S.wl.running || S.wl.refreshingForRun || !S.wl.preview) return;
+    if (!(await fxFlush())) return; // v0.8: a typed fixed time is saved (and the preview recalculated) first
     if (S.wl.running || S.wl.refreshingForRun || !S.wl.preview) return;
     // CR-9: never confirm totals from a stale preview.
     if (!S.wl.previewFetchedAt || Date.now() - S.wl.previewFetchedAt > PREVIEW_MAX_AGE_MS) {
@@ -5945,7 +6279,15 @@
    * ================================================================ */
   const FORM_SCALARS = ['jiraUrl', 'language', 'worklogTime', 'workdayStart', 'workdayEnd', 'lunchStart', 'lunchEnd', 'boardJql'];
   const FORM_BOOLS = ['autostart', 'worklogEnabled', 'notifyComments', 'autoCheckUpdates'];
-  const FORM_NUMS = ['dailyCapHours', 'loadFactor', 'hoursPerDay', 'commentPollMinutes'];
+  const FORM_NUMS = ['dailyCapHours', 'loadFactor', 'hoursPerDay', 'commentPollMinutes', 'authorMinutes', 'commentMinutes'];
+  /* v0.8 Settings → Roles: the three status lists share the tag-list control; the key is the data-status-kind /
+     remove-<kind> suffix ("status" keeps the v0.1 ids and the inProgressStatuses setting = Dev statuses). */
+  const STATUS_LISTS = {
+    status: { key: 'inProgressStatuses', list: '#s-statuses', input: '#s-status-input', pick: '#s-status-pick' },
+    'qa-status': { key: 'qaStatuses', list: '#s-qa-statuses', input: '#s-qa-status-input', pick: '#s-qa-status-pick' },
+    'review-status': { key: 'reviewStatuses', list: '#s-review-statuses', input: '#s-review-status-input', pick: '#s-review-status-pick' },
+  };
+  const STATUS_KEYS = Object.values(STATUS_LISTS).map((c) => c.key);
   const form = () => $('#settings-form');
 
   async function enterSettings(forceReload) {
@@ -5992,8 +6334,8 @@
       // from/to hold what the user sees/types (locale format); collectSettings() converts to ISO.
       vacations: (s.vacations || []).map((v) => ({ from: i18n.formatInputDate(v.from), to: i18n.formatInputDate(v.to), note: v.note || '' })),
       holidays: (s.holidays || []).slice().sort(),
-      inProgressStatuses: (s.inProgressStatuses || []).slice(),
     };
+    STATUS_KEYS.forEach((k) => { S.form[k] = (s[k] || []).slice(); });
     clearFieldErrors($('#settings-form'));
     $('#settings-alert').hidden = true;
     setTestResult($('#s-test-result'), null);
@@ -6013,7 +6355,7 @@
     const iso = (text) => i18n.parseInputDate(text) || text.trim();
     out.vacations = S.form.vacations.map((v) => ({ from: iso(v.from), to: iso(v.to), note: v.note.trim() }));
     out.holidays = S.form.holidays.slice();
-    out.inProgressStatuses = S.form.inProgressStatuses.slice();
+    STATUS_KEYS.forEach((k) => { out[k] = S.form[k].slice(); });
     const token = f.elements.token.value.trim();
     if (token) out.token = token;
     return out;
@@ -6082,7 +6424,9 @@
     })}`);
     if (focusedDay) $(`[data-day="${focusedDay}"]`, days).focus();
 
-    renderTagList($('#s-statuses'), S.form.inProgressStatuses, 'status', (v) => v);
+    Object.entries(STATUS_LISTS).forEach(([kind, c]) => {
+      renderTagList($(c.list), S.form[c.key], kind, (v) => v);
+    });
     const today = i18n.isoDate(new Date());
     renderTagList($('#s-holidays'), S.form.holidays, 'holiday', (v) => i18n.date(v + 'T12:00:00', { day: 'numeric', month: 'short', year: 'numeric' }), (v) => v < today);
     renderVacations();
@@ -6096,8 +6440,22 @@
     if (focusIdx >= 0) {
       const btns = $$('button', el);
       const target = btns[Math.min(focusIdx, btns.length - 1)];
-      if (target) target.focus(); else $(kind === 'status' ? '#s-status-input' : '#s-holiday-input').focus();
+      if (target) target.focus(); else $(STATUS_LISTS[kind] ? STATUS_LISTS[kind].input : '#s-holiday-input').focus();
     }
+  }
+
+  /** v0.8: Jira status names the UI already knows (boards, sprints, the worklog preview) for the Roles suggestions. */
+  function knownStatusNames() {
+    const names = new Map();
+    const add = (st) => { const n = nameOf(st).trim(); if (n && n.length <= 100 && !names.has(n.toLowerCase())) names.set(n.toLowerCase(), n); };
+    [S.board, ...Object.values(S.boardCache || {})].forEach((b) => (b && b.columns ? b.columns : []).forEach((c) => {
+      (c.statuses || []).forEach(add);
+      (c.issues || []).forEach((is) => add(is && is.status));
+    }));
+    [S.sp.data, ...S.sp.cache.values()].forEach((d) => d && [...(d.groups || []), d.backlog].forEach((g) => (g && g.issues ? g.issues : []).forEach((is) => add(is && is.status))));
+    const p = S.wl.preview;
+    if (p) [...(p.items || []), ...(p.related || [])].forEach((it) => add(it && it.status));
+    return [...names.values()].sort((a, b) => a.localeCompare(b, i18n.locale));
   }
 
   function renderVacations() {
@@ -6124,7 +6482,8 @@
   function clearFieldError(root, control) {
     if (!control.getAttribute || control.getAttribute('aria-invalid') !== 'true') return;
     control.removeAttribute('aria-invalid');
-    const base = control.name || (control.dataset.vac ? 'vacations' : control.id === 's-holiday-input' ? 'holidays' : '');
+    const kind = control.dataset.statusKind;
+    const base = control.name || (control.dataset.vac ? 'vacations' : control.id === 's-holiday-input' ? 'holidays' : kind && STATUS_LISTS[kind] ? STATUS_LISTS[kind].key : '');
     const holder = base && root.querySelector(`[data-error-for="${CSS.escape(base)}"]`);
     // Several vacation inputs share one message: keep it while any of them is still invalid.
     const othersInvalid = base === 'vacations' && root.querySelector('[data-vac][aria-invalid="true"]');
@@ -6227,7 +6586,7 @@
   }
 
   /** Client checks only for what the JSON/Go types need (range and business rules live in the backend). */
-  const INT_FIELDS = ['commentPollMinutes'];
+  const INT_FIELDS = ['commentPollMinutes', 'authorMinutes', 'commentMinutes'];
   function localErrors() {
     const f = form();
     const errs = [];
@@ -6262,6 +6621,11 @@
     out.autostart = effective;
     if (out.loadFactor == null) out.loadFactor = 1; // v0.1 backends do not send it
     if (typeof out.autoCheckUpdates !== 'boolean') out.autoCheckUpdates = true; // SPEC default; older backends do not send it
+    // v0.8 roles: pre-v0.8 backends do not send them (empty list = role off; SPEC default minutes)
+    if (!Array.isArray(out.qaStatuses)) out.qaStatuses = [];
+    if (!Array.isArray(out.reviewStatuses)) out.reviewStatuses = [];
+    if (out.authorMinutes == null) out.authorMinutes = 15;
+    if (out.commentMinutes == null) out.commentMinutes = 5;
     S.autostartMismatch = asked !== effective;
     return out;
   }
@@ -6366,8 +6730,10 @@
     }
     const i = Number(a.dataset.i);
     switch (a.dataset.action) {
-      case 'add-status': addStatus(); break;
-      case 'remove-status': S.form.inProgressStatuses.splice(i, 1); renderSettingsDynamic(); break;
+      case 'add-status': addStatus(a.dataset.statusKind); break;
+      case 'pick-status': openStatusPick(a); break;
+      case 'remove-status': case 'remove-qa-status': case 'remove-review-status':
+        S.form[STATUS_LISTS[a.dataset.action.slice('remove-'.length)].key].splice(i, 1); renderSettingsDynamic(); break;
       case 'add-holiday': addHoliday(); break;
       case 'remove-holiday': S.form.holidays.splice(i, 1); renderSettingsDynamic(); break;
       case 'add-vacation': {
@@ -6390,11 +6756,28 @@
     }
   }
 
-  function addStatus() {
-    const input = $('#s-status-input');
+  /** v0.8: Jira status names the UI has seen and this list lacks, in the glass menu (free text still via the input). */
+  function openStatusPick(btn) {
+    const kind = btn.dataset.statusKind;
+    const c = STATUS_LISTS[kind] || STATUS_LISTS.status;
+    const have = new Set(S.form[c.key].map((v) => v.toLowerCase()));
+    menu.open(btn, {
+      label: t('settings.pickStatus'),
+      items: knownStatusNames().filter((n) => !have.has(n.toLowerCase())),
+      empty: t('settings.pickStatusEmpty'),
+      item: (n) => html`<span class="mi-main"><span class="mi-title">${n}</span></span>`,
+      onPick: (n) => { $(c.input).value = n; addStatus(kind); },
+      anchorSel: c.pick,
+    });
+  }
+  function addStatus(kind) {
+    const c = STATUS_LISTS[kind] || STATUS_LISTS.status;
+    const input = $(c.input);
     const v = input.value.trim();
     if (!v) return;
-    if (!S.form.inProgressStatuses.some((x) => x.toLowerCase() === v.toLowerCase())) S.form.inProgressStatuses.push(v);
+    const list = S.form[c.key];
+    if (!list.some((x) => x.toLowerCase() === v.toLowerCase())) list.push(v);
+    clearFieldError($('#settings-form'), input);
     input.value = '';
     renderSettingsDynamic();
     input.focus();
@@ -6990,11 +7373,19 @@
     document.addEventListener('mouseup', (e) => { if (sbHot) { const r = sbHot.getBoundingClientRect(); if (e.clientY < r.bottom - 37 || e.clientY > r.bottom) sbCool(); } });
     $('#missed-notice').addEventListener('click', onMissedClick);
     $('#view-worklog').addEventListener('click', (e) => {
+      const row = e.target.closest('[data-open-key]');
+      if (row) { openIssue(row.dataset.openKey); return; } // v0.8: "other issues" list
       const a = e.target.closest('[data-action]');
       if (!a) return;
       if (a.dataset.action === 'wl-retry') loadPreview();
       if (a.dataset.action === 'history-retry') loadHistory();
+      if (a.dataset.action === 'fx-retry') loadOverrides();
     });
+    // v0.8 fixed-time editors: debounced 600 ms, Enter / blur commit
+    $('#view-worklog').addEventListener('input', onWorklogFxInput);
+    $('#view-worklog').addEventListener('keydown', onWorklogFxKey);
+    $('#view-worklog').addEventListener('focusout', onWorklogFxBlur);
+    $('#view-worklog').addEventListener('toggle', (e) => { if (e.target.id === 'wl-related') S.wl.relatedOpen = e.target.open; }, true);
 
     // Notifications
     $('#notif-mark-all').addEventListener('click', markAllRead);
@@ -7031,7 +7422,7 @@
     });
     sf.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter') return;
-      if (e.target.id === 's-status-input') { e.preventDefault(); addStatus(); }
+      if (e.target.matches('input[data-status-kind]')) { e.preventDefault(); addStatus(e.target.dataset.statusKind); }
       else if (e.target.id === 's-holiday-input') { e.preventDefault(); addHoliday(); }
     });
     $('#s-discard').addEventListener('click', () => {
