@@ -1872,3 +1872,54 @@ DayOverrides.manual?: ManualEntry[]   // ≤ 50 entries; same get/setWorklogOver
 - UI: "Добавить время" on the Worklog screen opens a panel: issue search (several picks shown as chips), time (Jira
   format), activity (— / Груминг / Оценка / Уточняющие вопросы), note; the day's entries are listed above the table
   with edit / delete; rows show the role chip «Вручную».
+
+## v0.9 — Ubuntu Linux
+
+The same app on Linux (Ubuntu 22.04+, x86-64): the same UI, contract and
+settings; only the platform layer differs.
+
+- **Window.** GTK 3 window without decorations holding a WebKitGTK 4.1 web
+  view; the page draws the chrome as on Windows (SPEC v0.7). `windowControl`
+  maps to iconify / (un)maximize / close / `gtk_window_begin_move_drag` /
+  `begin_resize_drag`, started from the last primary button press in the page.
+  `getWindowInfo` reports `glass: false`; `maximized` and `active` follow the
+  window state. No rounded corners or shadow (none for undecorated windows on
+  Wayland). `setWindowTheme` does nothing (no native title bar). The page
+  follows the desktop's dark style: the settings portal's `color-scheme`
+  drives GTK's `gtk-application-prefer-dark-theme`, which WebKit reports as
+  `prefers-color-scheme`.
+- **Binding.** A user script defines `window.__jiraffe(...)`, which posts the
+  arguments as one JSON array to the `jiraffe` script message handler; Go
+  decodes it into the same `(id, method, params, nonce)` call as WebView2.
+  Results and events use `evaluate_javascript` as before. Navigation to
+  anything but `about:`/`data:` and new windows are refused; the context menu
+  appears only on editable fields and selections (`JIRAFFE_DEVTOOLS=1`
+  enables the inspector).
+- **Tray.** StatusNotifierItem over D-Bus (fyne.io/systray): left click opens
+  the window, the menu is Open / Fill worklog / Pause–Resume / Quit, localised
+  on settings changes. GNOME needs the AppIndicator extension (Ubuntu default).
+- **Notifications.** org.freedesktop.Notifications with a `default` action;
+  a click opens the issue URL of that notification (or the window).
+- **Token.** `config.Protector` = AES-256-GCM, blob `"jk1" | nonce | ct`,
+  under a random 32-byte key stored in the Secret Service (item service
+  "Jiraffe", user "config-key"), created on the first save. Without a keyring
+  saving the token fails with an error; a DPAPI blob is not accepted.
+- **HTTP.** net/http with `HTTPS_PROXY`/`NO_PROXY`, the system CA store, full
+  TLS verification, no redirects followed; errors classified like WinHTTP's.
+- **Single instance.** Abstract Unix socket `@jiraffe-<uid>`; a second start
+  sends `show` and exits.
+- **Autostart.** `~/.config/autostart/jiraffe.desktop` with
+  `Exec="<exe>" --minimized`; enabled = the entry exists, is not hidden and
+  starts this exe. The menu entry and icon are (re)written at every start.
+- **Updates.** The release also carries `jiraffe-linux-amd64` (+ `.sha256`,
+  `.sig`, signed like the exe, the same message format). The Linux build
+  selects these assets (`update.UseLinuxAssets`) and requires an ELF header
+  instead of "MZ"; the staged file is created executable; the swap (exe →
+  exe.old, exe.new → exe) and restart with `--updated-from/--wait-pid` work
+  as on Windows. A binary in a folder the user cannot write (e.g. `/usr/bin`)
+  gets the "no write access" hint.
+- **Install.** `install.sh` (curl | sh): checks the runtime libraries,
+  downloads and checks the binary, installs `~/.local/bin/jiraffe`, starts it.
+- **Texts.** Platform-neutral: "Start when you sign in", "Stored encrypted on
+  this computer only", "replace the program file", "not trusted by the system".
+

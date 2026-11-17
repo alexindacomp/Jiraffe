@@ -1,6 +1,6 @@
 # Jiraffe
 
-A small Windows tray companion for Jira Server/Data Center: automatic daily
+A small Windows and Ubuntu Linux tray companion for Jira Server/Data Center: automatic daily
 worklogs (with a load factor), a board of my or all open issues with a project
 filter and each project's own columns (from its agile board or workflow), quick
 status changes from a dropdown, issue details (description, comments, history,
@@ -10,7 +10,8 @@ issues, creating and editing issues (rich-text editor for HTML descriptions;
 fields, people, story points, merge requests/branches and links editable right in
 the issue panel), writing comments,
 a per-project epic time dashboard and automatic updates. One
-self-contained `jiraffe.exe` (Go, no CGO, WebView2 UI, about 4.6 MB). The full specification is in [SPEC.md](SPEC.md).
+self-contained `jiraffe.exe` (Go, no CGO, WebView2 UI, about 4.9 MB), or
+`jiraffe-linux-amd64` on Linux (Go + GTK 3 / WebKitGTK 4.1, about 9.5 MB). The full specification is in [SPEC.md](SPEC.md).
 
 ## Install
 
@@ -40,6 +41,23 @@ installer: click **More info → Run anyway**. This happens only once — the
 installed app and its later versions (installed by Jiraffe itself) are not
 checked by SmartScreen.
 
+### Ubuntu Linux
+
+Ubuntu 22.04 or newer (x86-64, GNOME or another desktop with a tray). No sudo:
+
+```sh
+curl -fsSL https://github.com/alexindacomp/Jiraffe/releases/latest/download/install.sh | sh
+```
+
+It downloads `jiraffe-linux-amd64`, checks its SHA-256, installs it as
+`~/.local/bin/jiraffe` and starts it; Jiraffe then adds itself to the
+application menu ([scripts/install.sh](scripts/install.sh); `sh install.sh
+--uninstall` removes it). It needs `libwebkit2gtk-4.1-0` (preinstalled on
+Ubuntu Desktop; otherwise `sudo apt install libwebkit2gtk-4.1-0`). The tray
+icon needs the AppIndicator extension, enabled by default on Ubuntu (on other
+GNOME systems: `gnome-shell-extension-appindicator`). The token is kept
+encrypted with a key in the GNOME Keyring (Secret Service).
+
 Then enter your Jira URL and personal access token. Jiraffe updates itself:
 it checks GitHub releases at startup and asks before installing a new version
 (Settings → Updates). All versions and changes: [Releases](https://github.com/alexindacomp/Jiraffe/releases).
@@ -56,7 +74,8 @@ git push origin v0.4.0
 
 The workflow builds `jiraffe.exe` with version 0.4.0, signs it and publishes the
 GitHub release `v0.4.0` (assets `jiraffe.exe`, `jiraffe.exe.sha256`,
-`jiraffe.exe.sig`, `install.ps1`, `Jiraffe-windows.zip`) as the latest one, so the download link above serves it and
+`jiraffe.exe.sig`, `install.ps1`, `Jiraffe-windows.zip`, `jiraffe-linux-amd64`,
+`jiraffe-linux-amd64.sha256`, `jiraffe-linux-amd64.sig`, `install.sh`) as the latest one, so the download link above serves it and
 installed copies offer the update.
 
 **Release signing.** The release job runs in the GitHub environment `release`
@@ -84,7 +103,21 @@ manifest (PerMonitorV2 DPI awareness, common controls v6) and version info as
 (the tool is not added to go.mod and nothing of it ends up in the binary), then
 cross-compiles with `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 -ldflags "-s -w -H windowsgui"`.
 
-Tests run on Linux: `go vet ./... && go test ./...`.
+Tests run on Linux: `CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...`
+(pure Go; the GTK front end needs cgo, see below).
+
+The Linux build (cgo, GTK 3 + WebKitGTK 4.1; CI builds it on Ubuntu 22.04 so
+the binary runs on 22.04 and newer):
+
+```sh
+sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev
+./build-linux.sh            # → build/jiraffe-linux-amd64 (limit 20 MiB, the updater's maximum)
+./build-linux.sh --check    # go vet and go test with cgo first
+```
+
+`go build -tags snapshotdebug` adds a test hook: `JIRAFFE_SNAP="<js>|<js>"`
+and `JIRAFFE_SNAP_DIR=dir` run each JS step in the page and save
+`dir/snapN.png` (for checking the UI where no screenshot tool works, e.g. WSLg).
 
 Requires the Microsoft Edge WebView2 Runtime (preinstalled on Windows 10/11).
 
@@ -108,12 +141,22 @@ Files:
 - `%LOCALAPPDATA%\Jiraffe\WebView2` — WebView2 user data
 - `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Jiraffe` — autostart
 
+On Linux (the same flags, `jiraffe` instead of `jiraffe.exe`):
+
+- `~/.config/Jiraffe/` — `config.json` (token sealed with AES-GCM, key in the
+  GNOME Keyring item "Jiraffe / config-key"), `state.json`, `jiraffe.log`
+- `~/.cache/Jiraffe/update` — update downloads; `~/.local/share/Jiraffe/webkit` — web view storage
+- `~/.local/share/applications/jiraffe.desktop`, `~/.local/share/icons/hicolor/256x256/apps/jiraffe.png` — menu entry (written at start)
+- `~/.config/autostart/jiraffe.desktop` — autostart
+
 ## Layout
 
 ```
 main.go                 calls run(); ui_raw.go / ui_bundle.go embed the UI
 main_windows.go         wiring, single instance, tray + webview main-thread loop, JS binding
-main_other.go           stub for non-Windows builds
+main_linux.go           Linux wiring: GTK main loop, tray (StatusNotifierItem), window, keyring
+main_bridge.go          JS ↔ Go call bridge and --worklog-preview, shared by Windows and Linux
+main_other.go           stub for other builds (Linux without cgo, macOS)
 internal/worklog        pure: in-progress intervals, clipping, allocation, durations, calendar
 internal/jira           REST v2 client over a Transport interface
 internal/config         settings, defaults, validation (ru/uk/en messages), DPAPI via Protector
@@ -123,6 +166,10 @@ internal/app            JS ↔ Go contract (methods, events, errors), worklog/co
 internal/update         self-update: GitHub release check, download, verify (sha256 + ed25519), swap
 internal/webui          inlines ui/*.css|*.js into one HTML document, drops mock.js, adds CSP
 internal/winapi         *_windows.go: WinHTTP transport, DPAPI, tray/balloons, autostart, shell
+internal/gtkwin         Linux (cgo): frameless GTK window with WebKitGTK, moves/resizes, idle queue
+internal/linuxdesk      Linux: XDG folders, keyring Protector, notifications and dark style over
+                        D-Bus, autostart, menu entry, single instance (abstract socket), xdg-open
+internal/httpx          net/http Transport of the Linux build (env proxy, no redirects)
 internal/applog         rotating log writer
 tools/icongen           build-time icon generator
 tools/sign              CI release signer (ed25519, key from env)
@@ -137,6 +184,8 @@ assets/fonts            Manrope subsets (embedded in ui/app.css as base64) + OFL
 - **Manrope** (The Manrope Project Authors), SIL Open Font License 1.1 — see
   `assets/fonts/OFL.txt`. The Latin and Cyrillic `woff2` subsets are embedded in
   `ui/app.css` as `data:` URLs (no network).
+- Linux build only: **fyne.io/systray** (Apache 2.0), **godbus/dbus** (BSD 2-Clause),
+  **zalando/go-keyring** (MIT); it links GTK 3 and WebKitGTK (LGPL) dynamically.
 
 ## Design notes
 

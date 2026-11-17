@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"io"
@@ -13,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,7 +85,13 @@ func run(args []string) int {
 	log.Printf("Jiraffe %s starting (minimized=%v, preview=%v, updatedFrom=%q)", app.Version, *minimized, *previewOut != "", *updatedFrom)
 
 	if *previewOut != "" {
-		return headlessPreview(dataDir, *previewOut, *previewDate)
+		return headlessPreview(dataDir, *previewOut, *previewDate, winapi.DPAPI{}, func() (jira.Transport, func(), error) {
+			t, err := winapi.NewTransport(appName + "/" + app.Version)
+			if err != nil {
+				return nil, nil, err
+			}
+			return t, t.Close, nil
+		})
 	}
 
 	// --updated-from is only trusted as a version; anything else is ignored.
@@ -166,7 +170,8 @@ func run(args []string) int {
 		return 1
 	}
 
-	u := &ui{html: html, nonce: nonce, dataDir: dataDir, mainThread: windows.GetCurrentThreadId()}
+	u := &ui{html: html, dataDir: dataDir, mainThread: windows.GetCurrentThreadId()}
+	u.bridge = bridge{nonce: nonce, post: u.post, eval: u.eval}
 	plat := &platform{u: u, t: transport}
 	a := app.New(cfg, st, plat, scheduler.SystemClock{}, u.emit)
 	u.app = a
@@ -243,11 +248,11 @@ func (g updateGetter) Get(ctx context.Context, url string, headers map[string]st
 // ui owns the main-thread state: the tray, the (optional) webview window and
 // the queue of closures posted from goroutines.
 type ui struct {
+	bridge // nonce, app, binding, resolve, emit
+
 	html       string
-	nonce      string
 	dataDir    string
 	mainThread uint32
-	app        *app.App
 	tray       *winapi.Tray
 
 	// shown mirrors "a window is open" for other goroutines (WindowOpen).
@@ -563,99 +568,10 @@ func (u *ui) openWindow() bool {
 	return true
 }
 
-// validID accepts a JSON number or string as the call id.
-func validID(id json.RawMessage) bool {
-	if len(id) == 0 || !json.Valid(id) {
-		return false
-	}
-	c := id[0]
-	return c == '"' || c == '-' || (c >= '0' && c <= '9')
-}
-
-// dropGuardJS cancels drops that come from outside the page (files, links),
-// which would otherwise navigate the webview away from the app. It is
-// stateless: any dragenter/dragover/drop carrying "Files" or "text/uri-list"
-// is refused. Board card drags carry only text/plain and are unaffected.
-const dropGuardJS = `(function(){function ext(e){var t=e.dataTransfer&&e.dataTransfer.types;if(!t)return false;` +
-	`for(var i=0;i<t.length;i++){if(t[i]==="Files"||t[i]==="text/uri-list")return true}return false}` +
-	`function refuse(e){if(ext(e)){e.preventDefault();e.stopPropagation();e.dataTransfer.dropEffect="none"}}` +
-	`addEventListener("dragenter",refuse,true);addEventListener("dragover",refuse,true);` +
-	`addEventListener("drop",function(e){if(ext(e)){e.preventDefault();e.stopPropagation()}},true)})()`
-
-// resolve delivers a call result to the page.
-func (u *ui) resolve(id json.RawMessage, ok bool, payload []byte) {
-	js := "window.__jiraffeResolve&&window.__jiraffeResolve(" + string(id) + "," + strconv.FormatBool(ok) + "," + string(payload) + ")"
-	u.post(func() { u.eval(js) })
-}
-
-// binding is window.__jiraffe(id, method, paramsJSON, nonce). It runs on the
-// UI thread, so it only starts a goroutine; the result is delivered through
-// window.__jiraffeResolve(id, ok, payload). Calls without the document's
-// nonce are rejected with {code:"forbidden"}.
-func (u *ui) binding(id json.RawMessage, method string, rest ...json.RawMessage) {
-	var params, nonce json.RawMessage
-	if len(rest) > 0 {
-		params = rest[0]
-	}
-	if len(rest) > 1 {
-		nonce = rest[1]
-	}
-	if !validID(id) {
-		id = json.RawMessage("null")
-	}
-	if !app.CheckNonce(u.nonce, nonce) {
-		log.Printf("rejected call %q: missing or invalid nonce", method)
-		b, _ := json.Marshal(app.BadNonceError(u.app.Language()))
-		u.resolve(id, false, b)
-		return
-	}
-	go func() {
-		ok, payload := false, []byte(`{"code":"internal","message":"internal error"}`)
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("call %s panicked: %v\n%s", method, r, debug.Stack())
-				ok, payload = false, []byte(`{"code":"internal","message":"internal error"}`)
-			}
-			u.resolve(id, ok, payload)
-		}()
-		ctx, cancel := context.WithTimeout(u.app.Context(), 5*time.Minute)
-		defer cancel()
-		res, err := u.app.Call(ctx, method, params)
-		var v any = res
-		if err != nil {
-			e := u.app.ErrorFor(err)
-			if e.Code == app.CodeInternal || e.Code == jira.CodeServer {
-				log.Printf("call %s: %s", method, e.Message)
-			}
-			v = e
-		}
-		b, merr := json.Marshal(v)
-		if merr != nil {
-			log.Printf("call %s: encode result: %v", method, merr)
-			return
-		}
-		ok, payload = err == nil, b
-	}()
-}
-
 func (u *ui) eval(js string) {
 	if u.windowOpen() {
 		u.w.Eval(js)
 	}
-}
-
-// emit dispatches a "jiraffe" CustomEvent in the page (dropped when closed).
-func (u *ui) emit(typ string, payload any) {
-	b, err := json.Marshal(struct {
-		Type    string `json:"type"`
-		Payload any    `json:"payload"`
-	}{typ, payload})
-	if err != nil {
-		log.Printf("emit %s: %v", typ, err)
-		return
-	}
-	js := `window.dispatchEvent(new CustomEvent("jiraffe",{detail:` + string(b) + `}))`
-	u.post(func() { u.eval(js) })
 }
 
 func (u *ui) menu() []winapi.MenuItem {
@@ -800,82 +716,4 @@ func (p *platform) SettingsChanged(s config.Settings, paused bool) {
 		tip = app.T(s.Language, "tooltipPaused")
 	}
 	p.u.post(func() { p.u.tray.SetTooltip(tip) })
-}
-
-// headlessPlatform is used by --worklog-preview: no UI, nothing written.
-type headlessPlatform struct{ t *winapi.Transport }
-
-func (h headlessPlatform) Transport() jira.Transport           { return h.t }
-func (headlessPlatform) OpenURL(string) error                  { return nil }
-func (headlessPlatform) SetAutostart(bool) error               { return nil }
-func (headlessPlatform) Notify(string, string, string)         {}
-func (headlessPlatform) SettingsChanged(config.Settings, bool) {}
-func (headlessPlatform) SetWindowTheme(app.WindowTheme)        {}
-
-// headlessPreview computes today's worklog preview and writes it as JSON to
-// out. JIRAFFE_URL / JIRAFFE_TOKEN override the saved configuration.
-func headlessPreview(dataDir, out, date string) (code int) {
-	code = 1
-	var result any
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("preview panicked: %v\n%s", r, debug.Stack())
-			result, code = map[string]string{"error": "internal error"}, 1
-			_ = writeJSON(out, result)
-		}
-	}()
-
-	cfg, err := config.Open(filepath.Join(dataDir, "config.json"), winapi.DPAPI{})
-	if err != nil {
-		log.Printf("config: %v", err)
-	}
-	if envURL := os.Getenv("JIRAFFE_URL"); envURL != "" && !config.ValidateURL(config.NormalizeURL(envURL)) {
-		result = map[string]string{"code": app.CodeBadParams, "error": "JIRAFFE_URL is not a valid http(s) URL"}
-		if err := writeJSON(out, result); err != nil {
-			log.Printf("preview: %v", err)
-		}
-		return 1
-	}
-	cfg.Override(os.Getenv("JIRAFFE_URL"), os.Getenv("JIRAFFE_TOKEN"))
-	// The preview only reads state; nothing is written.
-	st, err := state.Open(filepath.Join(dataDir, "state.json"))
-	if err != nil {
-		log.Printf("state: %v", err)
-	}
-
-	transport, err := winapi.NewTransport(appName + "/" + app.Version)
-	if err != nil {
-		result = map[string]string{"code": app.CodeInternal, "error": err.Error()}
-		_ = writeJSON(out, result)
-		return 1
-	}
-	defer transport.Close()
-
-	a := app.New(cfg, st, headlessPlatform{t: transport}, scheduler.SystemClock{}, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	run, err := a.ComputeWorklogFor(ctx, date)
-	result = run
-	if e := (*app.Error)(nil); errors.As(err, &e) && e.Code == app.CodeBadParams {
-		result = map[string]string{"code": e.Code, "error": e.Message}
-	}
-	if err == nil && run.SkippedReason != "not-configured" && run.Error == "" {
-		code = 0
-	}
-	if err != nil {
-		log.Printf("preview: %v", err)
-	}
-	if werr := writeJSON(out, result); werr != nil {
-		log.Printf("preview: %v", werr)
-		return 1
-	}
-	return code
-}
-
-func writeJSON(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(b, '\n'), 0o644)
 }

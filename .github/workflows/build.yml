@@ -1,7 +1,8 @@
 name: build
 
-# push to master / pull request: vet, test and build jiraffe.exe (workflow artifact).
-# push of a tag vX.Y.Z: the same, then publish GitHub release vX.Y.Z with jiraffe.exe.
+# push to master / pull request: vet, test and build jiraffe.exe and
+# jiraffe-linux-amd64 (workflow artifacts).
+# push of a tag vX.Y.Z: the same, then publish GitHub release vX.Y.Z with both.
 on:
   push:
     branches: [master]
@@ -62,9 +63,54 @@ jobs:
             build/jiraffe.exe.sha256
           if-no-files-found: error
 
+  build-linux:
+    runs-on: ubuntu-22.04 # oldest supported glibc: the binary also runs on 24.04+
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: GTK / WebKitGTK headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libwebkit2gtk-4.1-dev
+
+      - name: Version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo v0.0.0)"
+            version="${version#v}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Vet, test and build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./build-linux.sh --check
+
+      - name: Checksum
+        working-directory: build
+        run: sha256sum jiraffe-linux-amd64 | tee jiraffe-linux-amd64.sha256
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: jiraffe-linux-${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: |
+            build/jiraffe-linux-amd64
+            build/jiraffe-linux-amd64.sha256
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, build-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # the signing key lives in this environment, which only v* tags may deploy to
@@ -91,9 +137,13 @@ jobs:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
           TAG: ${{ github.ref_name }}
         run: |
-          (cd dist && sha256sum -c jiraffe.exe.sha256)
+          (cd dist && sha256sum -c jiraffe.exe.sha256 && sha256sum -c jiraffe-linux-amd64.sha256)
           go run ./tools/sign -version "${TAG#v}" -file dist/jiraffe.exe > dist/jiraffe.exe.sig
+          go run ./tools/sign -version "${TAG#v}" -file dist/jiraffe-linux-amd64 > dist/jiraffe-linux-amd64.sig
           test -s dist/jiraffe.exe.sig
+          test -s dist/jiraffe-linux-amd64.sig
+          # Linux one-liner: curl -fsSL …/releases/latest/download/install.sh | sh
+          cp scripts/install.sh dist/install.sh
           # one-line installer: irm …/releases/latest/download/install.ps1 | iex
           cp scripts/install.ps1 dist/install.ps1
           # archive for manual installs: jiraffe.exe + "Install Jiraffe.cmd" + install.ps1
@@ -111,9 +161,9 @@ jobs:
           git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
           if gh release view "$TAG" >/dev/null 2>&1; then
             # re-run of the workflow: replace the binary, keep the notes
-            gh release upload "$TAG" dist/jiraffe.exe dist/jiraffe.exe.sha256 dist/jiraffe.exe.sig dist/install.ps1 dist/Jiraffe-windows.zip --clobber
+            gh release upload "$TAG" dist/jiraffe.exe dist/jiraffe.exe.sha256 dist/jiraffe.exe.sig dist/install.ps1 dist/Jiraffe-windows.zip dist/jiraffe-linux-amd64 dist/jiraffe-linux-amd64.sha256 dist/jiraffe-linux-amd64.sig dist/install.sh --clobber
           else
             # release notes = the annotated tag message (git tag -a vX.Y.Z -F notes.md)
-            gh release create "$TAG" dist/jiraffe.exe dist/jiraffe.exe.sha256 dist/jiraffe.exe.sig dist/install.ps1 dist/Jiraffe-windows.zip \
+            gh release create "$TAG" dist/jiraffe.exe dist/jiraffe.exe.sha256 dist/jiraffe.exe.sig dist/install.ps1 dist/Jiraffe-windows.zip dist/jiraffe-linux-amd64 dist/jiraffe-linux-amd64.sha256 dist/jiraffe-linux-amd64.sig dist/install.sh \
               --title "Jiraffe $TAG" --notes-from-tag --verify-tag --latest
           fi

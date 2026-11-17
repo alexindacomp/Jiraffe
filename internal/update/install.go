@@ -331,7 +331,8 @@ func (w *headWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Verify checks that path has exactly size bytes, starts with "MZ" and has
+// Verify checks that path has exactly size bytes, starts like an executable
+// of this platform ("MZ", or ELF on Linux) and has
 // the SHA-256 sum.
 func Verify(fs FS, path string, size int64, sum [32]byte) error {
 	_, err := verifyFile(fs, path, size, sum)
@@ -346,7 +347,7 @@ func verifyFile(fs FS, path string, size int64, sum [32]byte) ([32]byte, error) 
 		return got, err
 	case n != size:
 		return got, &Error{Code: CodeSizeMismatch, Detail: fmt.Sprintf("%d bytes, expected %d", n, size)}
-	case head != [2]byte{'M', 'Z'}:
+	case head != exeMagic:
 		return got, &Error{Code: CodeNotExe}
 	case got != sum:
 		return got, &Error{Code: CodeHashMismatch}

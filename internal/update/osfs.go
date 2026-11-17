@@ -14,7 +14,11 @@ type OSFS struct{}
 func (OSFS) MkdirAll(dir string) error { return os.MkdirAll(dir, 0o755) }
 
 // Create creates or truncates path.
-func (OSFS) Create(path string) (io.WriteCloser, error) { return os.Create(path) }
+// The file is executable for its owner on Unix (the staged update becomes the
+// program); Windows ignores the mode.
+func (OSFS) Create(path string) (io.WriteCloser, error) {
+	return os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o755)
+}
 
 // Open opens path for reading.
 func (OSFS) Open(path string) (io.ReadCloser, error) { return os.Open(path) }

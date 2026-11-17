@@ -28,10 +28,6 @@ const (
 	// downloadPrefix is where the release assets must be downloaded from.
 	downloadPrefix = ReleasesURL + "download/"
 
-	AssetExe = "jiraffe.exe"
-	AssetSum = "jiraffe.exe.sha256"
-	AssetSig = "jiraffe.exe.sig"
-
 	// MaxDownload bounds the downloaded executable.
 	MaxDownload = 20 << 20
 	// MaxRedirects bounds the redirects followed for one request.
@@ -285,6 +281,30 @@ func ParseChecksum(b []byte) ([32]byte, error) {
 	return sum, nil
 }
 
+// Release assets of this platform: the executable, its checksum and its
+// signature, and the first two bytes every such executable starts with.
+// Windows by default; UseLinuxAssets switches to the Linux build (v0.9).
+var (
+	AssetExe = "jiraffe.exe"
+	AssetSum = "jiraffe.exe.sha256"
+	AssetSig = "jiraffe.exe.sig"
+	exeMagic = [2]byte{'M', 'Z'}
+)
+
+// Linux release assets (v0.9): an x86-64 ELF binary.
+const (
+	LinuxAssetExe = "jiraffe-linux-amd64"
+	LinuxAssetSum = LinuxAssetExe + ".sha256"
+	LinuxAssetSig = LinuxAssetExe + ".sig"
+)
+
+// UseLinuxAssets makes the updater look for the Linux binary. Call it once
+// at start-up, before any check.
+func UseLinuxAssets() {
+	AssetExe, AssetSum, AssetSig = LinuxAssetExe, LinuxAssetSum, LinuxAssetSig
+	exeMagic = [2]byte{0x7f, 'E'}
+}
+
 // --- errors -----------------------------------------------------------------
 
 // Error codes (updateFailed.code and the check error).
@@ -297,7 +317,7 @@ const (
 	CodeBadChecksum   = "bad_checksum"    // .sha256 asset unusable
 	CodeSizeMismatch  = "size_mismatch"   // downloaded size ≠ asset size
 	CodeHashMismatch  = "hash_mismatch"   // SHA-256 ≠ .sha256
-	CodeNotExe        = "not_exe"         // does not start with "MZ"
+	CodeNotExe        = "not_exe"         // not an executable of this platform ("MZ" / ELF)
 	CodeBadSignature  = "bad_signature"   // .sig missing, malformed or not valid for this exe and version
 	CodeChanged       = "release_changed" // the latest release changed since the check
 	CodeNoWriteAccess = "no_write_access" // the exe folder is not writable
