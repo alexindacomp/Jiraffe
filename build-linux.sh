@@ -29,6 +29,10 @@ if ! "${PKG_CONFIG:-pkg-config}" --exists gtk+-3.0 webkit2gtk-4.1; then
   exit 1
 fi
 
+echo "==> icon"
+# assets/icon.png is generated (not in git); main_linux.go embeds it.
+go run ./tools/icongen -out assets
+
 echo "==> ui bundle"
 mkdir -p build
 go run ./tools/uibundle -src ui -out build/ui.bundle.gz
