@@ -58,6 +58,24 @@ icon needs the AppIndicator extension, enabled by default on Ubuntu (on other
 GNOME systems: `gnome-shell-extension-appindicator`). The token is kept
 encrypted with a key in the GNOME Keyring (Secret Service).
 
+**Jira with a company certificate.** Jiraffe verifies TLS against the system
+CA store. Windows machines in a domain trust the company root CA; Ubuntu does
+not, and Jiraffe reports "Jira's certificate is not trusted by the system".
+Add the company root CA to Ubuntu once (it is then trusted by Jiraffe, curl
+and other system tools). Take it from IT or from Windows (`certmgr.msc` →
+Trusted Root Certification Authorities → export as Base-64 .cer), or from the
+server's chain — then compare its SHA-256 fingerprint with the one Windows
+shows before trusting it:
+
+```sh
+echo | openssl s_client -connect jira.example.com:443 -servername jira.example.com -showcerts 2>/dev/null \
+  | awk '/BEGIN CERT/{n++} {c[n]=c[n] $0 "\n"} END{printf "%s", c[n]}' | sed -n '/BEGIN/,/END/p' > company-root.crt
+openssl x509 -in company-root.crt -noout -subject -fingerprint -sha256
+sudo cp company-root.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates
+```
+
+Then restart Jiraffe.
+
 Then enter your Jira URL and personal access token. Jiraffe updates itself:
 it checks GitHub releases at startup and asks before installing a new version
 (Settings → Updates). All versions and changes: [Releases](https://github.com/alexindacomp/Jiraffe/releases).

@@ -26,6 +26,10 @@ static void post_idle(uintptr_t h) { g_idle_add_full(G_PRIORITY_DEFAULT, idle_cb
 static int init_gtk(void) {
 	g_set_prgname("jiraffe"); // the Wayland app id / X11 class, matches jiraffe.desktop
 	g_set_application_name("Jiraffe");
+	// X11 (XWayland under a Wayland session) first: the frameless web view
+	// gets keyboard input, moves/resizes and its dock icon reliably there.
+	// GDK_BACKEND=wayland still selects Wayland.
+	gdk_set_allowed_backends("x11,wayland");
 	return gtk_init_check(NULL, NULL);
 }
 

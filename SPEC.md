@@ -1923,3 +1923,20 @@ settings; only the platform layer differs.
 - **Texts.** Platform-neutral: "Start when you sign in", "Stored encrypted on
   this computer only", "replace the program file", "not trusted by the system".
 
+## v0.9.2 — Linux fixes
+
+- **X11 first.** GTK opens the window through X11 (XWayland under Wayland
+  sessions): `gdk_set_allowed_backends("x11,wayland")`; `GDK_BACKEND=wayland`
+  still selects Wayland. Under native Wayland the page did not get keyboard
+  input on Ubuntu (empty fields, "enter a full http(s) address") and the dock
+  showed no icon; on X11 input, moves/resizes and the dock icon
+  (`_NET_WM_ICON`, `WM_CLASS jiraffe`) work.
+- **Menu entry icon** is the absolute path of the installed PNG, so the dock
+  and the menu show it without an icon-theme rescan.
+- **Company CA.** No change in the app (TLS is always verified against the
+  system store); README explains adding the company root CA to Ubuntu.
+- **Icon = the UI logo.** `tools/icongen` now draws the `i-logo` symbol of
+  ui/index.html (yellow #FFF200 rounded square, dark "J" with two dots, three
+  #D9CD00 spots) instead of the amber giraffe pattern: the .ico of the exe,
+  the Linux window/tray/menu icon (assets/icon.png) and the dock.
+

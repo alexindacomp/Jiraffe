@@ -158,7 +158,8 @@ func TestDesktopIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "applications", "jiraffe.desktop"))
-	if err != nil || !strings.Contains(string(b), "Exec=\"/home/u/.local/bin/jiraffe\"\n") || !strings.Contains(string(b), "StartupWMClass=jiraffe") {
+	if err != nil || !strings.Contains(string(b), "Exec=\"/home/u/.local/bin/jiraffe\"\n") || !strings.Contains(string(b), "StartupWMClass=jiraffe") ||
+		!strings.Contains(string(b), "Icon="+filepath.Join(dir, "icons", "hicolor", "256x256", "apps", "jiraffe.png")+"\n") {
 		t.Fatalf("entry %q %v", b, err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(dir, "icons", "hicolor", "256x256", "apps", "jiraffe.png")); string(b) != "png" {

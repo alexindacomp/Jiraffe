@@ -9,9 +9,11 @@ import (
 )
 
 // MenuEntry is the application menu entry for exe (~/.local/share/applications).
-func MenuEntry(exe string) string {
+// icon is the absolute path of the installed icon (no icon-theme lookup,
+// which may miss a freshly created folder until the next login).
+func MenuEntry(exe, icon string) string {
 	return "[Desktop Entry]\nType=Application\nName=Jiraffe\nComment=Jira in the tray: board, sprints, worklog\n" +
-		"Exec=" + execQuote(exe) + "\nIcon=jiraffe\nTerminal=false\nCategories=Office;ProjectManagement;\n" +
+		"Exec=" + execQuote(exe) + "\nIcon=" + icon + "\nTerminal=false\nCategories=Office;ProjectManagement;\n" +
 		"StartupWMClass=jiraffe\nStartupNotify=true\n"
 }
 
@@ -20,10 +22,11 @@ func MenuEntry(exe string) string {
 // have moved). The window and the tray find the icon by the name "jiraffe".
 func EnsureDesktopIntegration(exe string, iconPNG []byte) error {
 	data := xdg("XDG_DATA_HOME", ".local/share")
-	if err := writeIfChanged(filepath.Join(data, "icons", "hicolor", "256x256", "apps", "jiraffe.png"), iconPNG); err != nil {
+	icon := filepath.Join(data, "icons", "hicolor", "256x256", "apps", "jiraffe.png")
+	if err := writeIfChanged(icon, iconPNG); err != nil {
 		return err
 	}
-	return writeIfChanged(filepath.Join(data, "applications", "jiraffe.desktop"), []byte(MenuEntry(exe)))
+	return writeIfChanged(filepath.Join(data, "applications", "jiraffe.desktop"), []byte(MenuEntry(exe, icon)))
 }
 
 func writeIfChanged(path string, content []byte) error {
