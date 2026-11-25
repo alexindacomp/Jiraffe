@@ -204,96 +204,98 @@
   --shadow-lift: 0 18px 34px rgb(20 22 26 / .22), 0 3px 8px rgb(20 22 26 / .10);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    /* Dark: neutral graphite glass (the reference's structure and alphas, without its green tint) */
-    --win-bg: #141518;
-    --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23b8bcc3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-    --scroll-thumb: rgb(255 255 255 / .18);
-    --scroll-thumb-hover: rgb(255 255 255 / .34);
-    --tip-bg: rgb(244 245 247 / .96);
-    --tip-text: #16181c;
-    --panel: linear-gradient(135deg, rgb(36 37 41 / .76), rgb(20 21 24 / .70));
-    --panel-border: rgb(255 255 255 / .11);
-    --panel-shadow: 0 24px 70px rgb(0 0 0 / .35), inset 0 1px rgb(255 255 255 / .07);
-    --sticky-glass: rgb(255 255 255 / .03);
-    --sticky-bg: #242528;
-    --surface: rgb(255 255 255 / .035);
-    --surface-hover: rgb(255 255 255 / .05);
-    --surface-sunken: rgb(0 0 0 / .24);
-    --surface-raised: rgb(33 34 38 / .94);
-    --col-bg: rgb(0 0 0 / .17);
-    --col-border: rgb(255 255 255 / .07);
-    --card-bg: rgb(54 56 60 / .55);
-    --card-grad: linear-gradient(145deg, rgb(72 74 79 / .50), rgb(34 35 39 / .60));
-    --card-border: rgb(255 255 255 / .114);
-    --card-border-hover: rgb(255 255 255 / .20);
-    --card-shadow: inset 0 1px rgb(255 255 255 / .055), 0 12px 26px rgb(0 0 0 / .12);
-    --stat-grad: linear-gradient(145deg, rgb(255 255 255 / .05), rgb(255 255 255 / .02));
-    --border: rgb(255 255 255 / .09);
-    --border-strong: rgb(255 255 255 / .16);
-    --text: #f3f4f6;
-    --text-2: #cdd0d5;
-    --text-3: #b8bcc3;  /* ≥ 4.5:1 on the dark cards even over a white desktop (reference .40–.45 alphas fail AA) */
-    --scrim: rgb(6 7 9 / .5);
+/* Dark tokens. html[data-theme] is set by app.js before the first render: the
+   theme chosen in Settings, or the system's (prefers-color-scheme) for "system". */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  /* Dark: neutral graphite glass (the reference's structure and alphas, without its green tint) */
+  --win-bg: #141518;
+  --chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23b8bcc3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  --scroll-thumb: rgb(255 255 255 / .18);
+  --scroll-thumb-hover: rgb(255 255 255 / .34);
+  --tip-bg: rgb(244 245 247 / .96);
+  --tip-text: #16181c;
+  --panel: linear-gradient(135deg, rgb(36 37 41 / .76), rgb(20 21 24 / .70));
+  --panel-border: rgb(255 255 255 / .11);
+  --panel-shadow: 0 24px 70px rgb(0 0 0 / .35), inset 0 1px rgb(255 255 255 / .07);
+  --sticky-glass: rgb(255 255 255 / .03);
+  --sticky-bg: #242528;
+  --surface: rgb(255 255 255 / .035);
+  --surface-hover: rgb(255 255 255 / .05);
+  --surface-sunken: rgb(0 0 0 / .24);
+  --surface-raised: rgb(33 34 38 / .94);
+  --col-bg: rgb(0 0 0 / .17);
+  --col-border: rgb(255 255 255 / .07);
+  --card-bg: rgb(54 56 60 / .55);
+  --card-grad: linear-gradient(145deg, rgb(72 74 79 / .50), rgb(34 35 39 / .60));
+  --card-border: rgb(255 255 255 / .114);
+  --card-border-hover: rgb(255 255 255 / .20);
+  --card-shadow: inset 0 1px rgb(255 255 255 / .055), 0 12px 26px rgb(0 0 0 / .12);
+  --stat-grad: linear-gradient(145deg, rgb(255 255 255 / .05), rgb(255 255 255 / .02));
+  --border: rgb(255 255 255 / .09);
+  --border-strong: rgb(255 255 255 / .16);
+  --text: #f3f4f6;
+  --text-2: #cdd0d5;
+  --text-3: #b8bcc3;  /* ≥ 4.5:1 on the dark cards even over a white desktop (reference .40–.45 alphas fail AA) */
+  --scrim: rgb(6 7 9 / .5);
 
-    --rail-hover: rgb(255 255 255 / .08);
+  --rail-hover: rgb(255 255 255 / .08);
 
-    --accent-soft: rgb(255 242 0 / .12);
-    --accent-text: #fff27a;
-    --accent-line: #fff200;
-    --accent-pressed: #e6da00;
-    --focus: #fff200;
-    --focus-halo: transparent;
-    --control-stroke-strong: rgb(255 255 255 / .30);
-    --menu-hover: rgb(255 255 255 / .08);
-    --card-mine-bg: color-mix(in srgb, var(--accent) 5%, var(--card-bg));
-    --row-mine-bg: rgb(255 255 255 / .035);
-    --bar-ind: #7d8cff;
-    --drop-ring: var(--accent);
+  --accent-soft: rgb(255 242 0 / .12);
+  --accent-text: #fff27a;
+  --accent-line: #fff200;
+  --accent-pressed: #e6da00;
+  --focus: #fff200;
+  --focus-halo: transparent;
+  --control-stroke-strong: rgb(255 255 255 / .30);
+  --menu-hover: rgb(255 255 255 / .08);
+  --card-mine-bg: color-mix(in srgb, var(--accent) 5%, var(--card-bg));
+  --row-mine-bg: rgb(255 255 255 / .035);
+  --bar-ind: #7d8cff;
+  --drop-ring: var(--accent);
 
-    --cat-new: #fff200;
-    --cat-new-bg: rgb(255 242 0 / .12);
-    --cat-new-fg: #fff78a;
-    --cat-ind: #7d8cff;
-    --cat-ind-bg: rgb(125 140 255 / .18);
-    --cat-ind-fg: #c8ceff;
-    --cat-done: #6fd3a0;
-    --cat-done-bg: rgb(111 211 160 / .14);
-    --cat-done-fg: #a9ebc8;
+  --cat-new: #fff200;
+  --cat-new-bg: rgb(255 242 0 / .12);
+  --cat-new-fg: #fff78a;
+  --cat-ind: #7d8cff;
+  --cat-ind-bg: rgb(125 140 255 / .18);
+  --cat-ind-fg: #c8ceff;
+  --cat-done: #6fd3a0;
+  --cat-done-bg: rgb(111 211 160 / .14);
+  --cat-done-fg: #a9ebc8;
 
-    --danger: #f87171;
-    --danger-text: #fca5a5;  /* DR-17: ≥ 4.5:1 on the dark surfaces and on --danger-soft */
-    --danger-soft: rgb(248 113 113 / .14);
-    --chip-bad-fg: #fca5a5;
-    --success: #6fd3a0;
-    --success-soft: rgb(111 211 160 / .14);
-    --warning: #ffe066;
-    --warning-soft: rgb(255 196 0 / .14);
-    --info: #8cbcff;
+  --danger: #f87171;
+  --danger-text: #fca5a5;  /* DR-17: ≥ 4.5:1 on the dark surfaces and on --danger-soft */
+  --danger-soft: rgb(248 113 113 / .14);
+  --chip-bad-fg: #fca5a5;
+  --success: #6fd3a0;
+  --success-soft: rgb(111 211 160 / .14);
+  --warning: #ffe066;
+  --warning-soft: rgb(255 196 0 / .14);
+  --info: #8cbcff;
 
-    --tag-lime: #fff78a;   --tag-lime-bg: rgb(255 242 0 / .11);
-    --tag-blue: #a8d9ff;   --tag-blue-bg: rgb(98 177 255 / .12);
-    --tag-violet: #d0c5ff; --tag-violet-bg: rgb(154 129 255 / .13);
-    --tag-orange: #ffc39e; --tag-orange-bg: rgb(255 141 78 / .13);
+  --tag-lime: #fff78a;   --tag-lime-bg: rgb(255 242 0 / .11);
+  --tag-blue: #a8d9ff;   --tag-blue-bg: rgb(98 177 255 / .12);
+  --tag-violet: #d0c5ff; --tag-violet-bg: rgb(154 129 255 / .13);
+  --tag-orange: #ffc39e; --tag-orange-bg: rgb(255 141 78 / .13);
 
-    --type-epic: #8b63e8;
-    --type-story: #2a9258;
-    --type-task: #3a80dc;
-    --type-bug: #e04848;
-    --type-subtask: #14918a;
+  --type-epic: #8b63e8;
+  --type-story: #2a9258;
+  --type-task: #3a80dc;
+  --type-bug: #e04848;
+  --type-subtask: #14918a;
 
-    --prio-highest: #f07070;
-    --prio-high: #f59a5b;
-    --prio-medium: #fff200;
-    --prio-low: #8cbcff;
-    --prio-lowest: #a8c8f0;
+  --prio-highest: #f07070;
+  --prio-high: #f59a5b;
+  --prio-medium: #fff200;
+  --prio-low: #8cbcff;
+  --prio-lowest: #a8c8f0;
 
-    --shadow-1: 0 1px 2px rgb(0 0 0 / .3);
-    --shadow-2: 0 12px 26px rgb(0 0 0 / .28);
-    --shadow-3: 0 24px 70px rgb(0 0 0 / .5), 0 2px 8px rgb(0 0 0 / .35);
-    --shadow-lift: 0 20px 36px rgb(0 0 0 / .5), 0 3px 8px rgb(0 0 0 / .35);
-  }
+  --shadow-1: 0 1px 2px rgb(0 0 0 / .3);
+  --shadow-2: 0 12px 26px rgb(0 0 0 / .28);
+  --shadow-3: 0 24px 70px rgb(0 0 0 / .5), 0 2px 8px rgb(0 0 0 / .35);
+  --shadow-lift: 0 20px 36px rgb(0 0 0 / .5), 0 3px 8px rgb(0 0 0 / .35);
 }
 
 @media (prefers-reduced-motion: reduce) {

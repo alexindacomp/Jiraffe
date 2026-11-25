@@ -4,6 +4,14 @@
 (function () {
   'use strict';
 
+  /* Theme (v0.9.3): html[data-theme] = "light" | "dark" drives the dark tokens of app.css. Until the UI
+     prefs are loaded it follows the system; then the choice of Settings → Theme ("system" | "light" | "dark"). */
+  const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+  let themeChoice = 'system';
+  const THEMES = ['system', 'light', 'dark'];
+  const themeIsDark = () => themeChoice === 'dark' || (themeChoice === 'system' && darkQuery.matches);
+  document.documentElement.dataset.theme = themeIsDark() ? 'dark' : 'light';
+
   const t = (key, params) => i18n.t(key, params);
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -7700,6 +7708,7 @@
       renderSavebar();
     });
     sf.addEventListener('change', (e) => {
+      if (e.target.id === 's-theme') { applyTheme(e.target.value); prefs.set('theme', themeChoice); return; } // not a setting: no save bar
       if (e.target.id === 's-language') changeLanguage(e.target.value);
       if (e.target.id === 's-autostart' && S.autostartMismatch) { S.autostartMismatch = false; $('#w-autostart').hidden = true; }
       renderSavebar();
@@ -7909,8 +7918,16 @@
     document.addEventListener('scroll', () => { if (tip.target) tipHide(); }, true);
   }
 
+  /** Applies the theme choice ("system" | "light" | "dark") and tells the window frame. */
+  function applyTheme(choice) {
+    themeChoice = THEMES.includes(choice) ? choice : 'system';
+    document.documentElement.dataset.theme = themeIsDark() ? 'dark' : 'light';
+    const sel = $('#s-theme');
+    if (sel) sel.value = themeChoice;
+    syncWindowTheme();
+  }
+
   /* Native title bar (SPEC v0.4 §2): dark flag + caption colour = the top bar background. Best effort. */
-  const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
   /** "rgb(30, 31, 34)" / "rgb(30 31 34 / 1)" / "color(srgb 0.1 0.2 0.3)" → "#1e1f22"; null if not opaque or unknown. */
   function cssColorHex(value) {
     const s = String(value || '').trim();
@@ -7926,7 +7943,7 @@
     return '#' + rgb.map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
   }
   function syncWindowTheme() {
-    const params = { dark: darkQuery.matches };
+    const params = { dark: themeIsDark() };
     const caption = cssColorHex(getComputedStyle($('.topbar')).backgroundColor);
     if (caption) params.caption = caption;
     api('setWindowTheme', params).catch(() => { /* older backend / not Windows: the title bar keeps its colour */ });
@@ -7939,10 +7956,11 @@
     bindTooltips();
     loadWindowInfo();
     syncWindowTheme();
-    darkQuery.addEventListener('change', syncWindowTheme);
+    darkQuery.addEventListener('change', () => applyTheme(themeChoice)); // "system" follows the OS live
     renderChrome();
     await prefs.load(); // before the first render, so remembered choices apply from the start
     applyPrefs();
+    applyTheme(prefs.get('theme', 'system'));
     window.addEventListener('pagehide', () => prefs.flushNow());
     showView('board');
     loadState();

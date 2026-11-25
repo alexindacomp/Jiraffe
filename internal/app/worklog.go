@@ -270,11 +270,33 @@ func (a *App) computeWorklog(ctx context.Context, trigger string, due time.Time,
 // ids of the people fields of the active roles ("" = field absent or role
 // off; the Developer field is used whenever it exists) and the statuses of
 // all active status roles.
+//
+// v0.9.3: Jira shows status names translated to the user's language ("To Do"
+// → "Сделать"), but JQL and the changelog know only the original names. When
+// Jira's status list is available the statuses are therefore resolved to
+// their ids (ByID): the queries use the ids and time in a status is counted
+// from the ids of the changelog.
 type RoleQuery struct {
 	DevField      string
 	QAField       string
 	ReviewerField string
-	Statuses      []string // Dev ∪ QA ∪ Reviewer statuses, de-duplicated
+	Statuses      []string // Dev ∪ QA ∪ Reviewer statuses, de-duplicated: names, or ids when ByID
+
+	ByID bool
+	ids  map[string][]string // ByID: normalised configured name → ids of the statuses shown with that name
+}
+
+// StatusSet is the set of the given configured status names to match
+// against issues: their ids when q is ByID, else the names.
+func (q RoleQuery) StatusSet(names []string) worklog.StatusSet {
+	if !q.ByID {
+		return worklog.NewStatusSet(names)
+	}
+	var ids []string
+	for _, n := range names {
+		ids = append(ids, q.ids[worklog.NormStatus(n)]...)
+	}
+	return worklog.NewStatusSet(ids)
 }
 
 // roleQueryOf builds the RoleQuery of the settings on a Jira with fields
@@ -304,26 +326,60 @@ func roleQueryOf(s config.Settings, f jira.FieldIDs) RoleQuery {
 	return q
 }
 
-// KnownStatuses keeps the statuses of q that exist in Jira (names, any
-// case; Jira's spelling is used). JQL rejects the whole query when a status
-// name is unknown, and the role lists hold generic defaults. When the list
-// cannot be read for good (400/403/404), q is kept as is.
+// KnownStatuses keeps the statuses of q that exist in Jira (names as Jira
+// shows them, any case, spaces ignored). JQL rejects the whole query when a
+// status name is unknown, and the role lists hold generic defaults. When
+// every status of the list has an id, q becomes ByID: Statuses are the ids
+// of all statuses carrying the configured names (a translated name is not
+// valid in JQL; v0.9.3). When the list cannot be read for good (400/403/404),
+// q is kept as is.
 func KnownStatuses(q RoleQuery, all []jira.Status) RoleQuery {
 	if all == nil {
 		return q
 	}
-	byName := make(map[string]string, len(all))
+	byID := true
+	byName := make(map[string][]jira.Status, len(all))
 	for _, st := range all {
-		byName[worklog.NormStatus(st.Name)] = st.Name
+		k := worklog.NormStatus(st.Name)
+		byName[k] = append(byName[k], st)
+		if !numericStatusID(st.ID) {
+			byID = false
+		}
 	}
 	var keep []string
+	ids := map[string][]string{}
+	seen := map[string]bool{}
 	for _, n := range q.Statuses {
-		if name, ok := byName[worklog.NormStatus(n)]; ok {
-			keep = append(keep, name)
+		k := worklog.NormStatus(n)
+		for _, st := range byName[k] {
+			v := st.Name
+			if byID {
+				v = st.ID
+				ids[k] = append(ids[k], st.ID)
+			}
+			if !seen[v] {
+				seen[v] = true
+				keep = append(keep, v)
+			}
 		}
 	}
 	q.Statuses = keep
+	if byID {
+		q.ByID, q.ids = true, ids
+	}
 	return q
+}
+
+func numericStatusID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if id[i] < '0' || id[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // knownRoleQuery is roleQueryOf limited to the statuses Jira has.
@@ -366,15 +422,20 @@ func peopleJQL(q RoleQuery) string {
 	return b.String()
 }
 
-// statusList is the quoted, comma-separated list of status names ("" if none).
-func statusList(names []string) string {
+// statusList is the comma-separated JQL list of q's statuses: bare ids when
+// q is ByID, else quoted names ("" if none).
+func statusList(q RoleQuery) string {
 	var out []string
 	seen := map[string]bool{}
-	for _, n := range names {
+	for _, n := range q.Statuses {
 		n = strings.TrimSpace(n)
 		if k := strings.ToLower(n); n != "" && !seen[k] {
 			seen[k] = true
-			out = append(out, jqlString(n))
+			if q.ByID && numericStatusID(n) {
+				out = append(out, n)
+			} else {
+				out = append(out, jqlString(n))
+			}
 		}
 	}
 	return strings.Join(out, ", ")
@@ -438,7 +499,7 @@ func WorklogJQLFor(effective, realNow time.Time, q RoleQuery) string {
 		from = fmt.Sprintf("startOfDay(-%dd)", n+1)
 	}
 	statusIn := ""
-	if l := statusList(q.Statuses); l != "" {
+	if l := statusList(q); l != "" {
 		statusIn = " OR status IN (" + l + ")"
 	}
 	return `(assignee = currentUser()` + peopleJQL(q) + ` OR status changed BY currentUser() DURING (` + from + `, now())) AND ` +
@@ -456,7 +517,7 @@ func (e *capCheckError) Unwrap() error { return e.err }
 // roles on a past day (date "2006-01-02") and were mine or moved by me then;
 // absolute bounds, so it does not depend on today. "" when no status is set.
 func PastWorklogJQL(date string, q RoleQuery) string {
-	l := statusList(q.Statuses)
+	l := statusList(q)
 	if l == "" {
 		return ""
 	}
@@ -543,8 +604,9 @@ func StatusRoles(f *jira.Fields, me *jira.User, q RoleQuery) []string {
 	return out
 }
 
-// roleStatuses is the union of the statuses of the given status roles.
-func roleStatuses(s config.Settings, roles []string) worklog.StatusSet {
+// roleStatuses is the union of the statuses of the given status roles (ids
+// when q is ByID).
+func roleStatuses(s config.Settings, q RoleQuery, roles []string) worklog.StatusSet {
 	var names []string
 	for _, r := range roles {
 		switch r {
@@ -556,7 +618,7 @@ func roleStatuses(s config.Settings, roles []string) worklog.StatusSet {
 			names = append(names, s.ReviewStatuses...)
 		}
 	}
-	return worklog.NewStatusSet(names)
+	return q.StatusSet(names)
 }
 
 // dayIssue collects what one issue did on the computed day.
@@ -758,7 +820,7 @@ func (a *App) statusIssues(ctx context.Context, c *jira.Client, me *jira.User, s
 			}
 		}
 		roles := StatusRoles(&is.Fields, me, q)
-		spans := day.Clip(issueIntervals(is, roleStatuses(s, roles), now))
+		spans := day.Clip(issueIntervals(is, roleStatuses(s, q, roles), q.ByID, now))
 		if worklog.TotalSeconds(spans) < worklog.MinSeconds {
 			continue
 		}
@@ -768,7 +830,7 @@ func (a *App) statusIssues(ctx context.Context, c *jira.Client, me *jira.User, s
 			// The description names only the roles that worked: a Reviewer
 			// who is also QA of an issue in testing is not "code review".
 			for _, r := range roles {
-				if worklog.TotalSeconds(day.Clip(issueIntervals(is, roleStatuses(s, []string{r}), now))) >= worklog.MinSeconds {
+				if worklog.TotalSeconds(day.Clip(issueIntervals(is, roleStatuses(s, q, []string{r}), q.ByID, now))) >= worklog.MinSeconds {
 					d.worked = append(d.worked, r)
 				}
 			}
@@ -984,7 +1046,9 @@ func (a *App) loggedElsewhere(ctx context.Context, c *jira.Client, me *jira.User
 }
 
 // issueIntervals rebuilds the in-progress intervals of a Jira issue.
-func issueIntervals(is jira.Issue, inProgress worklog.StatusSet, now time.Time) []worklog.Interval {
+// byID: inProgress holds status ids, matched against the ids of the
+// changelog and of the current status (names may be translated, v0.9.3).
+func issueIntervals(is jira.Issue, inProgress worklog.StatusSet, byID bool, now time.Time) []worklog.Interval {
 	created, err := jira.ParseTime(is.Fields.Created)
 	if err != nil {
 		created = time.Time{}
@@ -998,7 +1062,11 @@ func issueIntervals(is jira.Issue, inProgress worklog.StatusSet, now time.Time) 
 			}
 			for _, it := range h.Items {
 				if strings.EqualFold(it.Field, "status") {
-					changes = append(changes, worklog.StatusChange{At: at, From: it.FromString, To: it.ToString})
+					ch := worklog.StatusChange{At: at, From: it.FromString, To: it.ToString}
+					if byID {
+						ch.From, ch.To = it.From, it.To
+					}
+					changes = append(changes, ch)
 				}
 			}
 		}
@@ -1006,6 +1074,9 @@ func issueIntervals(is jira.Issue, inProgress worklog.StatusSet, now time.Time) 
 	status := ""
 	if is.Fields.Status != nil {
 		status = is.Fields.Status.Name
+		if byID {
+			status = is.Fields.Status.ID
+		}
 	}
 	return worklog.InProgressIntervals(created, status, changes, inProgress, now)
 }

@@ -1940,3 +1940,32 @@ settings; only the platform layer differs.
   #D9CD00 spots) instead of the amber giraffe pattern: the .ico of the exe,
   the Linux window/tray/menu icon (assets/icon.png) and the dock.
 
+## v0.9.3 — role statuses by id
+
+Jira lists statuses in the user's language ("To Do" is shown as "Сделать",
+"Done" as "Готово"), but JQL accepts only the original names (a translated
+name fails the whole worklog query with HTTP 400 "Значение 'Сделать'
+отсутствует для поля 'status'") and the changelog records the original names.
+The role statuses (Dev / QA / Reviewer) are therefore resolved through
+`/rest/api/2/status` to the ids of every status shown with a configured name:
+
+- the worklog queries use `status IN (10500, …)` / `status WAS IN (…)` with
+  bare ids;
+- time in a status is counted from the changelog's `from`/`to` ids and the
+  current status id.
+
+Names that Jira does not list are dropped as before. Without a status list
+(or ids) the names are used as in v0.8.4.
+
+### Theme switch
+
+Settings → Application → Theme: "System" (default), "Light", "Dark". Applied
+at once, not part of the settings form (no save bar); kept in the UI prefs
+(`theme`, getUiPrefs / setUiPrefs). app.js sets `html[data-theme]` to
+`light`/`dark` before the first render (from `prefers-color-scheme` until the
+prefs are loaded), and "System" follows OS changes live. The dark tokens of
+app.css apply to `:root[data-theme="dark"]` (no `prefers-color-scheme` media
+query any more); `color-scheme` follows the theme, and `setWindowTheme` gets
+the chosen theme's dark flag (Windows title bar / backdrop). The window's
+background before the page paints still follows the system theme.
+
